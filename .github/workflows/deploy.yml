@@ -1,0 +1,96 @@
+name: Deploy to ModelScope Studio
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:      # 允许手动触发，便于失败重试
+
+# 同一时间只跑一个部署，避免并发 push 互相覆盖
+concurrency:
+  group: modelscope-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          #创空间默认分支是 master，需要完整历史才能正确合并
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+          git config --global core.quotepath false
+          # 避免中文文件名在日志里显示为转义码
+          git config --global i18n.logOutputEncoding utf-8
+
+      - name: Check required files
+        # ModelScope Gradio 创空间必须有这两个文件，缺了就早失败，省得白等一次部署
+        run: |
+          for f in app.py requirements.txt; do
+            if [ ! -f "$f" ]; then
+              echo "::error::缺少必需文件 $f —— Gradio 创空间入口与依赖清单必须存在"
+              exit 1
+            fi
+          done
+          echo "✅ app.py / requirements.txt 均存在"
+
+      - name: Push to ModelScope
+        env:
+          MODELSCOPE_API_KEY: ${{ secrets.MODELSCOPE_API_KEY }}
+        run: |
+          set -euo pipefail
+          STUDIO="viva25/video_txt"
+
+          if [ -z "${MODELSCOPE_API_KEY}" ]; then
+            echo "::error::未配置 Secret MODELSCOPE_API_KEY"
+            exit 1
+          fi
+
+          # token 只出现在这条命令里，且不放进 remote 配置，避免被后续 git 命令打印出来
+          git remote add ms "https://oauth2:${MODELSCOPE_API_KEY}@modelscope.cn/studios/${STUDIO}.git"
+
+          # 创空间仓库默认分支是 master，本仓库是 main，先把本地 main 改名对齐
+          git branch -M master
+
+          echo "--- 推送文件清单 ---"
+          git ls-files | head -30
+
+          git push ms master
+
+      - name: Wait for build and report status
+        env:
+          MODELSCOPE_API_KEY: ${{ secrets.MODELSCOPE_API_KEY }}
+        run: |
+          STUDIO="viva25/video_txt"
+          API="https://modelscope.cn/openapi/v1/studios/${STUDIO}"
+
+          # ModelScope 重建通常 3~8 分钟，这里轮询 8 分钟
+          for i in $(seq 1 16); do
+            sleep 30
+            BODY=$(curl -s --max-time 20 -H "Authorization: Bearer ${MODELSCOPE_API_KEY}" "${API}" || echo '{}')
+            STATE=$(echo "$BODY" | jq -r '.data.status // "unknown"' 2>/dev/null || echo unknown)
+            echo "[$((i*30))s] 当前状态：${STATE}"
+
+            if [ "$STATE" = "Running" ]; then
+              echo "::notice title=部署成功::创空间状态已变为 Running"
+              echo "https://modelscope.cn/studios/${STUDIO}"
+              exit 0
+            fi
+            if [ "$STATE" = "Failed" ] || [ "$STATE" = "Stopped" ]; then
+              echo "::error::部署失败，状态 ${STATE}，以下是构建日志："
+              curl -s --max-time 20 -H "Authorization: Bearer ${MODELSCOPE_API_KEY}" \
+                   "${API}/logs/run" | jq -r '.data.logs[-1] // "（无日志）"' || true
+              exit 1
+            fi
+          done
+
+          # 8 分钟仍未 Running 不一定失败（资源排队可能更久），给警告而非失败
+          echo "::warning::8 分钟内未变为 Running，可能仍在排队构建，请到创空间页面查看"
+          echo "https://modelscope.cn/studios/${STUDIO}"
