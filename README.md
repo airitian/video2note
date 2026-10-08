@@ -299,16 +299,45 @@ git push -u origin main
 `data/`（含 tasks / media / cookies.txt / settings.json）与 `*.log` 已在 `.gitignore` 中排除，
 不会把密钥和 Cookie 提交上去。首次推送需要在 GitHub 上创建一个空仓库（不要勾选 README）。
 
-### 自动部署到创空间（GitHub Actions）
+### 手动同步到创空间
 
-仓库内置 `.github/workflows/deploy.yml`：push 到 `main` / `master` 或手动触发时，
-自动把代码推到 ModelScope 创空间，并轮询部署状态。
+创空间仓库：`https://modelscope.cn/studios/viva25/video_txt.git`，
+访问令牌用 [ModelScope 访问令牌](https://modelscope.cn/my/myaccesstoken)。
 
-在仓库 **Settings → Secrets and variables → Actions** 新建 secret `MODELSCOPE_API_KEY`
-（ModelScope 访问令牌）后即可生效。
+**方式一：命令行推送（推荐）**
 
-流程：Checkout → 前置文件检查 → 平台兼容检查 → 推送创空间（自动对齐 `master` 分支）
-→ 轮询 `status` 直到 `Running`，失败时自动输出构建日志。
+在**创空间仓库目录**里直接覆盖文件（无需合并历史，最省事）：
+
+```bash
+# 1. 先拉取创空间仓库
+git clone https://oauth2:<你的访问令牌>@modelscope.cn/studios/viva25/video_txt.git ms_studio
+cd ms_studio
+
+# 2. 把本地项目文件复制进来（排除运行数据与 Git 配置）
+#    Windows PowerShell：
+#    robocopy ..\video2note . /E /XD .git data .github
+#    macOS / Linux：
+#    rsync -av --exclude='.git' --exclude='data' --exclude='__pycache__' ../video2note/ ./
+
+# 3. 提交并推送
+git add -A
+git commit -m "sync: 更新为 GitHub 版本" || echo "无变化"
+git push
+```
+
+> 令牌直接写在 clone URL 里最省事，但会留在 shell 历史中。
+> 更稳妥的做法是先 clone 不带令牌，再执行 `git remote set-url origin https://oauth2:<令牌>@...`，
+> 推送完把 remote 改回不带令牌的地址。
+
+**方式二：网页上传**
+
+到创空间「代码 → 上传文件」，或直接把 GitHub 仓库里的文件拖进去覆盖。
+
+> 关键点：创空间的默认分支是 **`master`**，而 GitHub 仓库用的是 `main`。
+> 推送时无需合并历史，直接把文件覆盖后 `git add -A && git commit && git push` 即可。
+
+推送后 ModelScope 会**自动重建**（实测约 3~8 分钟），不需要额外触发部署。
+可在创空间「日志」页查看启动输出。
 
 数据落地优先级：`V2N_DATA_DIR` → `/mnt/workspace/video2note`（创空间持久化目录）→ `项目/data`。
 创空间重启会保留 `/mnt/workspace`，但迁移或重命名会丢失，重要产物请及时导出。
