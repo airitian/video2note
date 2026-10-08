@@ -1,0 +1,24 @@
+# ========== 核心框架（ModelScope 创空间 Gradio 类型）==========
+gradio>=4.0.0
+
+# ========== Web 服务（可选：FastAPI 版入口 run.py）==========
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+
+# ========== 业务依赖 ==========
+yt-dlp>=2025.1.1          # B站下载主力；抖音因 a_bogus 签名已基本不可用
+pyktok>=0.0.31            # 抖音专用：Playwright 执行 JS 生成 a_bogus 签名
+requests>=2.31            # ASR 接口 + Anthropic 协议 LLM 调用 + 抖音直链下载
+openai>=1.30              # 仅当 llm_protocol=openai 时需要
+
+# pyktok 依赖 Playwright 浏览器内核，装完依赖后还需执行（国内加镜像）：
+#   python -m playwright install chromium
+# 国内网络慢可用镜像：
+#   PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
+#     python -m playwright install chromium
+
+# ========== 工具库 ==========
+python-dotenv>=1.0        # 本地 .env 支持
+# 本机若无 ffmpeg：安装工程后自带一个 ffmpeg 二进制作为兜底
+# imageio-ffmpeg>=0.4.9

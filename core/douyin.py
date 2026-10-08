@@ -1,0 +1,304 @@
+"""抖音专用下载：优先 pyktok（能绕过 a_bogus 签名风控），失败回退 yt-dlp
+
+yt-dlp 的抖音提取器（tiktok.py）调aweme/detail 接口时，抖音要求
+`a_bogus`/`X-Bogus` 动态签名参数，而 yt-dlp 未实现，会直接抛出
+误导性的 "Fresh cookies (not necessarily logged in) are needed"。
+pyktok 自带完整签名实现，因此抖音链接一律先走这里。
+
+B站等其他平台仍走 yt-dlp，不受本模块影响。
+"""
+from __future__ import annotations
+
+import json
+import re
+import urllib.parse
+from pathlib import Path
+from typing import Callable
+
+from .config import load_settings
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+
+
+class DouyinError(RuntimeError):
+    pass
+
+
+def _cookie_header() -> str:
+    """把配置里的 cookie_text 拼成请求头用的 Cookie 串"""
+    s = load_settings()
+    text = (s.get("cookie_text") or "").strip()
+    if not text:
+        return ""
+    # 去掉我们为落盘而加的 `# domain=xxx` 提示行
+    text = re.sub(r"^#\s*domain\s*=\s*\S+[ \t]*\n?", "", text, flags=re.I | re.M)
+    return " ".join(x.strip() for x in text.split("\n") if x.strip())
+
+
+def is_douyin(url: str) -> bool:
+    u = (url or "").lower()
+    return any(k in u for k in ("douyin.com", "iesdouyin.com"))
+
+
+def _referer(url: str) -> str:
+    """抖音短链需要先跟随到真实地址；从短链域名也能推断"""
+    return "https://www.douyin.com/"
+
+
+def _cookie_dict() -> dict:
+    """把 cookie_text 解析成 dict，交给 pyktok 设置会话"""
+    out: dict[str, str] = {}
+    for part in _cookie_header().split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            if k.strip():
+                out[k.strip()] = v.strip()
+    return out
+
+
+def _resolve_short(url: str) -> str:
+    """把 v.douyin.com 短链展开成带 aweme_id 的完整地址"""
+    if "v.douyin.com" not in url:
+        return url
+    import requests
+
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=(10, 25),
+                         allow_redirects=True)
+        final = r.url
+        m = re.search(r"/(?:video|note)/(\d+)", final) or re.search(r"modal_id=(\d+)", final)
+        if m:
+            return f"https://www.douyin.com/video/{m.group(1)}"
+        return final or url
+    except Exception:
+        return url
+
+
+def _pick_url(data: dict) -> str:
+    """从 play_addr / download_addr 里挑一个可用直链（去掉水印参数）"""
+    for key in ("play_addr", "download_addr", "playAddr", "downloadAddr"):
+        item = data.get(key) or {}
+        urls = item.get("url_list") or item.get("urlList") or []
+        for u in urls:
+            u = (u or "").replace("http://", "https://")
+            if u:
+                return u
+    # 兜底：老结构
+    for key in ("playApi", "videoApi"):
+        v = data.get(key) or ""
+        if isinstance(v, str) and v.startswith("http"):
+            return v.replace("http://", "https://")
+    raise DouyinError("未找到可用的视频直链")
+
+
+def _header_for(url: str, referer: str) -> dict:
+    h = {
+        "User-Agent": UA,
+        "Referer": referer,
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    }
+    ck = _cookie_header()
+    if ck:
+        h["Cookie"] = ck
+    return h
+
+
+def fetch_info(url: str) -> dict:
+    """用 pyktok 获取作品信息，返回统一格式的 dict
+
+    pyktok 的 TikTokApi 会用 Playwright 起浏览器执行 JS 签名，产出
+    a_bogus / X-Bogus，这是 yt-dlp 目前做不到的部分。
+    """
+    real = _resolve_short(url)
+    cookies = _cookie_dict()
+
+    detail = _pyktok_detail(real, cookies)
+    if not detail:
+        detail, err = _scrape_mobile(real)
+        if not detail:
+            raise DouyinError(err or "pyktok 未返回作品数据")
+        return _normalize(detail)
+    return _normalize(detail)
+
+
+def _pyktok_detail(url: str, cookies: dict) -> dict | None:
+    """用 pyktok 生成 X-Bogus 签名，再由本进程发 HTTP 请求拿详情 JSON
+
+    不走 pyktok 的 make_request：它在页面上下文里 fetch 跨域接口会被 CORS 拦掉
+    （Page.evaluate: Failed to fetch）。这里只用 generate_x_bogus 做签名，
+    请求自己发，行为与 yt-dlp 抓包一致。
+
+    注意 pyktok 默认导航 tiktok.com（国内不可达），必须用 starting_url 指向抖音。
+    """
+    import asyncio
+
+    from pyktok import TikTokApi
+
+    ck_list = [{"name": k, "value": v, "domain": ".douyin.com", "path": "/"}
+               for k, v in cookies.items()]
+    vid = ""
+    m = re.search(r"/(?:video|note)/(\d+)", url) or re.search(r"modal_id=(\d+)", url)
+    if m:
+        vid = m.group(1)
+    if not vid:
+        raise DouyinError("无法从链接中解析出作品 ID")
+
+    api_url = ("https://www.douyin.com/aweme/v1/web/aweme/detail/"
+               f"?aweme_id={vid}&device_platform=webapp&aid=6383"
+               "&channel=channel_pc_web&version_code=190500&version_name=19.5.0"
+               "&cookie_enabled=true&platform=PC&browser_language=zh-CN"
+               "&msToken=&a_bogus=")
+
+    async def sign() -> dict:
+        api = TikTokApi(logging_level=40)
+        try:
+            await api.create_sessions(
+                headless=True,
+                num_sessions=1,
+                starting_url="https://www.douyin.com/",
+                cookies=ck_list or None,
+            )
+            return await api.generate_x_bogus(api_url)
+        finally:
+            try:
+                await api.stop_playwright()
+            except Exception:
+                pass
+
+    try:
+        signed = asyncio.run(sign())
+    except Exception as e:
+        raise DouyinError(f"pyktok 签名失败：{type(e).__name__}: {e}") from e
+
+    params = {k: v for k, v in (signed or {}).items()
+              if k.lower() in ("x-bogus", "a_bogus", "ms-token", "mstoken")
+              and v not in (None, "")}
+    if not params:
+        raise DouyinError(f"pyktok 未生成可用签名参数（返回 {signed}）")
+
+    qs = urllib.parse.urlencode(params)
+    full = f"{api_url}&{qs}"
+
+    import requests
+
+    try:
+        r = requests.get(full, headers=_header_for(url, "https://www.douyin.com/"),
+                         timeout=(10, 30))
+        data = r.json()
+    except Exception as e:
+        raise DouyinError(f"详情接口请求失败：{e}") from e
+    return data if isinstance(data, dict) else None
+
+
+def _scrape_mobile(url: str) -> tuple[dict | None, str]:
+    """从 www.iesdouyin.com/share/ 页面里抠出 RENDER_DATA / _ROUTER_DATA"""
+    import requests
+
+    vid = ""
+    m = re.search(r"/(?:video|note)/(\d+)", url) or re.search(r"modal_id=(\d+)", url)
+    if m:
+        vid = m.group(1)
+    if not vid:
+        return None, "无法从链接中解析出作品 ID"
+
+    target = f"https://www.iesdouyin.com/share/video/{vid}/"
+    try:
+        r = requests.get(target, headers=_header_for(target, "https://www.iesdouyin.com/"),
+                         timeout=(10, 25))
+        html = r.text or ""
+    except Exception as e:
+        return None, f"分享页请求失败：{e}"
+
+    for pat, parser in (
+        (r'<script id="RENDER_DATA"[^>]*>(.*?)</script>', "uri"),
+        (r'<script id="_ROUTER_DATA"[^>]*>(.*?)</script>', "plain"),
+    ):
+        m = re.search(pat, html, re.S)
+        if not m:
+            continue
+        raw = m.group(1)
+        try:
+            if parser == "uri":
+                from urllib.parse import unquote
+                raw = unquote(raw)
+            data = json.loads(raw)
+        except Exception:
+            continue
+        item = (data.get("loaderData") or {}) if parser == "uri" else data
+        if parser == "plain":
+            item = (data.get("loaderData") or {}).get(
+                f"video_(id)/page", {}) or {}
+        d = ((item or {}).get("videoInfoRes") or {}).get("item_list") or []
+        if d:
+            return d[0], ""
+    return None, "分享页未返回作品数据（可能需要登录或已删除）"
+
+
+def _normalize(item: dict) -> dict:
+    video = item.get("video") or {}
+    duration = int(video.get("duration") or item.get("duration") or 0) / 1000.0
+    author = item.get("author") or {}
+    return {
+        "video_id": str(item.get("aweme_id") or item.get("awemeId") or ""),
+        "title": (item.get("desc") or "").strip() or "未命名视频",
+        "uploader": (author.get("nickname") or "").strip(),
+        "description": (item.get("desc") or "")[:1200],
+        "duration": duration,
+        "webpage_url": f"https://www.douyin.com/video/{item.get('aweme_id') or ''}",
+        "thumbnail": ((item.get("video") or {}).get("cover") or {}).get("url_list", [""])[0],
+        "_direct_url": _pick_url(item),
+        "_origin": "pyktok",
+    }
+
+
+def download(url: str, workdir: Path,
+             progress: Callable[[float, str], None] | None = None) -> dict:
+    """下载抖音视频到 workdir，返回与yt-dlp 路径一致的 meta dict"""
+    import requests
+
+    def emit(pct: float, msg: str) -> None:
+        if progress:
+            progress(pct, msg)
+
+    emit(3.0, "解析抖音作品信息（pyktok）")
+    meta = fetch_info(url)
+    direct = meta.pop("_direct_url")
+    referer = _referer(meta.get("webpage_url") or url)
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    out = workdir / "video.mp4"
+
+    emit(12.0, "下载视频文件")
+    with requests.get(direct, headers=_header_for(direct, referer),
+                      stream=True, timeout=(30, 300)) as r:
+        if r.status_code >= 400:
+            raise DouyinError(f"视频下载失败（HTTP {r.status_code}），可能 Cookie 已过期")
+        total = int(r.headers.get("Content-Length") or 0)
+        got = 0
+        tmp = out.with_suffix(".part")
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 18):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                got += len(chunk)
+                if total:
+                    emit(12.0 + min(got / total * 78, 78.0), "下载中")
+        if total and got < total * 0.9:
+            tmp.unlink(missing_ok=True)
+            raise DouyinError(f"下载不完整（{got}/{total} 字节）")
+        tmp.replace(out)
+
+    emit(92.0, "解析音频用于转写")
+    from . import audio as _audio
+
+    _audio.extract_audio(out, workdir / "audio.mp3")
+
+    meta["video_path"] = str(out)
+    meta["audio_path"] = str(workdir / "audio.mp3")
+    meta["parser"] = "pyktok"
+    emit(100.0, "下载完成")
+    return meta

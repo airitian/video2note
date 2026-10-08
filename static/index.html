@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>抖音 / B站 视频转文字</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo"></span>
+    <div>
+      <h1>抖音 / B站 视频转文字</h1>
+      <p>本地文件 / 分享链接 → 提取音频 → ASR 转写 → 文字稿 → AI 整理</p>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <span id="health" class="health"></span>
+    <button id="btn-history" class="btn ghost">🕘 历史记录 ▾</button>
+    <button id="btn-settings" class="btn ghost">设置</button>
+  </div>
+</header>
+
+<div id="history-panel" class="history hidden">
+  <div class="history-head">历史记录 <button id="btn-history-close" class="icon">×</button></div>
+  <div id="history-list" class="history-list"></div>
+</div>
+
+<main>
+  <section class="card composer">
+    <div class="input-grid">
+      <div class="input-col">
+        <div class="tab-head">直接上传音视频（推荐）</div>
+        <div id="drop" class="drop">
+          <div class="up-ico">⇧</div>
+          <div class="up-t1" id="drop-text">将文件拖放到此处</div>
+          <div class="up-t2">或 <a href="javascript:void(0)" id="pick">点击上传</a>，支持视频 / 音频</div>
+          <input type="file" id="file" accept="video/*,audio/*" hidden>
+        </div>
+      </div>
+      <div class="input-col">
+        <div class="tab-head">或粘贴抖音 / B站分享链接</div>
+        <textarea id="url" rows="5" placeholder="粘贴 https://v.douyin.com/... 、https://www.bilibili.com/video/BV... 或 https://b23.tv/... 分享链接（可连同标题一起粘贴）"></textarea>
+      </div>
+    </div>
+    <div class="opts-row">
+      <button id="btn-start" class="btn primary big">开始转写</button>
+      <span class="opts-hint">支持抖音 / B站链接，可连同分享文案一起粘贴；也支持直接拖入本地音视频</span>
+    </div>
+  </section>
+
+  <section class="card progress-panel">
+    <div class="phead">
+      <b id="ws-title">尚未开始任务</b>
+      <span id="ws-status" class="status"></span>
+    </div>
+    <div class="prow" data-stage="upload"><span class="plabel">文件上传</span><div class="pbar"><i></i></div><span class="ppct">0%</span></div>
+    <div class="prow" data-stage="downloading"><span class="plabel">视频下载</span><div class="pbar"><i></i></div><span class="ppct">0%</span></div>
+    <div class="prow" data-stage="extracting"><span class="plabel">音频提取</span><div class="pbar"><i></i></div><span class="ppct">0%</span></div>
+    <div class="prow" data-stage="slicing"><span class="plabel">语音切片</span><div class="pbar"><i></i></div><span class="ppct">0%</span></div>
+    <div class="prow" data-stage="transcribing"><span class="plabel">语音转写</span><div class="pbar"><i></i></div><span class="ppct">0%</span></div>
+    <div class="prow" data-stage="polishing"><span class="plabel">AI 整理</span><div class="pbar"><i></i></div><span class="ppct">0%</span></div>
+    <div id="ws-error" class="wserr hidden"></div>
+    <div id="ws-logs" class="logs hidden"></div>
+    <div class="pfoot">
+      <span id="ws-msg" class="footmsg"></span>
+      <span class="spacer"></span>
+      <button class="btn small" id="btn-logs">日志</button>
+    </div>
+  </section>
+
+  <section class="ws-grid">
+    <div class="card pane sticky-pane">
+      <div class="pane-head">视频预览</div>
+      <div id="video-host" class="video-host"><div class="empty">暂无视频</div></div>
+    </div>
+    <div class="card pane">
+      <div class="pane-head">文字稿（带时间戳，点击跳转，播放时自动跟随高亮）</div>
+      <div id="lines" class="lines"><div class="empty">暂无转写结果</div></div>
+    </div>
+  </section>
+
+  <div class="ai-row">
+    <div class="style-pick" id="style-pick" role="tablist" aria-label="文稿风格">
+      <button class="style-chip on" data-style="general" role="tab">整理文稿</button>
+      <button class="style-chip" data-style="note" role="tab">结构化笔记</button>
+      <button class="style-chip" data-style="article" role="tab">公众号文章</button>
+      <button class="style-chip" data-style="clean" role="tab">仅清洗润色</button>
+    </div>
+    <button id="btn-polish" class="btn ai" disabled>✨ 生成文稿</button>
+  </div>
+  <p class="ai-tip" id="ai-tip">选一种风格生成文稿；换风格点「生成文稿」即可重写同一份转写内容，已生成过的风格会直接复用，不重复消耗额度。</p>
+
+  <section class="card" id="note-card">
+    <div class="pane-head">AI 文稿
+      <span class="tools">
+        <span id="note-meta" class="note-meta"></span>
+        <button class="btn small" data-act="copy">复制</button>
+      </span>
+    </div>
+    <div id="note-body" class="note"><div class="empty">转写完成后，在上方选一种风格点「生成文稿」</div></div>
+  </section>
+</main>
+
+<div id="settings-modal" class="modal hidden">
+  <div class="modal-body">
+    <div class="modal-head">
+      <h2>设置</h2>
+      <button id="btn-close-settings" class="icon">×</button>
+    </div>
+    <p class="modal-tip">密钥保存在本地 <code>data/settings.json</code>，不会上传到任何第三方。留空的字段保持原值不变。</p>
+    <div id="settings-form" class="form"></div>
+    <div class="modal-foot">
+      <button id="btn-save-settings" class="btn primary">保存</button>
+      <button id="btn-cancel-settings" class="btn ghost">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
