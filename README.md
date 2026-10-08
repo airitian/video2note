@@ -339,6 +339,32 @@ git push
 推送后 ModelScope 会**自动重建**（实测约 3~8 分钟），不需要额外触发部署。
 可在创空间「日志」页查看启动输出。
 
+### 自动部署（GitHub Actions）
+
+仓库里带了 `.github/workflows/deploy-modelscope.yml`：向 GitHub 的 `main` 分支推送后，
+自动把代码同步到创空间并触发重建。也可以在 Actions 页手动点「Run workflow」。
+
+**一次性配置**：GitHub 仓库 → Settings → Secrets and variables → Actions → New repository secret
+
+| Secret | 值 |
+|---|---|
+| `MODELSCOPE_API_KEY` | ModelScope 访问令牌（[获取](https://modelscope.cn/my/myaccesstoken)） |
+
+workflow 里的目标创空间在文件顶部的 `env`（`STUDIO_OWNER` / `STUDIO_NAME` / `MODELSCOPE_HOST`）改。
+
+几个设计上的取舍：
+
+- **推送前先校验**：缺 `app.py` / `requirements.txt` 直接中止；若仓库里出现被跟踪的
+  `data/`、`.env`、`cookies.txt`、`*.log`，也会中止，防止密钥被推到创空间。
+- **不做 merge，用 orphan 分支强推**：创空间是部署目标而非代码源，
+  合并历史只会在文件冲突时卡死；以本地为准覆盖更可靠。
+- **内容一致就跳过推送**：与创空间 `master` 对比无差异时直接结束，省掉一次无意义的重建。
+- **令牌脱敏**：所有 git/curl 命令的输出都会把 `oauth2:xxx@` 替换成 `oauth2:***@`。
+
+> 也可以用本地脚本手动同步（不依赖 Actions）：
+> `export MODELSCOPE_TOKEN=你的令牌 && bash scripts/sync_to_studio.sh`
+> 两条路都可用，互不干扰。
+
 数据落地优先级：`V2N_DATA_DIR` → `/mnt/workspace/video2note`（创空间持久化目录）→ `项目/data`。
 创空间重启会保留 `/mnt/workspace`，但迁移或重命名会丢失，重要产物请及时导出。
 

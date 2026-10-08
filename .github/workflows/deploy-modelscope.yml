@@ -1,0 +1,180 @@
+name: Deploy to ModelScope Studio
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+# 同一时间只跑一个部署，避免两次 push 互相覆盖
+concurrency:
+  group: deploy-viva25-video-txt
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  STUDIO_OWNER: "viva25"
+  STUDIO_NAME: "video_txt"
+  MODELSCOPE_HOST: "modelscope.cn"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # ========== 1. 检出代码 ==========
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # ========== 2. 提交者身份 ==========
+      - name: Configure git
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          git config --global pull.rebase false
+
+      # ========== 3. 前置校验 ==========
+      # 创空间只认app.py；缺文件就别推了，否则线上直接起不来
+      - name: Preflight check
+        run: |
+          for f in app.py requirements.txt; do
+            if [ ! -f "$f" ]; then
+              echo "::error::缺少必需文件 $f，Gradio 创空间无法启动，已中止推送"
+              exit 1
+            fi
+          done
+          echo "文件齐全，待同步 $(git ls-files | wc -l | tr -d ' ') 个跟踪文件"
+          echo "---确认没有把密钥/Cookie 带进仓库---"
+          if git ls-files | grep -Ei '(^|/)(data|\.env|cookies\.txt)|\.log$' ; then
+            echo "::error::仓库里存在被跟踪的运行数据/密钥文件，请先加入 .gitignore"
+            exit 1
+          fi
+          echo "✅ 无敏感文件泄漏"
+
+      # ========== 4. 配置远端 ==========
+      - name: Add ModelScope remote
+        run: |
+          git remote remove modelscope 2>/dev/null || true
+          git remote add modelscope "https://oauth2:${{ secrets.MODELSCOPE_API_KEY }}@${{ env.MODELSCOPE_HOST }}/studios/${{ env.STUDIO_OWNER }}/${{ env.STUDIO_NAME }}.git"
+          # 只打印脱敏地址，避免令牌出现在日志里
+          echo "remote: $(git remote -v | grep modelscope | sed 's/oauth2:[^@]*@/oauth2:***@/')"
+
+      - name: Verify token
+        run: |
+          # 探测远端是否可访问；令牌错误会在这里直接失败，而不是等到push 才报错
+          if git ls-remote --heads modelscope >/dev/null 2>&1; then
+            echo "✅ 令牌有效，创空间仓库可访问"
+          else
+            echo "::error::无法访问创空间仓库，请检查 Secrets 里的 MODELSCOPE_API_KEY"
+            exit 1
+          fi
+
+      # ========== 5. 判断是否有变化 ==========
+      - name: Check for changes
+        id: check
+        run: |
+          # 创空间默认分支是 master；把远端 master 拉下来做树对比
+          git fetch modelscope master --depth=1 2>/dev/null || echo "远端暂无 master，首次部署"
+          if git rev-parse --verify modelscope/master >/dev/null 2>&1; then
+            # 比较「同一份源码」在两边是否已有差异（远端文件内容 vs 本地文件内容）
+            git diff --quiet modelscope/master HEAD -- . && SAME=1 || SAME=0
+          else
+            SAME=0
+          fi
+          if [ "$SAME" = "1" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "内容与创空间一致，跳过推送"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "检测到变化，准备推送"
+          fi
+
+      # ========== 6. 提交并推送 ==========
+      # 用「以本地为准」的orphan 分支推送，不做 merge：
+      # 创空间是部署目标而非代码源，保留它的历史没有意义，合并反而会卡在冲突上
+      - name: Push to ModelScope
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -e
+          git checkout --orphan deploy_master
+          git reset
+          git add -A
+          # data/、*.log、.env 已被 .gitignore 排除，不会进入提交
+          if git diff --cached --quiet; then
+            echo "没有需要推送的变更"
+            exit 0
+          fi
+          git commit -q -m "sync: $(date -u '+%Y-%m-%d %H:%M:%S') from GitHub Actions [${{ github.sha }}]"
+          echo "待推送提交："
+          git log -1 --oneline
+          echo "--- 推送（强制，覆盖创空间旧内容）---"
+          git push modelscope HEAD:master --force
+          echo "✅ 推送完成"
+
+      # ========== 7. 触发重建 ==========
+      - name: Trigger deploy
+        id: deploy
+        run: |
+          RESP=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://${{ env.MODELSCOPE_HOST }}/openapi/v1/studios/${{ env.STUDIO_OWNER }}/${{ env.STUDIO_NAME }}/deploy" \
+            -H "Authorization: Bearer ${{ secrets.MODELSCOPE_API_KEY }}" \
+            -H "Content-Type: application/json" || echo -e "\n000")
+          CODE=$(printf '%s' "$RESP" | tail -n1)
+          BODY=$(printf '%s' "$RESP" | sed '$d')
+          echo "HTTP $CODE"
+          echo "$BODY" | head -c 800
+          echo ""
+          # push 之后平台通常会自动重建；这里只是补一刀重启，失败也不算部署失败
+          if [ "$CODE" = "200" ]; then
+            echo "triggered=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "triggered=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::触发接口返回 $CODE；通常 push 后平台会自动重建，可到创空间日志页确认"
+          fi
+
+      # ========== 8. 轮询构建日志 ==========
+      - name: Check build log
+        run: |
+          for i in 1 2 3; do
+            sleep 40
+            echo "--- 第 $i 次检查（第 $((i*40)) 秒）---"
+            curl -s \
+              "https://${{ env.MODELSCOPE_HOST }}/openapi/v1/studios/${{ env.STUDIO_OWNER }}/${{ env.STUDIO_NAME }}/logs/run" \
+              -H "Authorization: Bearer ${{ secrets.MODELSCOPE_API_KEY }}" \
+            | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print('日志暂不可用'); sys.exit(0)
+data = d.get('data') or []
+rows = data[-8:] if isinstance(data, list) else []
+if not rows:
+    print('（暂无日志，平台可能还在排队构建）')
+for r in rows:
+    if isinstance(r, dict):
+        print(str(r.get('created_at') or r.get('time') or '')[:19], str(r.get('message') or r.get('content') or r)[:180])
+    else:
+        print(str(r)[:180])
+" || true
+          done
+
+      # ========== 9. 结果提示 ==========
+      - name: Summary
+        if: always()
+        run: |
+          echo ""
+          echo "=========================================="
+          echo " 创空间：${{ env.STUDIO_OWNER }}/${{ env.STUDIO_NAME }}"
+          echo " 地址：https://${{ env.MODELSCOPE_HOST }}/studios/${{ env.STUDIO_OWNER }}/${{ env.STUDIO_NAME }}"
+          echo " 推送：${{ steps.check.outputs.changed == 'true' && '已推送' || '内容一致，未推送' }}"
+          echo " 触发：${{ steps.deploy.outputs.triggered == 'true' && '已调用 deploy 接口' || '依赖平台自动重建' }}"
+          echo " 生效：约 3~8 分钟，请到创空间「日志」页确认启动完成"
+          echo "=========================================="
