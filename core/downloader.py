@@ -123,7 +123,44 @@ def _is_bilibili(url: str) -> bool:
     return any(k in u for k in ("bilibili.com", "b23.tv", "bilibili.tv"))
 
 
-def _base_opts(workdir: Path, url: str = "") -> dict:
+def _has_login_cookie() -> bool:
+    """是否配置了登录态 Cookie（SESSDATA / bili_jct / DedeUserID）
+
+    只有自动 buvid 时B站云 IP 大概率仍会 412；登录态才是真正的通行证。
+    """
+    cf = ensure_cookie_file()
+    if cf:
+        try:
+            from .config import COOKIE_FILE
+            path = Path(cf)
+            if path == COOKIE_FILE:
+                text = path.read_text("utf-8", errors="ignore")
+            else:
+                text = Path(cf).read_text("utf-8", errors="ignore")
+            return any(k in text for k in ("SESSDATA", "bili_jct", "DedeUserID"))
+        except Exception:
+            return True        # 有文件但读不了，姑且认为有
+    s = load_settings()
+    text = (s.get("cookie_text") or "") + (s.get("cookie_file") or "")
+    return any(k in text for k in ("SESSDATA", "bili_jct", "DedeUserID"))
+
+
+BILI_412_HINT = (
+    "B站风控拦截（HTTP 412）：已自动补充 buvid3 但仍被拒，说明这台服务器的 IP "
+    "被 B站深度风控。自动 buvid 在家用宽带上够用，在云服务器上通常不够。\n\n"
+    "解决办法：在「⚙️ 设置」页的「Cookie 文本」框粘贴浏览器里的B站 Cookie"
+    "（F12 → Network → 任意请求 → Request Headers → 复制整段 Cookie），"
+    "必须包含 SESSDATA / bili_jct / DedeUserID 这三项，保存后立即生效。\n\n"
+    "验证方式：设置页顶部应显示数据目录为 /mnt/workspace/video2note。"
+)
+
+
+def _base_opts(workdir: Path, url: str = "", bili_api: bool = False) -> dict:
+    """yt-dlp 参数
+
+    bili_api=True 时走 B站客户端 API 解析（video_app / web_embedded），
+    绕开 www.bilibili.com 网页的风控——云服务器 IP 上网页常 412，API 反而能通。
+    """
     s = load_settings()
     opts: dict = {
         "outtmpl": str(workdir / "%(id)s.%(ext)s"),
@@ -165,6 +202,9 @@ def _base_opts(workdir: Path, url: str = "") -> dict:
             opts["http_headers"].update(bv)
             if not cf:
                 opts["http_headers"]["Cookie"] = "; ".join(f"{k}={v}" for k, v in bv.items())
+        # 走客户端 API 而非网页：云 IP 上网页 412 时 API 往往还能通
+        opts["extractor_args"] = {"bilibili": {"video_app": "1" if bili_api else "0",
+                                               "prefer_video_codec": "avc"}}
 
     px = (s.get("proxy") or "").strip()
     if px:
@@ -330,42 +370,43 @@ def _ytdlp_download(url: str, workdir: Path, max_height: int,
             progress(pct, msg)
 
     emit(0.0, "解析视频信息")
-    try:
-        import yt_dlp
-        with yt_dlp.YoutubeDL(_base_opts(workdir, url)) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if info is None:
-                raise DownloadError("解析失败，未获取到视频信息")
-            if info.get("_type") == "playlist":
-                entries = [e for e in (info.get("entries") or []) if e]
+
+    def _probe(opts: dict, u: str) -> dict:
+        """用给定参数解析；合集则取首条"""
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            inf = ydl.extract_info(u, download=False)
+            if inf is not None and inf.get("_type") == "playlist":
+                entries = [x for x in (inf.get("entries") or []) if x]
                 if not entries:
                     raise DownloadError("合集/列表为空")
-                url = entries[0].get("webpage_url") or entries[0].get("url") or url
-                info = ydl.extract_info(url, download=False)
-                if info is None:
-                    raise DownloadError("解析合集首条失败")
+                u2 = entries[0].get("webpage_url") or entries[0].get("url") or u
+                inf = ydl.extract_info(u2, download=False)
+            if inf is None:
+                raise DownloadError("解析失败，未获取到视频信息")
+            return inf
+
+    try:
+        info = _probe(_base_opts(workdir, url), url)
     except DownloadError:
         raise
     except Exception as e:
-        # B站 412 基本都是风控：清掉缓存的 buvid 重新取一组再试一次，
-        # 仍失败才向上抛（_humanize_error 会给出可操作的提示）
+        # B站 412 是风控。逐级尝试：清 buvid 重试 -> 换客户端 API -> 换新 buvid + API
         if _is_bilibili(url) and _is_412(e):
-            _buvid_cache.clear()
-            emit(1.0, "触发 B站风控，正在重试")
-            try:
-                with yt_dlp.YoutubeDL(_base_opts(workdir, url)) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    if info is not None and info.get("_type") == "playlist":
-                        entries = [x for x in (info.get("entries") or []) if x]
-                        if entries:
-                            url = entries[0].get("webpage_url") or url
-                            info = ydl.extract_info(url, download=False)
-                    if info is None:
-                        raise DownloadError("解析失败，未获取到视频信息")
-            except DownloadError:
-                raise
-            except Exception as e2:
-                raise DownloadError(_humanize_error(e2))
+            last = e
+            for attempt, (clear, use_api) in enumerate(
+                    [(True, False), (False, True), (True, True)], start=1):
+                if clear:
+                    _buvid_cache.clear()
+                emit(float(attempt), f"B站风控，尝试第 {attempt} 种方式重试")
+                try:
+                    info = _probe(_base_opts(workdir, url, bili_api=use_api), url)
+                    break
+                except DownloadError:
+                    raise
+                except Exception as e2:
+                    last = e2
+            else:
+                raise DownloadError(_humanize_error(last))
         else:
             raise DownloadError(_humanize_error(e))
 
@@ -448,11 +489,12 @@ def _is_412(e: Exception) -> bool:
 def _humanize_error(e: Exception) -> str:
     msg = str(e)
     low = msg.lower()
-    # 412 放在最前面：风控错误的信息最容易被后续分支误判成普通下载失败
+    # 412 在最前面：风控错误的信息最容易被后续分支误判成普通下载失败
     if "412" in msg or "precondition failed" in low:
-        return ("B站风控拦截（HTTP 412）：服务器 IP 被判定为异常请求。"
-                "请在设置中粘贴浏览器的 B站 Cookie（含 SESSDATA / bili_jct / DedeUserID），"
-                "或稍后重试。")
+        if _is_bilibili(str(e)):
+            return BILI_412_HINT
+        return ("请求被平台风控拦截（HTTP 412）。"
+                "如为B站链接，请确认「设置」里已配置含 SESSDATA 的 Cookie。")
     if "unsupported url" in low or "no video formats" in low or "not a valid url" in low:
         return f"链接无法解析（请粘贴带 http(s):// 的完整链接）：{msg}"
     if "sign in" in low or "login" in low or "account" in low:
