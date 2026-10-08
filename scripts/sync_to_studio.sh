@@ -37,10 +37,15 @@ cd "$WORK/studio"
 # ---------- 覆盖代码（保留创空间侧 .git 与运行数据）----------
 echo "→ 同步文件..."
 cd "$ROOT"
-# 用 git 跟踪的文件列表为准，避免带上 data/、日志等本地运行数据
+# 用 git 跟踪的文件列表为准，避免带上 data/、日志等本地运行数据。
+# 从索引（git show :路径）取内容而不是直接 cp 工作区文件：工作区可能是 CRLF，
+# 而 ModelScope 的敏感扫描对 CRLF 文件会误判并回滚提交。
 git ls-files -z | while IFS= read -r -d '' f; do
+  case "$f" in
+    *.mp4|*.mp3|*.wav|*.png|*.jpg|*.ico|*.woff2) continue ;;
+  esac
   mkdir -p "$WORK/studio/$(dirname "$f")"
-  cp "$f" "$WORK/studio/$f"
+  git show ":$f" > "$WORK/studio/$f"
 done
 
 cd "$WORK/studio"
