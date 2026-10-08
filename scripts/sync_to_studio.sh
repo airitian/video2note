@@ -44,6 +44,10 @@ git ls-files -z | while IFS= read -r -d '' f; do
 done
 
 cd "$WORK/studio"
+# 临时克隆目录里没有全局身份，提交会失败；只在本仓库生效，不改用户全局配置
+git config user.email "sync@video2note.local"
+git config user.name "video2note sync"
+
 # 删除本地有、但已被 git 跟踪清单移除的文件
 git add -A
 
