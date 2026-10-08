@@ -40,11 +40,27 @@ def extract_url(text: str) -> str:
         return ""
     m = URL_RE.search(s)
     if m:
-        return m.group(0).rstrip(TRAIL)
+        return _fix_bv(m.group(0).rstrip(TRAIL))
     m = BARE_RE.search(s)
     if m:
-        return "https://" + m.group(0).lstrip("/").rstrip(TRAIL)
-    return s
+        return _fix_bv("https://" + m.group(0).lstrip("/").rstrip(TRAIL))
+    return _fix_bv(s)
+
+
+# B站 BV 号去掉 "BV" 后固定 10 位。分享时经常只给后半截（如 17Uhv6LEZX），
+# 少了 BV 前缀 yt-dlp 会直接报 Unsupported URL，这里补回去。
+_BV_SHORT = re.compile(r"(?:bilibili\.com/video/|b23\.tv/)([A-Za-z0-9]{10})(?![\w-])")
+
+
+def _fix_bv(url: str) -> str:
+    """把缺失 BV 前缀的B站短 ID 补全"""
+    m = _BV_SHORT.search(url or "")
+    if not m:
+        return url
+    vid = m.group(1)
+    if vid.startswith("BV"):
+        return url
+    return url[:m.start(1)] + "BV" + vid
 
 
 def detect_platform(url: str) -> str:
@@ -59,7 +75,55 @@ class DownloadError(RuntimeError):
     pass
 
 
-def _base_opts(workdir: Path) -> dict:
+# ========== B站风控（HTTP 412）相关 ==========
+# 412 Precondition Failed 不是「链接不对」，而是 B站的反爬机器人拦截：
+# 请求缺少 buvid3 这个设备标识就直接拒。yt-dlp 自己会去拿 buvid，
+# 但创空间是云服务器 IP，那一步请求本身就被拦，于是永远拿不到 buvid → 死循环在 412。
+# 解决办法：用浏览器 UA 直接调公开的 spi 接口取 buvid3 / buvid4（无需登录），塞进请求头。
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+_SPI_URL = "https://api.bilibili.com/x/frontend/finger/spi"
+
+# 常见浏览器头，缺 Referer / Accept-Language 也会被 B站判为异常请求
+BROWSER_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Referer": "https://www.bilibili.com/",
+}
+
+_buvid_cache: dict = {}
+
+
+def fetch_buvid(timeout: float = 12.0) -> dict:
+    """取 B站设备标识 buvid3 / buvid4（进程内缓存，无需登录）。
+
+    失败不抛异常——拿不到就返回空 dict，让调用方走原来的路径。
+    """
+    if _buvid_cache:
+        return _buvid_cache
+    import json
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(_SPI_URL, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8")).get("data") or {}
+        if data.get("b_3"):
+            _buvid_cache["buvid3"] = str(data["b_3"])
+        if data.get("b_4"):
+            _buvid_cache["buvid4"] = str(data["b_4"])
+    except Exception:
+        pass
+    return _buvid_cache
+
+
+def _is_bilibili(url: str) -> bool:
+    u = (url or "").lower()
+    return any(k in u for k in ("bilibili.com", "b23.tv", "bilibili.tv"))
+
+
+def _base_opts(workdir: Path, url: str = "") -> dict:
     s = load_settings()
     opts: dict = {
         "outtmpl": str(workdir / "%(id)s.%(ext)s"),
@@ -73,6 +137,8 @@ def _base_opts(workdir: Path) -> dict:
         "retries": 3,
         "fragment_retries": 3,
         "socket_timeout": 30,
+        # 浏览器头：B站 / 抖音对缺 Referer 的请求会直接 412
+        "http_headers": dict(BROWSER_HEADERS),
     }
     fp = (s.get("ffmpeg_path") or "").strip()
     if fp:
@@ -89,6 +155,17 @@ def _base_opts(workdir: Path) -> dict:
         name, _err = normalize_browser(cb)
         if name:
             opts["cookiesfrombrowser"] = (name,)
+
+    # B站兜底：补buvid3 / buvid4。风控要求这个设备标识，缺了就 412。
+    # 已有 cookiefile 时只补请求头（yt-dlp 会与 cookie 文件合并）；
+    # 没有 cookiefile 时直接用 Cookie 头携带。
+    if _is_bilibili(url):
+        bv = fetch_buvid()
+        if bv:
+            opts["http_headers"].update(bv)
+            if not cf:
+                opts["http_headers"]["Cookie"] = "; ".join(f"{k}={v}" for k, v in bv.items())
+
     px = (s.get("proxy") or "").strip()
     if px:
         opts["proxy"] = px
@@ -159,7 +236,7 @@ def _pick(info: dict, max_height: int) -> tuple[str | None, str | None]:
 def _download_one(url: str, workdir: Path, fmt_id: str, prefix: str,
                   progress: Callable[[float, str], None] | None) -> Path:
     workdir.mkdir(parents=True, exist_ok=True)
-    opts = _base_opts(workdir)
+    opts = _base_opts(workdir, url)
     opts["format"] = fmt_id
     opts["outtmpl"] = str(workdir / f"{prefix}.%(ext)s")
 
@@ -174,12 +251,29 @@ def _download_one(url: str, workdir: Path, fmt_id: str, prefix: str,
             progress(100.0, "下载完成")
 
     opts["progress_hooks"] = [hook]
-    try:
-        import yt_dlp
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-    except Exception as e:
-        raise DownloadError(_humanize_error(e))
+    last_exc: Exception | None = None
+    # 媒体流下载同样可能撞 412（解析过了但取CDN 时被拦），重试一次换新 buvid
+    for attempt in range(2):
+        try:
+            import yt_dlp
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+            last_exc = None
+            break
+        except Exception as e:
+            last_exc = e
+            if attempt == 0 and _is_bilibili(url) and _is_412(e):
+                _buvid_cache.clear()
+                opts = _base_opts(workdir, url)      # 重新取 buvid
+                opts["format"] = fmt_id
+                opts["outtmpl"] = str(workdir / f"{prefix}.%(ext)s")
+                opts["progress_hooks"] = [hook]
+                if progress:
+                    progress(0.0, "触发 B站风控，正在重试")
+                continue
+            break
+    if last_exc is not None:
+        raise DownloadError(_humanize_error(last_exc))
 
     cands = [p for p in workdir.iterdir()
              if p.is_file() and p.name.startswith(prefix + ".")
@@ -238,7 +332,7 @@ def _ytdlp_download(url: str, workdir: Path, max_height: int,
     emit(0.0, "解析视频信息")
     try:
         import yt_dlp
-        with yt_dlp.YoutubeDL(_base_opts(workdir)) as ydl:
+        with yt_dlp.YoutubeDL(_base_opts(workdir, url)) as ydl:
             info = ydl.extract_info(url, download=False)
             if info is None:
                 raise DownloadError("解析失败，未获取到视频信息")
@@ -253,7 +347,27 @@ def _ytdlp_download(url: str, workdir: Path, max_height: int,
     except DownloadError:
         raise
     except Exception as e:
-        raise DownloadError(_humanize_error(e))
+        # B站 412 基本都是风控：清掉缓存的 buvid 重新取一组再试一次，
+        # 仍失败才向上抛（_humanize_error 会给出可操作的提示）
+        if _is_bilibili(url) and _is_412(e):
+            _buvid_cache.clear()
+            emit(1.0, "触发 B站风控，正在重试")
+            try:
+                with yt_dlp.YoutubeDL(_base_opts(workdir, url)) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if info is not None and info.get("_type") == "playlist":
+                        entries = [x for x in (info.get("entries") or []) if x]
+                        if entries:
+                            url = entries[0].get("webpage_url") or url
+                            info = ydl.extract_info(url, download=False)
+                    if info is None:
+                        raise DownloadError("解析失败，未获取到视频信息")
+            except DownloadError:
+                raise
+            except Exception as e2:
+                raise DownloadError(_humanize_error(e2))
+        else:
+            raise DownloadError(_humanize_error(e))
 
     vid_id, aid_id = _pick(info, max_height)
     meta = _meta(info, url)
@@ -325,9 +439,20 @@ def _ytdlp_download(url: str, workdir: Path, max_height: int,
     return meta
 
 
+def _is_412(e: Exception) -> bool:
+    """判断异常是否是 B站的 412 风控"""
+    msg = str(e)
+    return "412" in msg or "Precondition Failed" in msg
+
+
 def _humanize_error(e: Exception) -> str:
     msg = str(e)
     low = msg.lower()
+    # 412 放在最前面：风控错误的信息最容易被后续分支误判成普通下载失败
+    if "412" in msg or "precondition failed" in low:
+        return ("B站风控拦截（HTTP 412）：服务器 IP 被判定为异常请求。"
+                "请在设置中粘贴浏览器的 B站 Cookie（含 SESSDATA / bili_jct / DedeUserID），"
+                "或稍后重试。")
     if "unsupported url" in low or "no video formats" in low or "not a valid url" in low:
         return f"链接无法解析（请粘贴带 http(s):// 的完整链接）：{msg}"
     if "sign in" in low or "login" in low or "account" in low:
