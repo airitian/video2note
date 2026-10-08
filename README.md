@@ -200,8 +200,19 @@ PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
 > ⚠️「从浏览器读取」框只接受浏览器名。往里粘 Cookie 内容会被校验拦下并提示，
 > 这是为了避免把两种 Cookie 来源搞混。
 
-抖音与B站共用同一份 Cookie 配置，作用域按 `cookies.txt` 里的 domain 区分。`cookie_text` 还支持首行
-写 `# domain=.douyin.com` 手动指定作用域，不写则从文本里推断，兜底 `.douyin.com`。
+抖音与 B站的 Cookie **必须分开填**，两者域名不同，混在一起会因作用域不匹配而双双失效：
+
+| 平台 | 页面输入框 | 配置项 | 落盘文件 | 固定域名 |
+|---|---|---|---|---|
+| 抖音 | 抖音 Cookie 文本 | `cookie_text` | `data/cookies.txt` | `.douyin.com` |
+| B站 | B站 Cookie 文本 | `cookie_text_bili` | `data/cookies_bili.txt` | `.bilibili.com` |
+
+下载时会按链接自动选对应通道；B站若未单独配置，会回退读抖音通道以兼容早期配置。
+
+- 清空某个平台的 Cookie 框并保存，对应的 `cookies*.txt` 会一并删除，不会出现
+  「页面回显为空、下载却仍在用旧 Cookie」的情况。
+- B站 Cookie 至少要含 `SESSDATA`，带上 `bili_jct` / `DedeUserID` 更稳，否则大概率返回 412。
+- 仍支持首行写 `# domain=.xxx.com` 手动指定作用域，覆盖默认域名。
 
 ## 视频预览为什么只有声音
 
@@ -263,7 +274,11 @@ video2note/
 | ASR 密钥 | `V2N_ASR_API_KEY`（别名 `MOARK_API_TOKEN`） | 模力方舟语音识别 |
 | LLM 密钥 | `V2N_LLM_API_KEY`（留空则复用 ASR） | 大模型整理 |
 | 语音识别语言 | `V2N_ASR_LANGUAGE` | 默认 `zh` |
-| 抖音 Cookie | `V2N_COOKIE_FILE` 或页面「Cookie 文本」 | 抖音解析需要 |
+| 抖音 Cookie | `V2N_COOKIE_TEXT` 或页面「抖音 Cookie 文本」 | 抖音解析需要 |
+| B站 Cookie | `V2N_COOKIE_TEXT_BILI` 或页面「B站 Cookie 文本」 | 含 SESSDATA，缓解 412 |
+
+> `V2N_COOKIE_FILE` 仍可用于指定一个已有的 Netscape cookies.txt 绝对路径，但优先级低于上面两项，
+> 仅在需要共用同一份 Cookie 文件时才用。
 
 页面上的密钥框在检测到环境变量后会显示「已由环境变量 XXX 托管，页面不可修改」。
 

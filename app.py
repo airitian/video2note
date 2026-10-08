@@ -395,7 +395,8 @@ def clean_media(days: float) -> str:
 def save_ui_settings(asr_key: str, llm_key: str, asr_base: str, llm_base: str,
                      protocol: str, max_tokens: str,
                      asr_model: str, llm_model: str, chunk_seconds: float,
-                     concurrency: float, cookie: str, cookie_text: str) -> str:
+                     concurrency: float, cookie: str, cookie_text: str,
+                     cookie_text_bili: str) -> str:
     """保存页面配置到持久化 settings.json；密钥留空表示不修改"""
     patch: dict[str, str] = {
         "asr_base_url": (asr_base or "").strip(),
@@ -408,6 +409,7 @@ def save_ui_settings(asr_key: str, llm_key: str, asr_base: str, llm_base: str,
         "max_concurrency": str(int(concurrency or 4)),
         "cookie_browser": (cookie or "").strip(),
         "cookie_text": (cookie_text or "").strip(),
+        "cookie_text_bili": (cookie_text_bili or "").strip(),
     }
     if (asr_key or "").strip():
         patch["asr_api_key"] = asr_key.strip()
@@ -421,16 +423,19 @@ def save_ui_settings(asr_key: str, llm_key: str, asr_base: str, llm_base: str,
             return "❌ " + err
 
     save_settings(patch)
-    cookie_note = ""
-    if patch["cookie_text"]:
-        path = ensure_cookie_file()          # 立刻落盘，后续下载直接用
-        cookie_note = (f"；Cookie 已写入 `{path}`" if path
-                       else "；⚠️ Cookie 文本未能解析成有效条目，请检查后重试")
+
+    # 两个平台各自落盘；即使被清空也要调用，内部会删掉残留文件，
+    # 否则页面回显为空、下载却仍在用旧 Cookie。
+    notes = []
+    for label, plat in (("抖音", "douyin"), ("B站", "bilibili")):
+        p = ensure_cookie_file(plat)
+        notes.append(f"{label} Cookie 已写入 `{p}`" if p else f"{label} Cookie 已清空")
+
     masked = public_settings()
     masked.setdefault("asr_api_key", "")
     return ("✅ 配置已保存（ASR 密钥：" + (masked.get("asr_api_key") or "未设置")
             + " / LLM 密钥：" + (masked.get("llm_api_key") or "复用 ASR 密钥")
-            + cookie_note
+            + "；" + "；".join(notes)
             + f"），数据目录 `{DATA_DIR}`")
 
 
@@ -591,13 +596,16 @@ with comp(gr.Blocks, title=APP_TITLE, theme=gr.themes.Soft(), css=CUSTOM_CSS,
                 conc_sl = comp(gr.Slider, 1, 8, step=1,
                                value=int(_default.get("max_concurrency") or 4),
                                visible=False, label=HELP["max_concurrency"])
-            cookie_text_tb = comp(gr.Textbox, label=HELP["cookie_text"], lines=5,
+            cookie_text_tb = comp(gr.Textbox, label=HELP["cookie_text"], lines=4,
                                   value=_default.get("cookie_text", ""),
-                                  placeholder="粘贴 Netscape 格式 cookies.txt 全文；"
-                                              "也可直接粘贴 a=1; b=2 这种请求头串（会自动转换）")
+                                  placeholder="粘贴抖音网页的 Cookie 整段（a=1; b=2）；"
+                                              "也可直接粘贴 Netscape cookies.txt 全文")
+            cookie_bili_tb = comp(gr.Textbox, label=HELP["cookie_text_bili"], lines=4,
+                                  value=_default.get("cookie_text_bili", ""),
+                                  placeholder="粘贴 B站网页的 Cookie 整段，必须含SESSDATA")
             cookie_tb = comp(gr.Textbox, label=HELP["cookie_browser"],
                              value=_default.get("cookie_browser", ""),
-                             placeholder="chrome / edge / firefox（与上方 Cookie 文本二选一）")
+                             placeholder="chrome / edge / firefox（容器环境不可用，优先用上面的 Cookie 文本）")
             save_btn = comp(gr.Button, value="💾 保存配置", variant="primary")
             save_msg = comp(gr.Markdown, value="")
 
@@ -649,7 +657,7 @@ with comp(gr.Blocks, title=APP_TITLE, theme=gr.themes.Soft(), css=CUSTOM_CSS,
         inputs=[asr_key_tb, llm_key_tb, asr_base_tb, llm_base_tb,
                 proto_dd, maxtok_tb,
                 set_asr_model_tb, set_llm_model_tb, chunk_sl, conc_sl,
-                cookie_tb, cookie_text_tb],
+                cookie_tb, cookie_text_tb, cookie_bili_tb],
         outputs=[save_msg],
     )
     clean_btn.click(fn=clean_media, inputs=[days_sl], outputs=[clean_msg])

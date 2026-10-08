@@ -124,34 +124,31 @@ def _is_bilibili(url: str) -> bool:
 
 
 def _has_login_cookie() -> bool:
-    """是否配置了登录态 Cookie（SESSDATA / bili_jct / DedeUserID）
+    """B站是否配置了登录态 Cookie（SESSDATA / bili_jct / DedeUserID）
 
-    只有自动 buvid 时B站云 IP 大概率仍会 412；登录态才是真正的通行证。
+    只有自动 buvid 时 B站云 IP 大概率仍会 412；登录态才是真正的通行证。
     """
-    cf = ensure_cookie_file()
+    cf = ensure_cookie_file("bilibili")
     if cf:
         try:
-            from .config import COOKIE_FILE
-            path = Path(cf)
-            if path == COOKIE_FILE:
-                text = path.read_text("utf-8", errors="ignore")
-            else:
-                text = Path(cf).read_text("utf-8", errors="ignore")
+            text = Path(cf).read_text("utf-8", errors="ignore")
             return any(k in text for k in ("SESSDATA", "bili_jct", "DedeUserID"))
         except Exception:
             return True        # 有文件但读不了，姑且认为有
     s = load_settings()
-    text = (s.get("cookie_text") or "") + (s.get("cookie_file") or "")
+    text = ((s.get("cookie_text_bili") or "") + (s.get("cookie_file") or "")).strip()
     return any(k in text for k in ("SESSDATA", "bili_jct", "DedeUserID"))
 
 
 BILI_412_HINT = (
     "B站风控拦截（HTTP 412）：已自动补充 buvid3 但仍被拒，说明这台服务器的 IP "
     "被 B站深度风控。自动 buvid 在家用宽带上够用，在云服务器上通常不够。\n\n"
-    "解决办法：在「⚙️ 设置」页的「Cookie 文本」框粘贴浏览器里的B站 Cookie"
+    "解决办法：在「⚙️ 设置」页的「B站 Cookie 文本」框粘贴浏览器里的B站 Cookie"
     "（F12 → Network → 任意请求 → Request Headers → 复制整段 Cookie），"
     "必须包含 SESSDATA / bili_jct / DedeUserID 这三项，保存后立即生效。\n\n"
-    "验证方式：设置页顶部应显示数据目录为 /mnt/workspace/video2note。"
+    "注意：不要再粘到「抖音 Cookie 文本」框——两个平台的 Cookie 必须分开填，"
+    "混在一起会因域名不匹配而全部失效。\n\n"
+    "验证方式：设置页保存后应提示「B站 Cookie 已写入 cookies_bili.txt」。"
 )
 
 
@@ -180,8 +177,13 @@ def _base_opts(workdir: Path, url: str = "", bili_api: bool = False) -> dict:
     fp = (s.get("ffmpeg_path") or "").strip()
     if fp:
         opts["ffmpeg_location"] = str(Path(fp).parent)
-    # Cookie 优先级：粘贴的文本 > 指定文件路径 > 从浏览器读取
-    cf = ensure_cookie_file()
+    # Cookie 优先级：本平台粘贴的文本 > 指定文件路径 > 从浏览器读取
+    # 两个平台的 Cookie 存在独立通道里，B站只认 cookie_text_bili：
+    # 抖音的 sessionid 落到 .bilibili.com 域名下是无效的，反之亦然。
+    plat = "bilibili" if _is_bilibili(url) else "douyin"
+    cf = ensure_cookie_file(plat)
+    if not cf and plat == "bilibili":
+        cf = ensure_cookie_file("douyin")   # 兼容早期只填了一个框的旧配置
     if not cf:
         cf = (s.get("cookie_file") or "").strip()
     cb = (s.get("cookie_browser") or "").strip()

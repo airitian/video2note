@@ -89,12 +89,20 @@ def post_settings(body: SettingsIn):
             raise HTTPException(status_code=400, detail=err)
         body.values["cookie_browser"] = name
     save_settings(body.values)
-    # Cookie 文本有更新时立刻落盘，供后续下载使用
-    cookie_file = ""
+    # Cookie 文本有变化时立刻落盘，供后续下载使用。
+    # 即使被清空也要调一次——ensure_cookie_file 内部会删掉残留文件，
+    # 否则页面回显为空、下载却仍在用旧 Cookie。
+    files: dict[str, str] = {}
     if "cookie_text" in body.values:
-        cookie_file = ensure_cookie_file()
+        p = ensure_cookie_file("douyin")
+        if p:
+            files["douyin"] = p
+    if "cookie_text_bili" in body.values:
+        p = ensure_cookie_file("bilibili")
+        if p:
+            files["bilibili"] = p
     return {"ok": True, "values": public_settings(), "help": HELP,
-            "cookie_file": cookie_file}
+            "cookie_files": files}
 
 
 @app.get("/api/health")

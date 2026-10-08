@@ -433,19 +433,24 @@
 
   function openSettings() {
     const v = settingsCache.values || {}, help = settingsCache.help || {};
-    const full = ["asr_base_url", "llm_base_url", "cookie_file", "cookie_text", "proxy", "ffmpeg_path"];
-    // 针对 Cookie 相关的框给出「怎么填」的具体提示，避免填错位置
+    const full = ["asr_base_url", "llm_base_url", "cookie_file", "cookie_text",
+                  "cookie_text_bili", "proxy", "ffmpeg_path"];
+    // 抖音与B站的 Cookie 必须分开填：域名不同，混在一起两边都会失效
+    const areas = ["cookie_text", "cookie_text_bili"];
     const PH = {
-      cookie_text: "方式1（推荐）：浏览器 F12 → Network → 点任意请求 → Request Headers → " +
-        "复制整段 Cookie（形如 a=1; b=2）粘到这里，程序自动转 cookies.txt。也接受 Netscape 格式全文。",
-      cookie_browser: "方式2：只填浏览器名，不要粘贴 Cookie 内容。chrome / edge / firefox / brave。",
-      cookie_file: "方式3：本机已有的 Netscape cookies.txt 绝对路径，例如 D:\\cookies.txt（一般用不到）。",
+      cookie_text: "【抖音】F12 → Network → 点任意请求 → Request Headers → 复制整段 Cookie"
+        + "（形如 a=1; b=2）粘到这里，程序自动转 cookies.txt。也接受 Netscape 格式全文。",
+      cookie_text_bili: "【B站】在 B站登录后按同样方式复制 Cookie，必须含 SESSDATA"
+        + "（bili_jct / DedeUserID 有了更稳），否则会返回 412。自动转 cookies_bili.txt。",
+      cookie_browser: "只填浏览器名，不要粘贴 Cookie 内容。chrome / edge / firefox / brave。"
+        + "（容器/云端环境没有浏览器，优先用上面的 Cookie 文本框）",
+      cookie_file: "本机已有的 Netscape cookies.txt 绝对路径，例如 D:\\cookies.txt（一般用不到）。",
     };
     $("#settings-form").innerHTML = Object.keys(help).map((k) => {
       const wide = full.includes(k) ? " full" : "";
       const val = v[k] !== undefined ? v[k] : "";
-      const ctl = k === "cookie_text"
-        ? '<textarea data-key="' + k + '" rows="5" placeholder="' + esc(PH.cookie_text) + '">' + esc(val) + "</textarea>"
+      const ctl = areas.includes(k)
+        ? '<textarea data-key="' + k + '" rows="4" placeholder="' + esc(PH[k] || "") + '">' + esc(val) + "</textarea>"
         : '<input data-key="' + k + '" value="' + esc(val) + '" placeholder="' + esc(PH[k] || "") + '">';
       return '<div class="field' + wide + '"><label>' + esc(help[k]) + "</label>" + ctl + "</div>";
     }).join("");
@@ -464,7 +469,9 @@
       const r = await api("/api/settings", { method: "POST", body: JSON.stringify({ values: values }) });
       settingsCache = r;
       $("#settings-modal").classList.add("hidden");
-      toast(r && r.cookie_file ? "设置已保存，Cookie 已写入 " + r.cookie_file : "设置已保存");
+      const f = (r && r.cookie_files) || {};
+      const written = Object.keys(f).map((k) => (k === "bilibili" ? "B站" : "抖音") + " Cookie 已写入 " + f[k]);
+      toast(written.length ? "设置已保存；" + written.join("；") : "设置已保存");
     } catch (e) {
       toast(e.message, true);
     }

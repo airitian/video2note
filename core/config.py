@@ -47,7 +47,8 @@ DEFAULTS: dict[str, str] = {
     # ---- 工程参数 ----
     "chunk_seconds": "600",
     "max_concurrency": "4",
-    "cookie_text": "",                       # 直接粘贴的 Cookie 文本，自动落盘成 cookies.txt
+    "cookie_text": "",                       # 抖音 Cookie 文本，自动落盘成 cookies.txt
+    "cookie_text_bili": "",                  # B站 Cookie 文本，落盘成 cookies_bili.txt
     "cookie_browser": "",
     "cookie_file": "",
     "proxy": "",
@@ -81,10 +82,14 @@ HELP: dict[str, str] = {
     "llm_temperature": "生成温度 0-1",
     "chunk_seconds": "长音频切片时长（秒），短视频无需调整",
     "max_concurrency": "转写并发数",
-    "cookie_text": "【方式1｜推荐】Cookie 文本 —— 直接粘贴一整段 Cookie。"
+    "cookie_text": "【抖音】Cookie 文本 —— 直接粘贴一整段 Cookie。"
                    "浏览器 F12 → Network → 任意请求 → Request Headers → 复制 Cookie 整段粘进来即可"
                    "（形如 a=1; b=2），程序会自动转成 cookies.txt；"
-                   "也接受 Netscape cookies.txt 全文。抖音/B站需要登录态时必填",
+                   "也接受 Netscape cookies.txt 全文。抖音视频需要登录态时必填",
+    "cookie_text_bili": "【B站】Cookie 文本 —— 与上面的抖音 Cookie 分开填写。"
+                        "B站登录后在 F12 → Network → 点任意请求 → Request Headers → 复制 Cookie 整段。"
+                        "必须包含 SESSDATA（bili_jct / DedeUserID 有了更稳），"
+                        "否则风控会返回 412。程序自动转成 cookies_bili.txt，域名固定为 .bilibili.com",
     "cookie_browser": "【方式2】从浏览器读取 —— 只填浏览器名，不要粘贴任何 Cookie 内容。"
                       "可用值：chrome / edge / firefox / brave / chromium / opera / safari / vivaldi / whale。"
                       "程序会调用 browser-cookie 库直接读本机该浏览器的 Cookie（需先在浏览器登录）",
@@ -205,13 +210,17 @@ _NOT_COOKIE = {"domain", "path", "expires", "max-age", "secure", "httponly", "sa
 _FAR_FUTURE = "2147483647"
 
 
-def normalize_cookie_text(text: str) -> str:
+def normalize_cookie_text(text: str, default_domain: str = "") -> str:
     """把粘贴进来的 Cookie 文本规整成 Netscape cookies.txt 内容。
 
     支持三种输入：
     1. Netscape cookies.txt 全文（有表头或 tab 分隔行）→ 原样保留，只补齐表头
     2. 请求头串 `a=1; b=2` 或每行 `a=1` → 自动转成 Netscape 行
-    3. 首行可写 `# domain=.douyin.com` 指定作用域，否则从文本里猜，兜底 `.douyin.com`
+    3. 首行可写 `# domain=.douyin.com` 指定作用域，否则用 default_domain，
+       都没给才从文本里猜，最后兜底 .douyin.com
+
+    default_domain 用来把各平台 Cookie 钉到自己的域名上：B站的登录态落在
+    .douyin.com 下是无效的，不能靠猜。
     """
     raw = (text or "").replace("\r\n", "\n").strip()
     if not raw:
@@ -222,6 +231,8 @@ def normalize_cookie_text(text: str) -> str:
     if m:
         domain = m.group(1)
         raw = re.sub(r"^#\s*domain\s*=\s*\S+[ \t]*\n?", "", raw, count=1, flags=re.I)
+    if not domain:
+        domain = (default_domain or "").strip()
     if not domain:
         dm = _DOMAIN_HINT.search(raw)
         domain = dm.group(1) if dm else ".douyin.com"
@@ -250,25 +261,47 @@ def normalize_cookie_text(text: str) -> str:
     return "\n".join(rows) + "\n"
 
 
-def ensure_cookie_file() -> str:
-    """把配置中的 cookie_text 落盘为 cookies.txt，返回其路径；无内容返回 ''"""
-    text = (load_settings().get("cookie_text") or "").strip()
+# 平台 -> (配置项名, cookies.txt 文件名, 默认域名)
+COOKIE_CHANNELS: dict[str, tuple[str, str, str]] = {
+    "douyin": ("cookie_text", "cookies.txt", ".douyin.com"),
+    "bilibili": ("cookie_text_bili", "cookies_bili.txt", ".bilibili.com"),
+}
+
+
+def _remove_cookie_file(path: Path) -> None:
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
+def ensure_cookie_file(platform: str = "douyin") -> str:
+    """把该平台配置里的 Cookie 文本落盘为 cookies*.txt，返回路径；无内容返回 ''
+
+    文本被清空时必须删掉已落盘的文件，否则会出现「页面回显为空、下载却仍在用
+    旧 Cookie」的不一致——残留文件照样会被 yt-dlp 读走。
+    """
+    key, fname, domain = COOKIE_CHANNELS.get(platform, COOKIE_CHANNELS["douyin"])
+    path = DATA_DIR / fname
+    text = (load_settings().get(key) or "").strip()
     if not text:
+        _remove_cookie_file(path)
         return ""
     ensure_dirs()
-    content = normalize_cookie_text(text)
+    content = normalize_cookie_text(text, default_domain=domain)
     if not content:
         return ""
     try:
-        if COOKIE_FILE.exists() and COOKIE_FILE.read_text("utf-8", errors="ignore") == content:
-            return str(COOKIE_FILE)
+        if path.exists() and path.read_text("utf-8", errors="ignore") == content:
+            return str(path)
     except Exception:
         pass
     try:
-        COOKIE_FILE.write_text(content, encoding="utf-8")
+        path.write_text(content, encoding="utf-8")
     except Exception:
         return ""
-    return str(COOKIE_FILE)
+    return str(path)
 
 
 def public_settings() -> dict:
