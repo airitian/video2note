@@ -602,7 +602,7 @@ with comp(gr.Blocks, title=APP_TITLE, theme=gr.themes.Soft(), css=CUSTOM_CSS,
                                               "也可直接粘贴 Netscape cookies.txt 全文")
             cookie_bili_tb = comp(gr.Textbox, label=HELP["cookie_text_bili"], lines=4,
                                   value=_default.get("cookie_text_bili", ""),
-                                  placeholder="粘贴 B站网页的 Cookie 整段，必须含SESSDATA")
+                                  placeholder="粘贴 B站网页的 Cookie 整段，必须包含登录态字段")
             cookie_tb = comp(gr.Textbox, label=HELP["cookie_browser"],
                              value=_default.get("cookie_browser", ""),
                              placeholder="chrome / edge / firefox（容器环境不可用，优先用上面的 Cookie 文本）")

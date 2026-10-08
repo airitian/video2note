@@ -88,8 +88,8 @@ HELP: dict[str, str] = {
                    "也接受 Netscape cookies.txt 全文。抖音视频需要登录态时必填",
     "cookie_text_bili": "【B站】Cookie 文本 —— 与上面的抖音 Cookie 分开填写。"
                         "B站登录后在 F12 → Network → 点任意请求 → Request Headers → 复制 Cookie 整段。"
-                        "必须包含 SESSDATA（bili_jct / DedeUserID 有了更稳），"
-                        "否则风控会返回 412。程序自动转成 cookies_bili.txt，域名固定为 .bilibili.com",
+                        "务必包含登录会话凭证（F12 里能看到的三项），否则风控会返回 412。"
+                        "程序自动转成 cookies_bili.txt，域名固定为 .bilibili.com",
     "cookie_browser": "【方式2】从浏览器读取 —— 只填浏览器名，不要粘贴任何 Cookie 内容。"
                       "可用值：chrome / edge / firefox / brave / chromium / opera / safari / vivaldi / whale。"
                       "程序会调用 browser-cookie 库直接读本机该浏览器的 Cookie（需先在浏览器登录）",

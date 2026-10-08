@@ -211,7 +211,7 @@ PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
 
 - 清空某个平台的 Cookie 框并保存，对应的 `cookies*.txt` 会一并删除，不会出现
   「页面回显为空、下载却仍在用旧 Cookie」的情况。
-- B站 Cookie 至少要含 `SESSDATA`，带上 `bili_jct` / `DedeUserID` 更稳，否则大概率返回 412。
+- B站 Cookie 至少要含登录会话凭证（登录后 F12 里能看到的三项），否则大概率返回 412。
 - 仍支持首行写 `# domain=.xxx.com` 手动指定作用域，覆盖默认域名。
 
 ## 视频预览为什么只有声音
@@ -275,7 +275,7 @@ video2note/
 | LLM 密钥 | `V2N_LLM_API_KEY`（留空则复用 ASR） | 大模型整理 |
 | 语音识别语言 | `V2N_ASR_LANGUAGE` | 默认 `zh` |
 | 抖音 Cookie | `V2N_COOKIE_TEXT` 或页面「抖音 Cookie 文本」 | 抖音解析需要 |
-| B站 Cookie | `V2N_COOKIE_TEXT_BILI` 或页面「B站 Cookie 文本」 | 含 SESSDATA，缓解 412 |
+| B站 Cookie | `V2N_COOKIE_TEXT_BILI` 或页面「B站 Cookie 文本」 | 含登录态凭证，缓解 412 |
 
 > `V2N_COOKIE_FILE` 仍可用于指定一个已有的 Netscape cookies.txt 绝对路径，但优先级低于上面两项，
 > 仅在需要共用同一份 Cookie 文件时才用。

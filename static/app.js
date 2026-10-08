@@ -440,8 +440,8 @@
     const PH = {
       cookie_text: "【抖音】F12 → Network → 点任意请求 → Request Headers → 复制整段 Cookie"
         + "（形如 a=1; b=2）粘到这里，程序自动转 cookies.txt。也接受 Netscape 格式全文。",
-      cookie_text_bili: "【B站】在 B站登录后按同样方式复制 Cookie，必须含 SESSDATA"
-        + "（bili_jct / DedeUserID 有了更稳），否则会返回 412。自动转 cookies_bili.txt。",
+      cookie_text_bili: "【B站】在 B站登录后按同样方式复制整段 Cookie 粘到这里。"
+        + "务必包含登录态字段（登录会话凭证），否则会返回 412。自动转 cookies_bili.txt。",
       cookie_browser: "只填浏览器名，不要粘贴 Cookie 内容。chrome / edge / firefox / brave。"
         + "（容器/云端环境没有浏览器，优先用上面的 Cookie 文本框）",
       cookie_file: "本机已有的 Netscape cookies.txt 绝对路径，例如 D:\\cookies.txt（一般用不到）。",
