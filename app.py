@@ -468,6 +468,8 @@ CUSTOM_CSS = """
 """
 
 _default = load_settings()
+# 由环境变量托管的配置项（部署平台注入密钥时，页面只读，避免误改与回显）
+_from_env = (public_settings() or {}).get("_from_env") or {}
 
 with comp(gr.Blocks, title=APP_TITLE, theme=gr.themes.Soft(), css=CUSTOM_CSS,
           analytics_enabled=False) as demo:
@@ -557,9 +559,15 @@ with comp(gr.Blocks, title=APP_TITLE, theme=gr.themes.Soft(), css=CUSTOM_CSS,
             comp(gr.Markdown, value="### 密钥配置")
             with gr.Row():
                 asr_key_tb = comp(gr.Textbox, label=HELP["asr_api_key"], type="password",
-                                  placeholder="留空表示不修改")
+                                  interactive=not _from_env.get("asr_api_key"),
+                                  placeholder=("已由环境变量 %s 托管，页面不可修改"
+                                               % _from_env["asr_api_key"])
+                                  if _from_env.get("asr_api_key") else "留空表示不修改")
                 llm_key_tb = comp(gr.Textbox, label=HELP["llm_api_key"], type="password",
-                                  placeholder="留空则复用 ASR 密钥")
+                                  interactive=not _from_env.get("llm_api_key"),
+                                  placeholder=("已由环境变量 %s 托管，页面不可修改"
+                                               % _from_env["llm_api_key"])
+                                  if _from_env.get("llm_api_key") else "留空则复用 ASR 密钥")
             with gr.Row():
                 asr_base_tb = comp(gr.Textbox, label=HELP["asr_base_url"], value=_default["asr_base_url"])
                 llm_base_tb = comp(gr.Textbox, label=HELP["llm_base_url"], value=_default["llm_base_url"])

@@ -171,7 +171,7 @@ def _pyktok_detail(url: str, cookies: dict) -> dict | None:
     try:
         signed = asyncio.run(sign())
     except Exception as e:
-        raise DouyinError(f"pyktok 签名失败：{type(e).__name__}: {e}") from e
+        raise DouyinError(_friendly_sign_error(e)) from e
 
     params = {k: v for k, v in (signed or {}).items()
               if k.lower() in ("x-bogus", "a_bogus", "ms-token", "mstoken")
@@ -252,6 +252,18 @@ def _normalize(item: dict) -> dict:
         "_direct_url": _pick_url(item),
         "_origin": "pyktok",
     }
+
+
+def _friendly_sign_error(e: Exception) -> str:
+    """把 Playwright 的长篇报错压缩成一句能读懂的话"""
+    msg = str(e)
+    if "Executable doesn't exist" in msg or "playwright install" in msg:
+        return ("抖音兜底失败：服务器未安装 Playwright 浏览器内核。"
+                "如需在服务端启用抖音兜底，请执行 `playwright install --with-deps chromium`；"
+                "否则请更新 Cookie 或改用yt-dlp 解析。")
+    if "Executable doesn't exist" in msg:
+        return "抖音兜底失败：缺少 Playwright 浏览器内核，请执行 playwright install chromium"
+    return f"pyktok 签名失败：{type(e).__name__}: {msg[:200]}"
 
 
 def download(url: str, workdir: Path,

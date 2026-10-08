@@ -248,6 +248,43 @@ video2note/
 3. 在「设置 → Secrets」里添加 `V2N_ASR_API_KEY`（可选 `V2N_LLM_API_KEY`）
 4. 平台会自动安装依赖并在 **7860** 端口拉起服务
 
+### 密钥托管：优先用环境变量，不要在页面上填
+
+**推荐做法**：在创空间「设置 → Secrets」里配好环境变量，页面上的密钥框会自动变为**只读**，
+不会回显密钥内容，也不用担心有人误改或误存。
+
+配置优先级：**内置默认值 < `data/settings.json` < 环境变量**（环境变量最高）。
+
+这条顺序很重要——即使 `settings.json` 里残留了旧密钥，也会被环境变量覆盖，
+不会出现「换了 Secret 但线上还在用旧密钥」的情况。
+
+| 配置项 | 环境变量名（推荐） | 说明 |
+|---|---|---|
+| ASR 密钥 | `V2N_ASR_API_KEY`（别名 `MOARK_API_TOKEN`） | 模力方舟语音识别 |
+| LLM 密钥 | `V2N_LLM_API_KEY`（留空则复用 ASR） | 大模型整理 |
+| 语音识别语言 | `V2N_ASR_LANGUAGE` | 默认 `zh` |
+| 抖音 Cookie | `V2N_COOKIE_FILE` 或页面「Cookie 文本」 | 抖音解析需要 |
+
+页面上的密钥框在检测到环境变量后会显示「已由环境变量 XXX 托管，页面不可修改」。
+
+###跨平台说明（本地 Windows / 线上 Linux）
+
+项目代码本身**不含Windows 专用代码**，`core/` 全目录扫描无 `winreg`、`os.startfile`、
+`ctypes.windll`，ffmpeg 通过 `shutil.which()` 走 `PATH`，两套系统通用。
+部署 workflow 里也加了平台兼容检查，检测到 Windows 专用 API 会直接让流水线失败。
+
+两处需要注意的系统差异：
+
+| 项 | Windows 本地 |创空间 Linux |
+|---|---|---|
+| 数据目录 | `项目/data/` | `/mnt/workspace/video2note`（自动识别，可持久化） |
+| Playwright 内核 | 本机已装 | **未预装**，抖音兜底不可用 |
+
+关于抖音：主链路是 **yt-dlp**（带 Cookie 时 B站与抖音都能解析），**pyktok 只是兜底**。
+创空间未装 Chromium 时，兜底会给出明确提示并跳过，不影响yt-dlp 主链路。
+若确实要在创空间启用抖音兜底，需在启动脚本里执行
+`python -m playwright install --with-deps chromium`（2 核 8G 容器内存偏紧，Chromium 会占用较多资源）。
+
 ### 推送到 GitHub
 
 ```bash
@@ -261,6 +298,17 @@ git push -u origin main
 
 `data/`（含 tasks / media / cookies.txt / settings.json）与 `*.log` 已在 `.gitignore` 中排除，
 不会把密钥和 Cookie 提交上去。首次推送需要在 GitHub 上创建一个空仓库（不要勾选 README）。
+
+### 自动部署到创空间（GitHub Actions）
+
+仓库内置 `.github/workflows/deploy.yml`：push 到 `main` / `master` 或手动触发时，
+自动把代码推到 ModelScope 创空间，并轮询部署状态。
+
+在仓库 **Settings → Secrets and variables → Actions** 新建 secret `MODELSCOPE_API_KEY`
+（ModelScope 访问令牌）后即可生效。
+
+流程：Checkout → 前置文件检查 → 平台兼容检查 → 推送创空间（自动对齐 `master` 分支）
+→ 轮询 `status` 直到 `Running`，失败时自动输出构建日志。
 
 数据落地优先级：`V2N_DATA_DIR` → `/mnt/workspace/video2note`（创空间持久化目录）→ `项目/data`。
 创空间重启会保留 `/mnt/workspace`，但迁移或重命名会丢失，重要产物请及时导出。

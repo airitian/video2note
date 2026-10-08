@@ -7,13 +7,16 @@ uvicorn[standard]>=0.27
 python-multipart>=0.0.9
 
 # ========== 业务依赖 ==========
-yt-dlp>=2025.1.1          # B站下载主力；抖音因 a_bogus 签名已基本不可用
-pyktok>=0.0.31            # 抖音专用：Playwright 执行 JS 生成 a_bogus 签名
+yt-dlp>=2025.1.1          # 下载主力：B站与抖音（带 Cookie 时）实测均可解析
+pyktok>=0.0.31            # 抖音兜底（可选）：仅 yt-dlp 失败时才用，需另装浏览器内核
 requests>=2.31            # ASR 接口 + Anthropic 协议 LLM 调用 + 抖音直链下载
 openai>=1.30              # 仅当 llm_protocol=openai 时需要
 
-# pyktok 依赖 Playwright 浏览器内核，装完依赖后还需执行（国内加镜像）：
-#   python -m playwright install chromium
+# ---- 抖音兜底（可选）----
+# pyktok 需要 Playwright 浏览器内核才能签名。缺失时 core/douyin.py 会自动跳过并给出提示，
+# 不影响 yt-dlp 主链路。部署到服务器时若需启用：
+#   pip install pyktok
+#   python -m playwright install --with-deps chromium
 # 国内网络慢可用镜像：
 #   PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
 #     python -m playwright install chromium

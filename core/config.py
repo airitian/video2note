@@ -120,19 +120,25 @@ load_dotenv_once()
 
 
 def load_settings() -> dict[str, str]:
-    """读取顺序：内置默认值 <- 环境变量 <- data/settings.json（后者优先）"""
+    """读取顺序：内置默认值 <- data/settings.json <- 环境变量（环境变量最高优先级）
+
+    环境变量优先级最高，是为了让部署平台（ModelScope 创空间等）用环境变量托管密钥：
+    即使settings.json 里存着旧密钥，也会被环境变量覆盖，避免线上用了过期凭据。
+    """
     s = dict(DEFAULTS)
+    if SETTINGS_FILE.exists():
+        try:
+            stored = json.loads(SETTINGS_FILE.read_text("utf-8"))
+            if isinstance(stored, dict):
+                s.update(stored)
+        except Exception:
+            pass
     for k in DEFAULTS:
         for name in _env_names(k):
             v = os.getenv(name)
             if v:
                 s[k] = v
                 break
-    if SETTINGS_FILE.exists():
-        try:
-            s.update(json.loads(SETTINGS_FILE.read_text("utf-8")))
-        except Exception:
-            pass
     return s
 
 
@@ -266,16 +272,32 @@ def ensure_cookie_file() -> str:
 
 
 def public_settings() -> dict:
-    """给前端用的配置（密钥脱敏）"""
+    """给前端用的配置（密钥脱敏）
+
+    额外返回 _from_env：标记哪些配置项由环境变量托管。
+    前端据此把密钥输入框置为只读并提示「由平台环境变量管理」，
+    避免在页面上误改、也避免把托管的密钥回显出来。
+    """
     s = load_settings()
     out = {k: v for k, v in s.items()}
+    from_env = {}
+    for k in DEFAULTS:
+        for name in _env_names(k):
+            if os.getenv(name):
+                from_env[k] = name
+                break
     for k in SECRET_KEYS:
         v = out.get(k, "")
-        out[k] = (v[:4] + "*" * max(0, len(v) - 8) + v[-4:]) if len(v) > 8 else ("*" * len(v))
+        # 托管在环境变量里的密钥一律不回显，连脱敏片段都不给
+        if k in from_env:
+            out[k] = ""
+        else:
+            out[k] = (v[:4] + "*" * max(0, len(v) - 8) + v[-4:]) if len(v) > 8 else ("*" * len(v))
     out["_configured"] = {
         "asr": bool(s.get("asr_api_key")),
         "llm": bool(s.get("llm_api_key") or s.get("asr_api_key")),
     }
+    out["_from_env"] = from_env
     return out
 
 
