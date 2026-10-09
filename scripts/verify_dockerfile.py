@@ -206,6 +206,66 @@ def main() -> int:
             if target.startswith("-") or not (ROOT / target).exists():
                 errors.append(f"L{lineno}: {instr} 启动的 {target} 在仓库里不存在")
 
+    # ---- 9. 指令顺序：路径必须先被创建/复制，后面才能使用 ----
+    # 真实踩过的坑：COPY --from=builder /opt/venv 写在装 Chromium 的 RUN 之后，
+    # 构建报 "/opt/venv/bin/python: not found"。这里按出现顺序做数据流检查。
+    #
+    # 关键：**按构建阶段隔离**。builder 阶段的 python -m venv /opt/venv 对运行阶段
+    # 不可见，若不隔离会漏判（L24 提供 /opt/venv，L59 在运行阶段用它）。
+    # 同一条指令内部「先创建后使用」是合法的，所以自身 provides 先登记再判uses。
+    order_problems: list[tuple[int, int, str, str]] = []  # (使用行, 提供行, 路径, 指令)
+
+    def _collect_provides(instr: str, args: str) -> list[str]:
+        out: list[str] = []
+        if instr == "COPY":
+            out += [p for p in re.split(r"\s+", args) if p and not p.startswith("--")]
+        elif instr == "RUN":
+            # python -m venv X / mkdir -p X / install -d X 都算创建 X
+            out += re.findall(r"-m\s+venv\s+([\w/.-]+)", args)
+            out += re.findall(r"mkdir\s+(?:-p\s+)?([\w/.-]+)", args)
+            out += re.findall(r"install\s+-d\s+([\w/.-]+)", args)
+        return out
+
+    def _collect_uses(instr: str, args: str) -> list[str]:
+        out: list[str] = []
+        if instr in ("RUN", "CMD", "ENTRYPOINT"):
+            out += re.findall(r"(?<![\w/])(/opt/[\w/.-]+)", args)
+        elif instr == "ENV":
+            out += re.findall(r"PATH=[\"']?([^\"'\s]+)", args)
+        return out
+
+    # 每个 FROM 开一个新阶段。阶段之间文件系统不共享，provided 不能跨阶段累积。
+    # 每个阶段内部要「先收集全阶段 provides，再检查 uses」：单遍遍历时，
+    # 后面的 COPY 还没登记，前面的使用就查不到来源，会漏判
+    # （真实事故：COPY --from=builder /opt/venv 在装 Chromium 的 RUN 之后，单遍查不出来）。
+    stages: list[list[tuple[int, str, str]]] = [[]]
+    for item in items:
+        if item[1] == "FROM":
+            stages.append([])
+        stages[-1].append(item)
+
+    for stage in stages:
+        provided: dict[str, int] = {}
+        for lineno, instr, args in stage:
+            for p in _collect_provides(instr, args):
+                provided.setdefault(p, lineno)
+        for lineno, instr, args in stage:
+            for u in _collect_uses(instr, args):
+                if "$PATH" in u:
+                    continue
+                src = None
+                for p, ln in provided.items():
+                    if u == p or u.startswith(p.rstrip("/") + "/"):
+                        if src is None or ln < src:
+                            src = ln
+                # src > lineno 表示「路径在用到它之后才被创建/复制」——构建会报 not found
+                if src is not None and src > lineno:
+                    order_problems.append((lineno, src, u, instr))
+    for use_ln, src_ln, path, instr in order_problems:
+        errors.append(
+            f"L{use_ln}: {instr} 使用了 {path}，但它在 L{src_ln} 才被复制/创建 —— 构建会报 not found"
+        )
+
     # ---- 输出 ----
     for w in warns:
         print(f"WARN  {w}")

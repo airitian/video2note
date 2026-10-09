@@ -37,6 +37,16 @@ CASES: list[tuple[str, list[tuple[str, str]], bool]] = [
     ("首条指令不是 FROM", [("FROM python:3.11-slim-bookworm AS builder", "RUN echo hi\nFROM python:3.11-slim-bookworm AS builder")], True),
     ("拼错指令名", [("EXPOSE 7860", "EXPSOE 7860")], True),
     ("CMD 指向不存在的文件", [("exec python -u app.py", "exec python -u nope.py")], True),
+    # 真实线上事故：COPY --from=builder /opt/venv 写在装 Chromium 的 RUN 之后，
+    # 构建报 "/opt/venv/bin/python: not found"。校验器必须靠「阶段隔离 + 先收集后检查」抓出来。
+    (
+        "venv 复制晚于 Chromium 安装",
+        [
+            ("# venv 必须先落地：下面装 Chromium 的 RUN 要用 /opt/venv/bin/python\nCOPY --from=builder /opt/venv /opt/venv\n\n", ""),
+            ("WORKDIR /app\nCOPY . /app", "WORKDIR /app\nCOPY . /app\nCOPY --from=builder /opt/venv /opt/venv"),
+        ],
+        True,
+    ),
 ]
 
 
@@ -66,12 +76,16 @@ def main() -> int:
             blocked = code != 0
             first_err = next((l for l in out.splitlines() if l.startswith("ERROR")), "")
             if blocked == should_fail:
-                mark = "✅" if should_fail else "✅（按预期放行）"
-                print(f"{mark} {name} -> {first_err[:88] or '无 ERROR'}")
+                if should_fail:
+                    print(f"✅ 拦截 {name} -> {first_err[:88]}")
+                else:
+                    print(f"✅ 放行 {name}（符合预期）")
             else:
-                mark = "❌ 漏报" if should_fail else "❌ 误报"
-                print(f"{mark} {name} -> {first_err[:88] or '被误拦'}")
-                failures.append(f"{mark} {name}")
+                if should_fail:
+                    print(f"❌ 漏报 {name} -> 校验器返回 {code}，未产生 ERROR")
+                else:
+                    print(f"❌ 误报 {name} -> {first_err[:88]}")
+                failures.append(f"{'漏报' if should_fail else '误报'} {name}")
     finally:
         DOCKERFILE.write_text(original, encoding="utf-8", newline="\n")
 

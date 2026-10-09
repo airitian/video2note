@@ -44,6 +44,9 @@ ENV PYTHONUNBUFFERED=1 \
     DEBUG_MODE=false \
     APP_ENTRY=app
 
+# venv 必须先落地：下面装 Chromium 的 RUN 要用 /opt/venv/bin/python
+COPY --from=builder /opt/venv /opt/venv
+
 # ffmpeg/ffprobe：合并音视频、抽音频、探测时长都依赖它（core/audio.py）
 # ca-certificates：访问模力方舟 / LLM / B站等 HTTPS 接口
 # curl：给 HEALTHCHECK 与排障用；tzdata：日志时间戳
@@ -65,8 +68,6 @@ RUN if [ "$INSTALL_PLAYWRIGHT" = "1" ]; then \
         && PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
            /opt/venv/bin/python -m playwright install chromium ; \
     fi
-
-COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 COPY . /app
