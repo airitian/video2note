@@ -321,7 +321,7 @@ docker build --build-arg INSTALL_PLAYWRIGHT=0 -t video2note .
 ### 3. 本地验证镜像（可选，但推荐）
 
 ```bash
-# 静态校验：不用Docker 也能跑，检查端口/指令/COPY 源/密钥硬编码
+# 静态校验：不用 Docker 也能跑，检查端口/指令顺序/COPY 源/密钥硬编码
 python scripts/verify_dockerfile.py
 
 # 校验器自测：故意改坏 Dockerfile，确认能被拦住
@@ -335,6 +335,14 @@ docker run --rm -p 7860:7860 \
   video2note
 # 浏览器打开 http://127.0.0.1:7860
 ```
+
+> 静态校验器重点检查**指令顺序**：多阶段构建里，
+> `COPY --from=builder /opt/venv` 必须排在所有用`/opt/venv/bin/python` 的 `RUN` 之前，
+> 否则构建会报 `/opt/venv/bin/python: not found`。
+> 本项目踩过这个坑，校验器现在会自动拦截（见 `selftest` 里的回归用例）。
+
+> 改了 Dockerfile 后，光`git push` 不一定触发重建，
+> 需要在创空间页面点「重新部署」或调用 deploy 接口。
 
 ### 4. 切换用哪套UI
 
