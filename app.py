@@ -71,6 +71,13 @@ SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "7860"))
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "false").lower() == "true"
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "2"))
+
+# 反代前缀：ModelScope 创空间把容器放在网关后面时，静态资源与 API 需要同一个前缀，
+# 否则页面能开但 JS/CSS 404。留空或"/" 视为根路径（本地与直连 7860 场景）。
+# 不设置时 Gradio 会自己读X-Forwarded-Prefix，所以这里只在显式配置时传参。
+_root_path = (os.environ.get("GRADIO_ROOT_PATH") or "").strip()
+ROOT_PATH = "" if _root_path in ("", "/") else _root_path.rstrip("/")
+
 TEMP_DIR = Path(os.environ.get("GRADIO_TEMP_DIR", str(DATA_DIR / "tmp")))
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -666,8 +673,7 @@ with comp(gr.Blocks, title=APP_TITLE, theme=gr.themes.Soft(), css=CUSTOM_CSS,
 # ========== 11. 启动 ==========
 def launch_kwargs() -> dict:
     """按当前 gradio 版本过滤 launch 参数（theme / css 在 6.x 起由 launch 接收）"""
-    return supported_kwargs(
-        demo.launch,
+    kwargs: dict[str, Any] = dict(
         server_name=SERVER_HOST,
         server_port=SERVER_PORT,
         share=False,
@@ -679,6 +685,10 @@ def launch_kwargs() -> dict:
         css=CUSTOM_CSS,
         quiet=not DEBUG_MODE,
     )
+    # 只有显式配置了前缀才传，避免各版本对 root_path 默认值处理不一致
+    if ROOT_PATH:
+        kwargs["root_path"] = ROOT_PATH
+    return supported_kwargs(demo.launch, **kwargs)
 
 
 def main() -> None:

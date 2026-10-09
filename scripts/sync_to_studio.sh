@@ -37,6 +37,43 @@ cd "$WORK/studio"
 # ---------- 覆盖代码（保留创空间侧 .git 与运行数据）----------
 echo "→ 同步文件..."
 cd "$ROOT"
+# ---------- 前置校验（在源仓库做，报错信息更准确）----------
+# Docker 类型创空间只认根目录的 Dockerfile；缺文件就别推了，否则线上直接构建失败
+if [ ! -f "Dockerfile" ]; then
+  echo "❌ 缺少 Dockerfile，Docker 类型创空间无法构建"
+  exit 1
+fi
+# 平台强制 7860，EXOSE 别的端口会导致健康检查一直失败
+if ! grep -qE '^[[:space:]]*EXPOSE[[:space:]]+7860' Dockerfile; then
+  echo "❌ Dockerfile 未 EXPOSE 7860。ModelScope 规定服务必须监听 0.0.0.0:7860"
+  exit 1
+fi
+# 8080 被平台占用
+if grep -qE '^[[:space:]]*EXPOSE[[:space:]]+8080([[:space:]]|$)' Dockerfile; then
+  echo "❌ Dockerfile EXPOSE 了 8080，该端口被平台占用，会导致启动失败"
+  exit 1
+fi
+# 密钥绝不能进仓库
+if git ls-files | grep -Eiq '(^|/)(\.env|cookies(_bili)?\.txt)$|\.log$'; then
+  echo "❌ 仓库里存在被跟踪的密钥/Cookie/日志文件，请先加入 .gitignore"
+  exit 1
+fi
+# 超过 100MB 的文件必须走 Git LFS，否则平台直接拒绝
+big=""
+while IFS= read -r f; do
+  sz=$(git cat-file -s "$(git rev-parse ":$f" 2>/dev/null)" 2>/dev/null || echo 0)
+  if [ "${sz:-0}" -gt 104857600 ]; then
+    big="$big $f"
+  fi
+done < <(git ls-files)
+if [ -n "$big" ]; then
+  echo "❌ 以下文件超过平台 100MB 限制，必须改用 Git LFS：$big"
+  exit 1
+fi
+echo "✅ Dockerfile 校验通过（EXPOSE 7860，无敏感文件，无超大文件）"
+
+# ---------- 覆盖代码（保留创空间侧 .git 与运行数据）----------
+echo "→ 同步文件..."
 # 用 git 跟踪的文件列表为准，避免带上 data/、日志等本地运行数据。
 # 从索引（git show :路径）取内容而不是直接 cp 工作区文件：工作区可能是 CRLF，
 # 而 ModelScope 的敏感扫描对 CRLF 文件会误判并回滚提交。
@@ -56,14 +93,6 @@ git config user.name "video2note sync"
 # 删除本地有、但已被 git 跟踪清单移除的文件
 git add -A
 
-# ---------- 前置校验 ----------
-for f in app.py requirements.txt; do
-  if [ ! -f "$f" ]; then
-    echo "❌ 缺少必需文件 $f，Gradio 创空间无法启动"
-    exit 1
-  fi
-done
-
 if git diff --cached --quiet; then
   echo "✅ 与创空间内容一致，无需推送"
   exit 0
@@ -76,4 +105,5 @@ git push -q origin HEAD 2>&1 | sed 's/oauth2:[^@]*@/oauth2:***@/'
 echo ""
 echo "✅ 已推送到 ModelScope 创空间"
 echo "   https://modelscope.cn/studios/${STUDIO}"
-echo "   平台会自动重建，实测约 3~8 分钟，可在创空间「日志」页查看进度。"
+echo "   平台会自动重新构建镜像。Docker 类型首次构建约 3~5 分钟，"
+echo "   带 Chromium 时可能到 8~12 分钟，可在创空间「日志」页查看进度。"

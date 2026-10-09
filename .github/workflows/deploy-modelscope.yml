@@ -41,22 +41,44 @@ jobs:
           git config --global pull.rebase false
 
       # ========== 3. 前置校验 ==========
-      # 创空间只认app.py；缺文件就别推了，否则线上直接起不来
+      # Docker 类型创空间只认根目录的 Dockerfile；缺文件就别推了，否则线上直接构建失败
       - name: Preflight check
         run: |
-          for f in app.py requirements.txt; do
-            if [ ! -f "$f" ]; then
-              echo "::error::缺少必需文件 $f，Gradio 创空间无法启动，已中止推送"
-              exit 1
-            fi
-          done
-          echo "文件齐全，待同步 $(git ls-files | wc -l | tr -d ' ') 个跟踪文件"
+          set -e
+          if [ ! -f "Dockerfile" ]; then
+            echo "::error::缺少 Dockerfile，Docker 类型创空间无法构建，已中止推送"
+            exit 1
+          fi
+          # 平台强制 7860；8080 被平台占用
+          if ! grep -qE '^[[:space:]]*EXPOSE[[:space:]]+7860' Dockerfile; then
+            echo "::error::Dockerfile 未 EXPOSE 7860，ModelScope 要求服务监听 0.0.0.0:7860"
+            exit 1
+          fi
+          if grep -qE '^[[:space:]]*EXPOSE[[:space:]]+8080([[:space:]]|$)' Dockerfile; then
+            echo "::error::Dockerfile EXPOSE 了 8080，该端口被平台占用"
+            exit 1
+          fi
+          echo "✅ Dockerfile 校验通过（EXPOSE 7860）"
+          echo "待同步 $(git ls-files | wc -l | tr -d ' ') 个跟踪文件"
           echo "---确认没有把密钥/Cookie 带进仓库---"
-          if git ls-files | grep -Ei '(^|/)(data|\.env|cookies\.txt)|\.log$' ; then
+          if git ls-files | grep -Eiq '(^|/)(\.env|cookies(_bili)?\.txt)$|\.log$'; then
             echo "::error::仓库里存在被跟踪的运行数据/密钥文件，请先加入 .gitignore"
             exit 1
           fi
-          echo "✅ 无敏感文件泄漏"
+          echo "--- 确认没有超过 100MB 的文件（平台要求 Git LFS）---"
+          # 管道里的 while 在子 shell，exit 传不出去，用 flag 承接
+          big=""
+          while IFS= read -r f; do
+            sz=$(git cat-file -s "$(git rev-parse ":$f")" 2>/dev/null || echo 0)
+            if [ "${sz:-0}" -gt 104857600 ]; then
+              big="$big $f"
+            fi
+          done < <(git ls-files)
+          if [ -n "$big" ]; then
+            echo "::error::以下文件超过 100MB，必须改用 Git LFS:$big"
+            exit 1
+          fi
+          echo "✅ 无敏感文件泄漏，无超大文件"
 
       # ========== 4. 配置远端 ==========
       - name: Add ModelScope remote

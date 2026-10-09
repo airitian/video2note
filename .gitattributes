@@ -1,6 +1,15 @@
 # 统一换行符：仓库内一律存 LF，Windows 检出时由 Git 自动转 CRLF
 * text=auto eol=lf
 
+# Docker 与 CI 相关文件必须是 LF：CRLF 会让 ModelScope 构建脚本报错，
+#历史上也因 CRLF 触发过平台自动回滚
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+
 # Windows 脚本保持 CRLF
 *.bat text eol=crlf
 *.cmd text eol=crlf

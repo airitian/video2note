@@ -11,7 +11,7 @@ URL / 文件 → yt-dlp(视频轨+音频轨) → ffmpeg(合并 mp4 / 抽 16k 音
 
 仓库里有**两个前端**，业务内核（`core/`）完全共用，只换 UI 层：
 
-| |🖥️ 本地版（FastAPI + 自绘前端） | ☁️ Gradio 版（ModelScope 创空间） |
+| |🖥️ 本地版（FastAPI + 自绘前端） | ☁️ Gradio 版（创空间默认） |
 |---|---|---|
 | 入口文件 | **`run.py`** | **`app.py`** |
 | 启动命令 | `python run.py --port 8765` | `python app.py`（默认 `0.0.0.0:7860`） |
@@ -21,9 +21,11 @@ URL / 文件 → yt-dlp(视频轨+音频轨) → ffmpeg(合并 mp4 / 抽 16k 音
 | 默认地址 | http://127.0.0.1:8765 | http://127.0.0.1:7860 |
 | 适合场景 | 本机日常使用，界面更清爽 | 部署到创空间 / 分享给他人 |
 | 前端文件 | `static/index.html`、`app.js`、`style.css` | 无独立前端文件，全部写在 `app.py` |
+| 创空间部署 | Docker 可用（`APP_ENTRY=run`） | Docker 默认入口（`APP_ENTRY=app`） |
 
 **判别口诀**：看到 `run.py` → 本地版；看到 `app.py` → Gradio 版。
 两者可同时运行，互不冲突（端口不同），共用同一个 `data/` 目录与配置。
+部署到创空间时用 `Dockerfile`，镜像内通过 `APP_ENTRY` 环境变量决定启动哪一套。
 
 > 想只用其中一个？删掉另一个入口文件即可，`core/` 不受影响。
 
@@ -43,7 +45,8 @@ python app.py                    # 打开 http://127.0.0.1:7860
 ```
 
 > 两个版本功能一致（转写、换风格重写、历史回显、多风格缓存都支持）。
-> ModelScope 创空间只能识别 `app.py`，因此**部署必须用 Gradio 版**。
+> ModelScope 创空间的 **Docker 类型**里两套都能跑，默认用 Gradio 版；
+> 想换成自绘界面，在环境变量里设 `APP_ENTRY=run` 即可，见[部署章节](#部署到modelscope-创空间)。
 
 ## 前置条件
 
@@ -229,12 +232,16 @@ PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
 
 ```
 video2note/
-├── app.py                  # ☁️ 【Gradio 版入口】ModelScope 创空间用，固定 7860
+├── app.py                  # ☁️【Gradio 版入口】创空间默认，固定 7860
 ├── run.py                  # 🖥️ 【本地版入口】FastAPI + static/ 自绘界面，默认 8765
 ├── requirements.txt        # ⭐ 依赖列表
+├── Dockerfile              # ⭐ ModelScope 创空间 Docker 类型镜像（0.0.0.0:7860）
+├── ms_deploy.json          # ⭐ 创空间部署配置（sdk_type=docker, port=7860）
+├── .dockerignore           # ⭐ 排除 data/媒体/缓存，减小构建上下文
 ├── README.md
 ├── .env.example            # 本地环境变量样例
 ├── .gitignore
+├── .gitattributes          # 强制仓库内一律 LF（CRLF 会触发平台回滚）
 ├── core/                   # 业务内核（两个版本共用，与入口解耦）
 │   ├── config.py           配置：默认值 <- 环境变量 V2N_* <- settings.json
 │   ├── downloader.py       yt-dlp 优先取流下载，抖音失败回退 pyktok、文案中提取 URL
@@ -247,17 +254,109 @@ video2note/
 │   ├── pipeline.py         流水线编排，同时提供线程池版与同步回调版
 │   └── main.py             FastAPI 接口（🖥️ 仅本地版使用，含 SSE 实时进度）
 ├── static/                 # 🖥️ 仅本地版使用的前端：index.html / app.js / style.css
+├── scripts/
+│   ├── sync_to_studio.sh            # 一键同步到创空间（含 Dockerfile/密钥/体积校验）
+│   ├── verify_dockerfile.py         # Dockerfile 静态校验（无需 Docker 环境）
+│   └── verify_dockerfile.selftest.py  # 校验器自测（故意改坏确认能拦住）
 └── data/                   运行时生成：tasks / media / export / settings.json
 ```
 
 ## 部署到 ModelScope 创空间
 
->创空间只认 `app.py`，因此**必须使用 ☁️ Gradio 版**（本地版 `run.py` 不参与部署）。
+本项目提供 **Docker** 类型的 `Dockerfile`（详见 <https://modelscope.cn/docs/studios/docker>），
+`app.py`（☁️ Gradio 版）与 `run.py`（🖥️ FastAPI 版）都能在同一镜像里跑。
 
-1. 创空间类型选 **Gradio**，SDK 随意，Python ≥ 3.10
-2. 把本目录内容推到创空间仓库，根目录必须有 `app.py` 与 `requirements.txt`
-3. 在「设置 → Secrets」里添加 `V2N_ASR_API_KEY`（可选 `V2N_LLM_API_KEY`）
-4. 平台会自动安装依赖并在 **7860** 端口拉起服务
+### 平台硬性要求（Docker 类型）
+
+官方 schema（`https://modelscope.cn/api/v1/studios/deploy_schema.json`）里对 Docker 类型的规定：
+
+| 要求 | 说明 | 本项目如何满足 |
+|---|---|---|
+| 仓库根目录必须有 `Dockerfile` | 缺了就无法构建 | 已提供 |
+| 服务监听 `0.0.0.0:7860` | `port` 只能填 7860，**8080 被平台占用** | `ENV SERVER_HOST/SERVER_PORT` 固定 |
+| 不使用 `Authorization`/`X-modelscope-*`/`X-studio-*` 响应头 | 平台代理保留头 | 代码未设置这些头 |
+| 超过 100MB 的文件必须走 Git LFS | 否则平台拒绝 | 仓库无大文件，同步脚本会校验 |
+| 默认分支 `master`，不要 force push | 平台按master 触发构建 | 同步脚本走普通 push |
+| 密钥禁止硬编码 | 必须用环境变量 / Secrets | 同步脚本与 CI 双重扫描 |
+| 数据持久化目录 `/mnt/workspace` | 重启会丢数据 | `V2N_DATA_DIR=/mnt/workspace/video2note` |
+
+> ⚠️ **Docker 类型需要先在魔搭完成阿里云账号绑定与实名认证**，
+> 否则无法创建/切换，见 <https://modelscope.cn/docs/studios/docker>。
+
+### 1. 首次部署 / 从 Gradio 切换到 Docker
+
+创空间类型选 **Docker**。仓库已带`ms_deploy.json`，通过「快速创建」上传本目录即可自动识别：
+
+```json
+{
+  "sdk_type": "docker",
+  "resource_configuration": "platform/2v-cpu-16g-mem",
+  "port": 7860
+}
+```
+
+- `platform/2v-cpu-16g-mem`：2 vCPU + 16GB 内存，免费额度，够用；
+- `xgpu/*`：需要加入 xGPU 组织并申请审批，本项目用不到（ASR 与 LLM 都走远程 API，不需要本地 GPU）。
+
+**已存在的创空间切换类型**：在创空间「设置 → 运行时」里把 SDK 从 Gradio 改成 Docker 并保存，
+再推送一次代码触发构建。切换会重建环境，**已有 `/mnt/workspace` 下的数据会保留**，但保险起见先备份设置。
+
+### 2. 镜像里装了什么
+
+```
+builder 阶段：python:3.11-slim + venv 装 requirements.txt
+运行阶段：
+  ├─ ffmpeg / ffprobe        合并音视频、抽音频、探测时长（core/audio.py 硬依赖）
+  ├─ ca-certificates         访问模力方舟 / LLM / B站 HTTPS 接口
+  ├─ curl + tzdata           健康检查与时区
+  └─ Chromium (可选)         仅供 pyktok抖音签名，yt-dlp 主链路不需要
+```
+
+Chromium 由构建参数控制，想要小镜像就关掉：
+
+```bash
+docker build --build-arg INSTALL_PLAYWRIGHT=0 -t video2note .
+```
+
+### 3. 本地验证镜像（可选，但推荐）
+
+```bash
+# 静态校验：不用Docker 也能跑，检查端口/指令/COPY 源/密钥硬编码
+python scripts/verify_dockerfile.py
+
+# 校验器自测：故意改坏 Dockerfile，确认能被拦住
+python scripts/verify_dockerfile.selftest.py
+
+# 真实构建 + 启动
+docker build -t video2note .
+docker run --rm -p 7860:7860 \
+  -e V2N_ASR_API_KEY=xxx -e V2N_LLM_API_KEY=xxx \
+  -v video2note-data:/mnt/workspace \
+  video2note
+# 浏览器打开 http://127.0.0.1:7860
+```
+
+### 4. 切换用哪套UI
+
+同一镜像通过 `APP_ENTRY` 切换，端口都固定 7860：
+
+| `APP_ENTRY` | 入口 | 界面 |
+|---|---|---|
+| `app`（默认） | `app.py` | Gradio 版，控件多、适合创空间 |
+| `run` | `run.py --host 0.0.0.0 --port 7860` | FastAPI + static/ 自绘界面 |
+
+在创空间环境变量里加 `APP_ENTRY=run` 即可切换，不需要改代码。
+
+### 5. 反代前缀（root_path）
+
+创空间把容器放在网关后面，如果页面能开但 JS/CSS 404，需要给 Gradio 传前缀：
+
+```bash
+GRADIO_ROOT_PATH=/你的前缀     # app.py：留空或 "/" 视为根路径
+ROOT_PATH=/你的前缀# run.py：FastAPI 版同理
+```
+
+不设置时 Gradio 会自己读 `X-Forwarded-Prefix`，大多数情况无需手动配置。
 
 ### 密钥托管：优先用环境变量，不要在页面上填
 
@@ -276,29 +375,30 @@ video2note/
 | 语音识别语言 | `V2N_ASR_LANGUAGE` | 默认 `zh` |
 | 抖音 Cookie | `V2N_COOKIE_TEXT` 或页面「抖音 Cookie 文本」 | 抖音解析需要 |
 | B站 Cookie | `V2N_COOKIE_TEXT_BILI` 或页面「B站 Cookie 文本」 | 含登录态凭证，缓解 412 |
+| UI 入口 | `APP_ENTRY` | `app`=Gradio（默认）/ `run`=FastAPI |
 
 > `V2N_COOKIE_FILE` 仍可用于指定一个已有的 Netscape cookies.txt 绝对路径，但优先级低于上面两项，
 > 仅在需要共用同一份 Cookie 文件时才用。
 
 页面上的密钥框在检测到环境变量后会显示「已由环境变量 XXX 托管，页面不可修改」。
 
-###跨平台说明（本地 Windows / 线上 Linux）
+### 跨平台说明（本地 Windows / 线上 Linux）
 
-项目代码本身**不含Windows 专用代码**，`core/` 全目录扫描无 `winreg`、`os.startfile`、
+项目代码本身**不含 Windows 专用代码**，`core/` 全目录扫描无 `winreg`、`os.startfile`、
 `ctypes.windll`，ffmpeg 通过 `shutil.which()` 走 `PATH`，两套系统通用。
-部署 workflow 里也加了平台兼容检查，检测到 Windows 专用 API 会直接让流水线失败。
+Dockerfile 全部基于 `python:3.11-slim-bookworm`，构建产物与本地一致。
 
 两处需要注意的系统差异：
 
-| 项 | Windows 本地 |创空间 Linux |
+| 项 | Windows 本地 | 创空间 Linux |
 |---|---|---|
 | 数据目录 | `项目/data/` | `/mnt/workspace/video2note`（自动识别，可持久化） |
-| Playwright 内核 | 本机已装 | **未预装**，抖音兜底不可用 |
+| ffmpeg | 需本机安装 | 镜像内已装，无需额外操作 |
+| Playwright 内核 | 本机已装 | 镜像默认已装（`INSTALL_PLAYWRIGHT=0` 可关） |
 
 关于抖音：主链路是 **yt-dlp**（带 Cookie 时 B站与抖音都能解析），**pyktok 只是兜底**。
-创空间未装 Chromium 时，兜底会给出明确提示并跳过，不影响yt-dlp 主链路。
-若确实要在创空间启用抖音兜底，需在启动脚本里执行
-`python -m playwright install --with-deps chromium`（2 核 8G 容器内存偏紧，Chromium 会占用较多资源）。
+镜像里已默认装好 Chromium，兜底可直接用；2 核 16G 容器跑Chromium 内存偏紧，
+若只想用 yt-dlp，构建时传 `--build-arg INSTALL_PLAYWRIGHT=0` 即可去掉。
 
 ### 推送到 GitHub
 
@@ -319,9 +419,20 @@ git push -u origin main
 创空间仓库：`https://modelscope.cn/studios/viva25/video_txt.git`，
 访问令牌用 [ModelScope 访问令牌](https://modelscope.cn/my/myaccesstoken)。
 
-**方式一：命令行推送（推荐）**
+**方式一：一键脚本（推荐）**
 
-在**创空间仓库目录**里直接覆盖文件（无需合并历史，最省事）：
+```bash
+#令牌优先级：环境变量 MODELSCOPE_TOKEN >项目根目录 .env 里的 V2N_STUDIO_TOKEN
+MODELSCOPE_TOKEN=<你的访问令牌> bash scripts/sync_to_studio.sh
+```
+
+脚本会做三件事：从 **Git 索引**（不是工作区）取文件内容以保证纯 LF、
+校验 Dockerfile 是否 `EXPOSE 7860`、扫描是否夹带密钥/超大文件，然后推送到创空间。
+
+> Docker 类型首次构建约 3~5 分钟，装Chromium 时可能到 8~12 分钟。
+> 在创空间「日志」页看进度。
+
+**方式二：命令行手动推送**
 
 ```bash
 # 1. 先拉取创空间仓库
@@ -343,6 +454,9 @@ git push
 > 令牌直接写在 clone URL 里最省事，但会留在 shell 历史中。
 > 更稳妥的做法是先 clone 不带令牌，再执行 `git remote set-url origin https://oauth2:<令牌>@...`，
 > 推送完把 remote 改回不带令牌的地址。
+>
+> ⚠️ 手动 `cp` 复制时注意**行尾必须是 LF**。历史上曾因 CRLF 触发平台敏感扫描导致自动回滚，
+> `.gitattributes` 已强制 `eol=lf`，但手动复制绕过 Git 时仍要留意。
 
 **方式二：网页上传**
 
@@ -412,6 +526,11 @@ Gradio 版同名能力由 `app.py` 内的 9 个端点提供（见 `/gradio_api/i
 | 页面无法访问 | 确认监听 `0.0.0.0`（`SERVER_HOST` 默认已是） |
 | 视频很慢/显存不足 | 减小 `chunk_seconds`、调低并发，或提高创空间资源规格 |
 | 中文乱码 | 代码统一 UTF-8 读写，导出时用 Chrome/Edge 打开 .md |
+| 创空间构建失败 / 一直排队 | Docker 类型首次构建 3~5 分钟，装Chromium 时可能 8~12 分钟；看创空间「日志」页 |
+| 构建报 `EXPOSE 7860` 相关错误 | 平台强制 7860，8080 被占用；跑 `python scripts/verify_dockerfile.py` 本地自查 |
+| 页面能开但样式/接口 404 | 反代前缀问题：设 `GRADIO_ROOT_PATH`（app.py）或 `ROOT_PATH`（run.py） |
+| 推送后线上代码回退 | 多为 CRLF 触发平台扫描；用 `scripts/sync_to_studio.sh`（从 Git 索引取内容，保证 LF） |
+| 重启后历史记录没了 | 数据要落在 `/mnt/workspace`；Dockerfile 已设 `V2N_DATA_DIR`，别改 |
 
 ## 合规提示
 
