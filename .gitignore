@@ -21,6 +21,14 @@ ENV/
 .env.local
 .env.*.local
 
+# 密钥文件：即使 data/ 已被排除，也显式列出防止误改路径后泄露
+secrets.json
+data/secrets.json
+*.secrets.json
+V2N_SECRETS_FILE
+# 密钥文件示例（只有键名、无值）可以提交
+!secrets.example.json
+
 # Gradio / App runtime
 .gradio/
 *.session

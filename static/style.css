@@ -179,3 +179,9 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 /* 失败后的重试按钮：比普通按钮醒目，因为它是失败后的唯一出口 */
 .btn.retry { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border-strong)); }
 .btn.retry:hover { background: color-mix(in srgb, var(--err) 8%, transparent); }
+
+/* 敏感项（Token / Cookie）状态行：只说明配没配，不回显内容 */
+.secret-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.secret-state { font-size: 12px; color: var(--text-3); }
+.btn.danger { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border-strong)); }
+.btn.danger:hover { background: color-mix(in srgb, var(--err) 8%, transparent); }

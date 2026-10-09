@@ -14,14 +14,17 @@ from pydantic import BaseModel
 
 from . import audio, downloader, exporters, store
 from .downloader import detect_platform, extract_url
-from .config import (HELP, MEDIA_DIR, ROOT, ensure_cookie_file, ensure_dirs,
-                     load_settings, normalize_browser, public_settings,
-                     save_settings)
+from .config import (HELP, MEDIA_DIR, ROOT, SECRET_KEYS, ensure_cookie_file,
+                     ensure_dirs, load_settings, migrate_secrets,
+                     normalize_browser, public_settings, save_settings)
 from .pipeline import (_apply_variant, _mark_idempotent_hit, _sync_variant_meta,
                        polish_needed, retry as pipeline_retry,
                        submit, submit_polish)
 
 ensure_dirs()
+# 旧版本的密钥躺在 settings.json 里（会被接口读回浏览器），搬到独立文件。
+# 放在 ensure_dirs 之后：迁移要写文件，数据目录必须已存在。
+migrate_secrets()
 
 app = FastAPI(title="视频转笔记", version="1.1.0")
 STATIC = ROOT / "static"
@@ -60,6 +63,9 @@ class PolishIn(BaseModel):
 
 class SettingsIn(BaseModel):
     values: dict
+    # 显式要求清空的敏感项（Token / Cookie）。
+    # 敏感项不再回传，前端无法区分「没改」和「想清空」，所以必须单独传。
+    clear: list[str] = []
 
 
 def _clean_style(s: str | None) -> str:
@@ -105,16 +111,16 @@ def post_settings(body: SettingsIn):
         if err:
             raise HTTPException(status_code=400, detail=err)
         body.values["cookie_browser"] = name
-    save_settings(body.values)
+    save_settings(body.values, clear_secrets=set(body.clear))
     # Cookie 文本有变化时立刻落盘，供后续下载使用。
     # 即使被清空也要调一次——ensure_cookie_file 内部会删掉残留文件，
-    # 否则页面回显为空、下载却仍在用旧 Cookie。
+    # 否则页面显示「未配置」、下载却仍在用旧 Cookie。
     files: dict[str, str] = {}
-    if "cookie_text" in body.values:
+    if "cookie_text" in body.values or "cookie_text" in body.clear:
         p = ensure_cookie_file("douyin")
         if p:
             files["douyin"] = p
-    if "cookie_text_bili" in body.values:
+    if "cookie_text_bili" in body.values or "cookie_text_bili" in body.clear:
         p = ensure_cookie_file("bilibili")
         if p:
             files["bilibili"] = p

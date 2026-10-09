@@ -110,7 +110,8 @@
       <h2>设置</h2>
       <button id="btn-close-settings" class="icon">×</button>
     </div>
-    <p class="modal-tip">密钥保存在本地 <code>data/settings.json</code>，不会上传到任何第三方。留空的字段保持原值不变。</p>
+    <p class="modal-tip">密钥与 Cookie 单独存放在本机 <code>data/secrets.json</code>（权限 600），
+      不在普通配置文件里，页面也不会回显内容——已配置的项只显示「已配置」，留空即保持原值不变。</p>
     <div id="settings-form" class="form"></div>
     <div class="modal-foot">
       <button id="btn-save-settings" class="btn primary">保存</button>

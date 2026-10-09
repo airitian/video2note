@@ -1,4 +1,11 @@
-"""配置加载：内置默认值 <- 环境变量 V2N_* <- data/settings.json（后者优先）"""
+"""配置加载（三层来源，后者覆盖前者）：
+
+    内置默认值  <-  data/settings.json  <-  data/secrets.json  <-  环境变量 V2N_*
+
+密钥类配置单独存放在 secrets.json，且**永不通过接口回传**：
+前端只能知道「配没配、配在哪」，拿不到内容本身。settings.json 里如果
+残留了旧密钥，会在首次读取时自动搬进 secrets.json 并抹掉。
+"""
 from __future__ import annotations
 
 import json
@@ -30,6 +37,11 @@ DATA_DIR = _resolve_data_dir()
 TASK_DIR = DATA_DIR / "tasks"
 MEDIA_DIR = DATA_DIR / "media"
 SETTINGS_FILE = DATA_DIR / "settings.json"
+# 敏感配置独立成文件：便于单独 chmod 600、单独加进 .gitignore、
+# 单独复制到服务器而不把普通配置一起带走。
+SECRETS_FILE = Path(
+    (os.getenv("V2N_SECRETS_FILE") or "").strip() or (DATA_DIR / "secrets.json")
+).expanduser()
 
 DEFAULTS: dict[str, str] = {
     # ---- 语音识别（模力方舟 / Gitee AI，OpenAI 兼容）----
@@ -55,7 +67,9 @@ DEFAULTS: dict[str, str] = {
     "ffmpeg_path": "",
 }
 
-SECRET_KEYS = {"asr_api_key", "llm_api_key"}
+# 敏感配置：只落在 secrets.json，永不经接口下发。
+# Cookie 文本同样算敏感——它就是登录态，回显到浏览器等于把账号会话交出去。
+SECRET_KEYS = {"asr_api_key", "llm_api_key", "cookie_text", "cookie_text_bili"}
 
 # ASR 可用模型（实测于 /v1/models），UI 下拉使用
 ASR_MODELS = [
@@ -124,20 +138,41 @@ def load_dotenv_once() -> None:
 load_dotenv_once()
 
 
-def load_settings() -> dict[str, str]:
-    """读取顺序：内置默认值 <- data/settings.json <- 环境变量（环境变量最高优先级）
+def _read_json(path: Path) -> dict:
+    """读JSON 文件；不存在或损坏都按空处理，不让配置问题拖垮整个服务"""
+    try:
+        if path.exists():
+            data = json.loads(path.read_text("utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
 
-    环境变量优先级最高，是为了让部署平台（ModelScope 创空间等）用环境变量托管密钥：
-    即使settings.json 里存着旧密钥，也会被环境变量覆盖，避免线上用了过期凭据。
-    """
-    s = dict(DEFAULTS)
-    if SETTINGS_FILE.exists():
+
+def _write_json(path: Path, data: dict, private: bool = False) -> None:
+    """写 JSON 文件。private=True 时把权限收紧到仅属主可读写（Windows 上忽略）"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    if private:
         try:
-            stored = json.loads(SETTINGS_FILE.read_text("utf-8"))
-            if isinstance(stored, dict):
-                s.update(stored)
+            os.chmod(path, 0o600)
         except Exception:
             pass
+
+
+def load_settings() -> dict[str, str]:
+    """读取顺序：内置默认值 <- settings.json <- secrets.json <- 环境变量
+
+    环境变量优先级最高，是为了让部署平台（云服务器 / 容器等）用环境变量托管密钥：
+    即使文件里存着旧密钥，也会被环境变量覆盖，避免线上用了过期凭据。
+
+    secrets.json 覆盖 settings.json：密钥永远以独立文件为准，
+    这样即使用户误把密钥提交进settings.json，也会被这里的正确值覆盖。
+    """
+    s = dict(DEFAULTS)
+    s.update(_read_json(SETTINGS_FILE))
+    s.update(_read_json(SECRETS_FILE))
     for k in DEFAULTS:
         for name in _env_names(k):
             v = os.getenv(name)
@@ -147,9 +182,29 @@ def load_settings() -> dict[str, str]:
     return s
 
 
+def migrate_secrets() -> bool:
+    """把 settings.json 里的敏感项搬到 secrets.json，并从 settings.json 移除。
+
+    升级旧版本时自动执行一次：用户的 Token / Cookie 不会因为这次改动而丢失，
+    但从此不再留在会被读回浏览器的 settings.json 里。
+    """
+    stored = _read_json(SETTINGS_FILE)
+    moving = {k: v for k, v in stored.items() if k in SECRET_KEYS and v}
+    if not moving:
+        return False
+    secrets = _read_json(SECRETS_FILE)
+    for k, v in moving.items():
+        secrets.setdefault(k, v)
+    _write_json(SECRETS_FILE, secrets, private=True)
+    for k in moving:
+        stored.pop(k, None)
+    _write_json(SETTINGS_FILE, stored)
+    return True
+
+
 def _env_names(key: str) -> tuple[str, ...]:
     """某个配置项可接受的环境变量名（按优先级排列）。
-    密钥类额外兼容 ModelScope 创空间常见的 Token 变量名。"""
+    密钥类额外兼容常见的 Token 变量名。"""
     base = "V2N_" + key.upper()
     alias = {
         "asr_api_key": ("MOARK_API_TOKEN", "GITEE_AI_API_TOKEN", "ASR_API_KEY", "MODELSCOPE_API_TOKEN"),
@@ -159,13 +214,51 @@ def _env_names(key: str) -> tuple[str, ...]:
     return (base,) + alias.get(key, ())
 
 
-def save_settings(patch: dict) -> dict[str, str]:
+def save_settings(patch: dict, clear_secrets: set[str] | None = None) -> dict[str, str]:
+    """保存配置。敏感项写入 secrets.json（0600），其余写 settings.json
+
+    clear_secrets 里列出的敏感项会被显式清空（值为空字符串）。
+    之所以要有这个参数：敏感项不再回传，前端无法靠「回传值为空」判断用户
+    是否想清空——那会把「没改」和「想清空」混为一谈，导致打开设置就把密钥抹掉。
+    """
     ensure_dirs()
+    clear_secrets = clear_secrets or set()
     cur = load_settings()
+    normal: dict[str, str] = {}
+    secret: dict[str, str] = {}
+
     for k, v in patch.items():
-        if k in DEFAULTS and v is not None:
-            cur[k] = str(v).strip()
-    SETTINGS_FILE.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
+        if k not in DEFAULTS or v is None:
+            continue
+        val = str(v).strip()
+        if k in SECRET_KEYS:
+            # 空值不覆盖已有密钥：前端不持有密钥，「清空」必须走 clear_secrets
+            if val:
+                secret[k] = val
+        else:
+            normal[k] = val
+
+    for k in clear_secrets:
+        if k in SECRET_KEYS:
+            secret[k] = ""
+
+    # 普通配置：整份重写，剔除任何敏感项残留
+    stored = {k: v for k, v in _read_json(SETTINGS_FILE).items() if k not in SECRET_KEYS}
+    stored.update(normal)
+    _write_json(SETTINGS_FILE, stored)
+
+    # 敏感配置：独立文件 + 0600
+    secrets = {k: v for k, v in _read_json(SECRETS_FILE).items() if k in SECRET_KEYS}
+    for k, v in secret.items():
+        if v:
+            secrets[k] = v
+        else:
+            secrets.pop(k, None)
+    if secret or secrets:
+        _write_json(SECRETS_FILE, secrets, private=True)
+
+    cur.update(normal)
+    cur.update({k: v for k, v in secret.items() if v})
     return cur
 
 
@@ -344,32 +437,37 @@ def ensure_cookie_file(platform: str = "douyin") -> str:
 
 
 def public_settings() -> dict:
-    """给前端用的配置（密钥脱敏）
+    """给前端用的配置。
 
-    额外返回 _from_env：标记哪些配置项由环境变量托管。
-    前端据此把密钥输入框置为只读并提示「由平台环境变量管理」，
-    避免在页面上误改、也避免把托管的密钥回显出来。
+    敏感项（Token / Cookie）一律返回空字符串——不是打码，是**完全不发**。
+    早前这里返回过 `sk-1***...***abcd` 这样的片段，但「前4 后4」对短密钥几乎等于
+    明文（44位里泄露 8 位），而且浏览器里F12 一开就全在，所以直接切断。
+
+    前端要判断「配没配」，用返回的 `_configured`；
+    要改值，去编辑 secrets.json 或设环境变量。
     """
     s = load_settings()
-    out = {k: v for k, v in s.items()}
+    out = dict(s)
+
     from_env = {}
     for k in DEFAULTS:
         for name in _env_names(k):
             if os.getenv(name):
                 from_env[k] = name
                 break
+
     for k in SECRET_KEYS:
-        v = out.get(k, "")
-        # 托管在环境变量里的密钥一律不回显，连脱敏片段都不给
-        if k in from_env:
-            out[k] = ""
-        else:
-            out[k] = (v[:4] + "*" * max(0, len(v) - 8) + v[-4:]) if len(v) > 8 else ("*" * len(v))
+        out[k] = ""
+
     out["_configured"] = {
         "asr": bool(s.get("asr_api_key")),
         "llm": bool(s.get("llm_api_key") or s.get("asr_api_key")),
+        "cookie_douyin": bool(s.get("cookie_text")),
+        "cookie_bilibili": bool(s.get("cookie_text_bili")),
     }
     out["_from_env"] = from_env
+    # 密钥落盘位置，页面据此提示用户去哪里改
+    out["_secrets_file"] = str(SECRETS_FILE)
     return out
 
 

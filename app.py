@@ -52,12 +52,15 @@ from core.config import (  # noqa: E402
     ensure_cookie_file,
     ensure_dirs,
     load_settings,
+    migrate_secrets,
     normalize_browser,
     public_settings,
     save_settings,
 )
 
 ensure_dirs()
+# 旧版本密钥躺在 settings.json 里，搬到独立文件并抹掉原处
+migrate_secrets()
 
 # ========== 4. 配置常量（密钥一律来自环境变量 / 页面填写，禁止硬编码）==========
 APP_TITLE = "视频转笔记 Video2Note"
@@ -434,9 +437,13 @@ def save_ui_settings(asr_key: str, llm_key: str, asr_base: str, llm_base: str,
         "chunk_seconds": str(int(chunk_seconds or 600)),
         "max_concurrency": str(int(concurrency or 4)),
         "cookie_browser": (cookie or "").strip(),
-        "cookie_text": (cookie_text or "").strip(),
-        "cookie_text_bili": (cookie_text_bili or "").strip(),
     }
+    # Cookie 文本框现在恒为空（不回显），留空 = 不修改，不能当成清空。
+    # 要清空请直接编辑 data/secrets.json 删除对应项。
+    if (cookie_text or "").strip():
+        patch["cookie_text"] = cookie_text.strip()
+    if (cookie_text_bili or "").strip():
+        patch["cookie_text_bili"] = cookie_text_bili.strip()
     if (asr_key or "").strip():
         patch["asr_api_key"] = asr_key.strip()
     if (llm_key or "").strip():
@@ -451,18 +458,18 @@ def save_ui_settings(asr_key: str, llm_key: str, asr_base: str, llm_base: str,
     save_settings(patch)
 
     # 两个平台各自落盘；即使被清空也要调用，内部会删掉残留文件，
-    # 否则页面回显为空、下载却仍在用旧 Cookie。
+    # 否则页面显示未配置、下载却仍在用旧 Cookie。
     notes = []
     for label, plat in (("抖音", "douyin"), ("B站", "bilibili")):
         p = ensure_cookie_file(plat)
-        notes.append(f"{label} Cookie 已写入 `{p}`" if p else f"{label} Cookie 已清空")
+        notes.append(f"{label} Cookie 已写入 `{p}`" if p else f"{label} Cookie 未配置")
 
-    masked = public_settings()
-    masked.setdefault("asr_api_key", "")
-    return ("✅ 配置已保存（ASR 密钥：" + (masked.get("asr_api_key") or "未设置")
-            + " / LLM 密钥：" + (masked.get("llm_api_key") or "复用 ASR 密钥")
+    st = public_settings()
+    cfg = st.get("_configured") or {}
+    return ("✅ 配置已保存（ASR 密钥：" + ("已配置" if cfg.get("asr") else "未设置")
+            + " / LLM 密钥：" + ("已配置" if cfg.get("llm") else "未设置")
             + "；" + "；".join(notes)
-            + f"），数据目录 `{DATA_DIR}`")
+            + f"），密钥存放于 {st.get('_secrets_file', '')}")
 
 
 def settings_summary() -> str:
@@ -629,13 +636,22 @@ with comp(gr.Blocks, title=APP_TITLE, theme=gr.themes.Soft(), css=CUSTOM_CSS,
                 conc_sl = comp(gr.Slider, 1, 8, step=1,
                                value=int(_default.get("max_concurrency") or 4),
                                visible=False, label=HELP["max_concurrency"])
+            # 敏感项不回显：value 恒为空，只在placeholder 里说明当前状态。
+            # 留空表示「不修改」——save_ui_settings 只在有内容时才写入密钥。
+            _cfg = (public_settings() or {}).get("_configured") or {}
+            _dy = ("✅ 已配置（内容不回显，留空保持不变）" if _cfg.get("cookie_douyin")
+                   else "未配置 —— 粘贴后点保存")
+            _bl = ("✅ 已配置（内容不回显，留空保持不变）" if _cfg.get("cookie_bilibili")
+                   else "未配置 —— 粘贴后点保存")
             cookie_text_tb = comp(gr.Textbox, label=HELP["cookie_text"], lines=4,
-                                  value=_default.get("cookie_text", ""),
+                                  value="",
                                   placeholder="粘贴抖音网页的 Cookie 整段（a=1; b=2）；"
-                                              "也可直接粘贴 Netscape cookies.txt 全文")
+                                              "也可直接粘贴 Netscape cookies.txt 全文。"
+                                              + _dy)
             cookie_bili_tb = comp(gr.Textbox, label=HELP["cookie_text_bili"], lines=4,
-                                  value=_default.get("cookie_text_bili", ""),
-                                  placeholder="粘贴 B站网页的 Cookie 整段，必须包含登录态字段")
+                                  value="",
+                                  placeholder="粘贴 B站网页的 Cookie 整段，必须包含登录态字段。"
+                                              + _bl)
             cookie_tb = comp(gr.Textbox, label=HELP["cookie_browser"], visible=False,
                              value=_default.get("cookie_browser", ""),
                              placeholder="chrome / edge / firefox（容器环境不可用，优先用上面的 Cookie 文本）")

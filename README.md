@@ -283,7 +283,7 @@ video2note/
 │   ├── sync_to_studio.sh            # 一键同步到创空间（含 Dockerfile/密钥/体积校验）
 │   ├── verify_dockerfile.py         # Dockerfile 静态校验（无需 Docker 环境）
 │   └── verify_dockerfile.selftest.py  # 校验器自测（故意改坏确认能拦住）
-└── data/                   运行时生成：tasks / media / export / settings.json
+└── data/                   运行时生成：tasks / media / export / settings.json / secrets.json
 ```
 
 ## 部署到 ModelScope 创空间
@@ -396,10 +396,40 @@ ROOT_PATH=/你的前缀# run.py：FastAPI 版同理
 **推荐做法**：在创空间「设置 → Secrets」里配好环境变量，页面上的密钥框会自动变为**只读**，
 不会回显密钥内容，也不用担心有人误改或误存。
 
-配置优先级：**内置默认值 < `data/settings.json` < 环境变量**（环境变量最高）。
+配置优先级：**内置默认值 < `data/settings.json` < `data/secrets.json` < 环境变量**（环境变量最高）。
 
-这条顺序很重要——即使 `settings.json` 里残留了旧密钥，也会被环境变量覆盖，
+这条顺序很重要——即使某个文件里残留了旧密钥，也会被更高优先级来源覆盖，
 不会出现「换了 Secret 但线上还在用旧密钥」的情况。
+
+### 密钥存放在哪里
+
+Token 和 Cookie **不放**在 `settings.json` 里，而是单独存到 `data/secrets.json`，
+写入时自动收紧为 `600`（仅属主可读写，Windows 上忽略）。
+
+这样做有三个原因：
+
+1. **不会被接口读回浏览器。** 页面「设置」只显示「✅ 已配置 / 未配置」，
+   连打码片段都不给——早前返回过 `sk-1***...***abcd` 这种形式，
+   但 44 位密钥泄露 8 位、且 F12 一开就全看见，等于没脱敏。
+2. **权限能单独收紧。** 普通配置保持常规权限，密钥文件 600。
+3. **迁移/备份更干净。** 复制配置到服务器时不会顺手把密钥带走。
+
+用 `V2N_SECRETS_FILE` 可以把密钥文件放到数据目录之外，
+例如 `/etc/video2note.secrets.json`（配合 `chmod 600` 与 systemd `EnvironmentFile`）。
+
+页面上的 Token 输入框已隐藏，Cookie 框也不回显内容。要改密钥直接编辑该文件：
+
+```json
+{
+  "asr_api_key": "填你的模力方舟 Token",
+  "llm_api_key": "留空则复用 ASR 的 Key",
+  "cookie_text": "抖音 Cookie 整段",
+  "cookie_text_bili": "B站 Cookie 整段"
+}
+```
+
+从旧版本升级时无需手动操作：程序启动会自动把 `settings.json` 里的密钥
+搬进 `secrets.json` 并从原文件删除，重复执行是幂等的。
 
 | 配置项 | 环境变量名（推荐） | 说明 |
 |---|---|---|
@@ -444,8 +474,9 @@ git remote add origin https://github.com/<你的用户名>/video2note.git
 git push -u origin main
 ```
 
-`data/`（含 tasks / media / cookies.txt / settings.json）与 `*.log` 已在 `.gitignore` 中排除，
-不会把密钥和 Cookie 提交上去。首次推送需要在 GitHub 上创建一个空仓库（不要勾选 README）。
+`data/`（含 tasks / media / cookies.txt / settings.json / secrets.json）与 `*.log` 已在 `.gitignore` 中排除，
+`secrets.json` 也单独列了规则，不会把密钥和 Cookie 提交上去。
+首次推送需要在 GitHub 上创建一个空仓库（不要勾选 README）。
 
 ### 手动同步到创空间
 

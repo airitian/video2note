@@ -500,7 +500,7 @@
   // 这些是部署期参数（接口地址、协议、Token、模型名）或与本项目无关的本地环境项，
   // 日常使用改不动也不需要改，暴露出来只会让设置面板变得冗长、容易误填。
   // 注意：只是前端不渲染，后端 DEFAULTS 与接口照常支持，
-  // 需要改时仍可编辑 data/settings.json 或用 V2N_* 环境变量。
+  // 需要改时仍可编辑 data/secrets.json 或用 V2N_* 环境变量。
   const HIDDEN_SETTINGS = [
     "asr_base_url", "asr_api_key", "asr_model",
     "llm_protocol", "llm_base_url", "llm_api_key", "llm_model",
@@ -508,17 +508,28 @@
     "proxy", "ffmpeg_path",
   ];
 
+  // 敏感项：后端只回「有没有配」，绝不回内容。
+  // 输入框因此始终为空，placeholder 提示当前状态；
+  // 留空表示不改（不是清空），要清空得点旁边的清除按钮。
+  const SECRET_UI = {
+    cookie_text: "cookie_douyin",
+    cookie_text_bili: "cookie_bilibili",
+  };
+
   function openSettings() {
     const v = settingsCache.values || {}, help = settingsCache.help || {};
+    const cfg = v._configured || {};
     const full = ["asr_base_url", "llm_base_url", "cookie_file", "cookie_text",
                   "cookie_text_bili", "proxy", "ffmpeg_path"];
     // 抖音与B站的 Cookie 必须分开填：域名不同，混在一起两边都会失效
     const areas = ["cookie_text", "cookie_text_bili"];
     const PH = {
       cookie_text: "【抖音】F12 → Network → 点任意请求 → Request Headers → 复制整段 Cookie"
-        + "（形如 a=1; b=2）粘到这里，程序自动转 cookies.txt。也接受 Netscape 格式全文。",
+        + "（形如 a=1; b=2）粘到这里，程序自动转 cookies.txt。也接受 Netscape 格式全文。"
+        + "（出于安全考虑，已保存的 Cookie 不会回显；留空即保持不变）",
       cookie_text_bili: "【B站】在 B站登录后按同样方式复制整段 Cookie 粘到这里。"
-        + "务必包含登录态字段（登录会话凭证），否则会返回 412。自动转 cookies_bili.txt。",
+        + "务必包含登录态字段（登录会话凭证），否则会返回 412。"
+        + "（出于安全考虑，已保存的 Cookie 不会回显；留空即保持不变）",
       cookie_browser: "只填浏览器名，不要粘贴 Cookie 内容。chrome / edge / firefox / brave。"
         + "（容器/云端环境没有浏览器，优先用上面的 Cookie 文本框）",
       cookie_file: "本机已有的 Netscape cookies.txt 绝对路径，例如 D:\\cookies.txt（一般用不到）。",
@@ -526,19 +537,50 @@
     const keys = Object.keys(help).filter((k) => HIDDEN_SETTINGS.indexOf(k) < 0);
     $("#settings-form").innerHTML = keys.map((k) => {
       const wide = full.includes(k) ? " full" : "";
-      const val = v[k] !== undefined ? v[k] : "";
-      const ctl = areas.includes(k)
-        ? '<textarea data-key="' + k + '" rows="4" placeholder="' + esc(PH[k] || "") + '">' + esc(val) + "</textarea>"
-        : '<input data-key="' + k + '" value="' + esc(val) + '" placeholder="' + esc(PH[k] || "") + '">';
+      const isSecret = Object.prototype.hasOwnProperty.call(SECRET_UI, k);
+      // 敏感项不回显真实值，val 恒为空
+      const val = isSecret ? "" : (v[k] !== undefined ? v[k] : "");
+      let ctl;
+      if (areas.includes(k)) {
+        const on = isSecret && !!cfg[SECRET_UI[k]];
+        const state = on
+          ? "✅ 已配置（内容不回显，留空保持不变）"
+          : "未配置 —— 粘贴后点保存";
+        ctl = '<textarea data-key="' + k + '" rows="4" placeholder="'
+          + esc(PH[k] || "") + '">' + esc(val) + "</textarea>"
+          + '<div class="secret-row"><span class="secret-state">' + state + "</span>"
+          + (on ? '<button type="button" class="btn small danger" data-clear="' + k
+                 + '">清除</button>' : "") + "</div>";
+      } else {
+        ctl = '<input data-key="' + k + '" value="' + esc(val) + '" placeholder="'
+          + esc(PH[k] || "") + '">';
+      }
       return '<div class="field' + wide + '"><label>' + esc(help[k]) + "</label>" + ctl + "</div>";
     }).join("");
     $("#settings-modal").classList.remove("hidden");
+  }
+
+  async function clearSecret(key) {
+    const label = key === "cookie_text" ? "抖音" : "B站";
+    if (!confirm("确定清除已保存的" + label + " Cookie？清除后下载这两个平台的视频会因缺少登录态而失败。")) return;
+    try {
+      settingsCache = await api("/api/settings", {
+        method: "POST", body: JSON.stringify({ values: {}, clear: [key] }),
+      });
+      openSettings();
+      toast(label + " Cookie 已清除");
+    } catch (e) { toast(e.message, true); }
   }
 
   async function saveSettings() {
     const values = {};
     $("#settings-form").querySelectorAll("input, textarea").forEach((inp) => {
       const k = inp.dataset.key;
+      // 敏感项：只有真正填了新值才提交；留空 = 保持原值不变
+      if (Object.prototype.hasOwnProperty.call(SECRET_UI, k)) {
+        if (inp.value.trim()) values[k] = inp.value;
+        return;
+      }
       const orig = String((settingsCache.values || {})[k] !== undefined ? settingsCache.values[k] : "");
       if (inp.value === orig) return;
       values[k] = inp.value;
@@ -557,6 +599,8 @@
 
   // ---------- 事件 ----------
   document.addEventListener("click", async (e) => {
+    const clr = e.target.closest("[data-clear]");
+    if (clr) { e.stopPropagation(); clearSecret(clr.dataset.clear); return; }
     const del = e.target.closest("[data-del]");
     if (del) { e.stopPropagation(); removeTask(del.dataset.del); return; }
     const hitem = e.target.closest(".hitem");
