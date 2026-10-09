@@ -461,11 +461,16 @@ def _meta_from_file(src: Path, workdir: Path) -> dict:
     else:
         try:
             audio.extract_audio(src, workdir / "audio.mp3")
-            video_path = str(workdir / "source" + src.suffix.lower())
-            workdir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, video_path)
         except Exception as e:
             raise RuntimeError(f"无法从文件中提取音频：{e}")
+        try:
+            # 注意：/ 优先级高于 +，必须写成 workdir / f"source{ext}"，
+            # 否则会算成 (workdir / "source") + ext —— Path + str 直接抛 TypeError
+            video_path = workdir / f"source{src.suffix.lower()}"
+            shutil.copy2(src, video_path)
+        except Exception:
+            # 复制失败不影响转写，只丢视频预览；这里不能带上任务对象（不在作用域内）
+            video_path = None
     meta = {
         "video_id": src.stem,
         "title": src.stem or "本地文件",
@@ -477,7 +482,8 @@ def _meta_from_file(src: Path, workdir: Path) -> dict:
         "audio_path": str(workdir / "audio.mp3"),
     }
     if video_path:
-        meta["video_path"] = video_path
+        # 必须转 str：meta 会被 json 序列化落盘，Path 不可序列化
+        meta["video_path"] = str(video_path)
     return meta
 
 
