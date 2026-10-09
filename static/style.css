@@ -170,3 +170,12 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
   .ai-row { flex-direction: column; }
   .btn.ai { width: 100%; }
 }
+
+/* 转写进行中的占位行：让用户知道后面还有内容在识别 */
+.pending-line { color: var(--text-3); font-size: 13px; font-style: italic; padding: 6px 10px; }
+.pending-line::after { content: ""; display: inline-block; width: 6px; height: 6px; margin-left: 6px; border-radius: 50%; background: currentColor; animation: v2pulse 1.1s ease-in-out infinite; vertical-align: middle; }
+@keyframes v2pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+
+/* 失败后的重试按钮：比普通按钮醒目，因为它是失败后的唯一出口 */
+.btn.retry { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border-strong)); }
+.btn.retry:hover { background: color-mix(in srgb, var(--err) 8%, transparent); }

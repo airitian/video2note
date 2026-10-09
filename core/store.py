@@ -22,6 +22,8 @@ class Task:
     platform: str = ""
     status: str = "pending"          # pending/running/transcribed/done/failed/canceled
     stage: str = "queued"            # downloading/extracting/slicing/transcribing/polishing/queued
+    #失败时所处的阶段：决定重试从哪一步继续（polishing -> 只重跑整理，其余 -> 重跑转写）
+    failed_stage: str = ""
     percent: int = 0
     spercent: int = 0                # 当前阶段内部百分比（给前端分阶段进度条）
     message: str = ""
@@ -56,6 +58,7 @@ class Task:
             "platform": self.platform,
             "status": self.status,
             "stage": self.stage,
+            "failed_stage": self.failed_stage,
             "percent": self.percent,
             "spercent": self.spercent,
             "message": self.message,

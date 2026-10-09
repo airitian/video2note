@@ -18,7 +18,8 @@ from .config import (HELP, MEDIA_DIR, ROOT, ensure_cookie_file, ensure_dirs,
                      load_settings, normalize_browser, public_settings,
                      save_settings)
 from .pipeline import (_apply_variant, _mark_idempotent_hit, _sync_variant_meta,
-                       polish_needed, submit, submit_polish)
+                       polish_needed, retry as pipeline_retry,
+                       submit, submit_polish)
 
 ensure_dirs()
 
@@ -26,8 +27,24 @@ app = FastAPI(title="视频转笔记", version="1.1.0")
 STATIC = ROOT / "static"
 
 STYLES = ("general", "note", "article", "clean")
-MEDIA_TYPES = {"video.mp4": "video/mp4", "audio.mp3": "audio/mpeg"}
-ALLOWED_MEDIA = set(MEDIA_TYPES)
+
+# 按扩展名给媒体流定Content-Type。
+# 不用固定白名单的原因：上传的本地文件落盘名是 source<原后缀>，
+# 可能是 source.mp4 / source.mkv / source.mov 等任意视频格式；
+# 固定只认 video.mp4 会让上传的视频预览不出来。
+MEDIA_TYPES = {
+    ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
+    ".webm": "video/webm", ".mkv": "video/x-matroska", ".avi": "video/x-msvideo",
+    ".flv": "video/x-flv", ".ts": "video/mp2t", ".3gp": "video/3gpp",
+    ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".aac": "audio/aac",
+    ".wav": "audio/wav", ".flac": "audio/flac", ".ogg": "audio/ogg",
+    ".opus": "audio/opus", ".wma": "audio/x-ms-wma",
+}
+
+
+def _media_type(name: str) -> str:
+    """媒体文件 -> Content-Type；不在白名单内返回空字符串"""
+    return MEDIA_TYPES.get(Path(name).suffix.lower(), "")
 
 
 class CreateIn(BaseModel):
@@ -198,6 +215,21 @@ def polish_task(tid: str, body: PolishIn):
     return {"ok": True, "idempotent": False, "message": reason}
 
 
+@app.post("/api/tasks/{tid}/retry")
+def retry_task(tid: str):
+    """从失败处重试：整理阶段失败只重跑 LLM，其余阶段重跑整条流程"""
+    t = store.get(tid)
+    if not t:
+        raise HTTPException(404, "任务不存在")
+    if t.status not in ("failed", "canceled"):
+        raise HTTPException(400, "只有失败或已取消的任务才能重试")
+    action = pipeline_retry(t)
+    if action == "busy":
+        raise HTTPException(400, "任务正在处理中，请稍后再试")
+    return {"ok": True, "action": action,
+            "message": "正在重试 AI 整理" if action == "polish" else "正在重新转写"}
+
+
 @app.get("/api/tasks/{tid}")
 def get_task(tid: str):
     t = store.get(tid)
@@ -224,6 +256,9 @@ async def task_events(tid: str):
     async def gen():
         last = 0
         idle = 0
+        # 记录上次推过的句数，只有新增分片才推 partial，
+        # 否则 0.8 秒一次心跳会把同一份全文反复推一遍
+        sent_segs = -1
         while True:
             t = store.get(tid)
             if not t:
@@ -233,10 +268,22 @@ async def task_events(tid: str):
                 e = t.events[last]
                 last += 1
                 yield "data: " + json.dumps({"type": "log", **e}, ensure_ascii=False) + "\n\n"
+            # 转写进行中：增量推送已转写出的句子
+            if t.status == "running" and t.stage == "transcribing":
+                n = len(t.segments or [])
+                if n and n != sent_segs:
+                    sent_segs = n
+                    yield "data: " + json.dumps(
+                        {"type": "partial", "segments": t.segments,
+                         "transcript": t.transcript,
+                         "spercent": t.spercent}, ensure_ascii=False) + "\n\n"
+            elif t.status != "running":
+                sent_segs = -1
             yield "data: " + json.dumps(
                 {"type": "state", "status": t.status, "stage": t.stage,
                  "percent": t.percent, "spercent": t.spercent,
-                 "message": t.message, "error": t.error},
+                 "message": t.message, "error": t.error,
+                 "failed_stage": t.failed_stage},
                 ensure_ascii=False) + "\n\n"
             if t.status in ("done", "failed", "canceled"):
                 yield 'data: {"type":"eof"}\n\n'
@@ -253,8 +300,11 @@ async def task_events(tid: str):
 @app.get("/api/media/{tid}/{name}")
 def media(tid: str, name: str, request: Request, download: int = 0):
     """视频/音频流式服务，支持 HTTP Range（浏览器拖动进度条必需）"""
-    mt = MEDIA_TYPES.get(name)
+    mt = _media_type(name)
     if not mt:
+        raise HTTPException(404, "不支持的媒体文件")
+    # 防目录穿越：只允许任务目录下的文件名，不接受任何路径分隔符
+    if "/" in name or "\\" in name or name.startswith("."):
         raise HTTPException(404, "不支持的媒体文件")
     p = MEDIA_DIR / tid / name
     if not p.is_file():

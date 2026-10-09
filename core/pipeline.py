@@ -53,6 +53,17 @@ def _set(t: store.Task, stage: str, pct: float, msg: str,
             pass
 
 
+def _publish_segments(t: store.Task, segments: list[dict]) -> None:
+    """把已转写出的分片结果排序后写到任务上并落盘，供前端实时预览。
+
+    segments 是乱序累积的（并发返回），必须按 start 排序，否则预览里
+    句子会跳来跳去。transcript 同步刷新，这样刷新页面也能看到中间结果。
+    """
+    segs = sorted((s for s in segments if s), key=lambda x: x.get("start", 0))
+    t.segments = segs
+    t.transcript = asr.segments_to_text(segs)
+
+
 def _check_cancel(t: store.Task) -> None:
     if t._cancel:
         raise InterruptedError("任务已取消")
@@ -71,6 +82,8 @@ def _run_and_catch(t: store.Task, body: Callable[[], None]) -> bool:
         return False
     except Exception as e:
         t.status = "failed"
+        # 记下失败发生在哪个阶段：重试据此决定是只重跑 AI 整理，还是整个转写流程
+        t.failed_stage = t.stage
         t.error = str(e)
         t.message = "处理失败"
         t.log("error", str(e))
@@ -145,6 +158,7 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
     segments: list[dict] = []
     if len(chunks) == 1:
         segments = do_chunk(0)
+        _publish_segments(t, segments)
         _set(t, "transcribing", 1.0, "转写完成", emit=emit)
     else:
         done = 0
@@ -156,6 +170,9 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
                 with lock:
                     done += 1
                     segments.extend(segs)
+                    # 每完成一个分片就落一次盘，用户能边转写边看到文字，
+                    # 而不是干等全部跑完才一次性出现
+                    _publish_segments(t, segments)
                     _set(t, "transcribing", done / len(chunks),
                          f"转写进度 {done}/{len(chunks)}", emit=emit)
 
@@ -312,6 +329,42 @@ def _polish_body(t: store.Task, style: str, emit: EmitFn = None, force: bool = F
 
 # ============================ 对外接口 ============================
 
+def retry(t: store.Task) -> str:
+    """从失败处重试，返回本次要执行的动作（transcribe / polish）。
+
+    分两类：
+    - 失败在polishing（AI 整理）：转写原文还在，只重跑 LLM，不重新下载和转写
+    - 其他阶段（下载/抽音频/切片/转写）：重跑整条流程。
+      _transcribe_body 开头会检测本地已有媒体并复用，所以不会重复下载。
+
+    canceled 也允许重试：用户主动取消后通常就是想再跑一次。
+    """
+    if t.status == "running":
+        return "busy"
+
+    t._cancel = False
+    stage = t.failed_stage or ""
+
+    # 整理阶段失败：原文完好，只补这一段
+    if stage == "polishing" and t.transcript:
+        style = (t.options or {}).get("style") or "general"
+        submit_polish(t, style, force=True)
+        return "polish"
+
+    # 其余情况走完整流程。注意要先清掉旧错误，否则界面会同时显示
+    # 上一次的失败信息和本次的进度
+    t.failed_stage = ""
+    t.error = ""
+    t.status = "pending"
+    t.stage = "queued"
+    t.message = "正在重试"
+    t.log("info", "从失败处重试：重新执行转写流程"
+          + ("（将复用已下载的媒体文件）" if _existing_media(t) else ""))
+    store.save(t)
+    submit(t)
+    return "transcribe"
+
+
 def submit(t: store.Task) -> None:
     t.status = "running"
     store.save(t)
@@ -467,7 +520,12 @@ def _meta_from_file(src: Path, workdir: Path) -> dict:
             # 注意：/ 优先级高于 +，必须写成 workdir / f"source{ext}"，
             # 否则会算成 (workdir / "source") + ext —— Path + str 直接抛 TypeError
             video_path = workdir / f"source{src.suffix.lower()}"
-            shutil.copy2(src, video_path)
+            # 上传接口已经把文件存成了 workdir/source<ext>，这里 src 与目标
+            # 是同一个文件。copy2 撞上同路径会抛 SameFileError，被下面的
+            # except 吞掉后 video_path 变None —— 表现为「上传了视频但预览
+            # 区一直显示暂无视频」。所以要先比一下，相同就直接沿用。
+            if not (src.exists() and src.resolve() == video_path.resolve()):
+                shutil.copy2(src, video_path)
         except Exception:
             # 复制失败不影响转写，只丢视频预览；这里不能带上任务对象（不在作用域内）
             video_path = None

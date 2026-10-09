@@ -9,7 +9,7 @@
   let pickedFile = null;
   let uploadPct = null;
   let settingsCache = { values: {}, help: {} };
-  const ws = { videoTask: null, videoEl: null, linesTask: null, lineEls: [], segs: [], active: -1, follow: true, noteKey: null };
+  const ws = { videoTask: null, videoEl: null, videoKey: null, linesTask: null, lineEls: [], segs: [], active: -1, follow: true, noteKey: null };
 
   const ORDER = ["upload", "downloading", "extracting", "slicing", "transcribing", "polishing"];
   const STATUS_TEXT = { pending: "排队中", running: "处理中", transcribed: "转写完成", done: "已完成", failed: "失败", canceled: "已取消" };
@@ -176,6 +176,13 @@
     msg.textContent = t.message || "";
     const err = $("#ws-error");
     if (t.error) { err.textContent = t.error; err.classList.remove("hidden"); } else err.classList.add("hidden");
+    // 失败/取消后才给重试入口；整理阶段失败只补AI 整理，其余重跑全流程
+    const rbtn = $("#btn-retry");
+    if (rbtn) {
+      const can = t.status === "failed" || t.status === "canceled";
+      rbtn.classList.toggle("hidden", !can);
+      rbtn.textContent = (t.failed_stage === "polishing" && t.transcript) ? "↻ 重试 AI 整理" : "↻ 重新转写";
+    }
     const logs = $("#ws-logs");
     if (!logs.classList.contains("hidden")) {
       logs.innerHTML = (t.events || []).slice(-80).map((e) => '<div class="' + e.level + '">' + esc(e.text) + "</div>").join("");
@@ -210,45 +217,81 @@
 
   function ensureVideo(t) {
     const host = $("#video-host");
-    const has = !!(t && t.meta && t.meta.video_path);
-    if (ws.videoTask !== currentId) {
-      ws.videoTask = currentId;
-      ws.videoEl = null;
-      host.innerHTML = has
-        ? '<video controls preload="metadata" playsinline src="/api/media/' + currentId + '/video.mp4"></video>'
-        : '<div class="empty">暂无视频</div>';
-      if (has) {
-        ws.videoEl = host.querySelector("video");
-        ws.videoEl.addEventListener("timeupdate", () => syncActive(ws.videoEl.currentTime));
-        ws.videoEl.addEventListener("seeked", () => syncActive(ws.videoEl.currentTime, true));
+    const vp = t && t.meta && t.meta.video_path;
+    const key = currentId + "|" + (vp || "");
+    if (ws.videoKey === key) return;
+    ws.videoKey = key;
+    ws.videoTask = currentId;
+    ws.videoEl = null;
+    if (!vp) {
+      host.innerHTML = '<div class="empty">暂无视频</div>';
+      return;
+    }
+    // 必须用 meta 里记录的真实文件名，不能写死 video.mp4：
+    // 本地上传的视频落盘名是 source<原后缀>，写死会导致预览区一直空白
+    const fname = vp.split(/[\\/]/).pop();
+    const kind = (fname.match(/\.(mp3|m4a|aac|wav|flac|ogg|opus|wma)$/i)) ? "audio" : "video";
+    host.innerHTML = '<' + kind + ' controls preload="metadata" playsinline src="/api/media/'
+      + currentId + "/" + encodeURIComponent(fname) + '"></' + kind + '>';
+    ws.videoEl = host.querySelector(kind);
+    if (kind === "video" && ws.videoEl) {
+      ws.videoEl.addEventListener("timeupdate", () => syncActive(ws.videoEl.currentTime));
+      ws.videoEl.addEventListener("seeked", () => syncActive(ws.videoEl.currentTime, true));
+    } else {
+      // 纯音频没有画面，但也要能跟着播放高亮文字稿
+      ws.videoEl = ws.videoEl || null;
+      const a = host.querySelector("audio");
+      if (a) {
+        a.addEventListener("timeupdate", () => syncActive(a.currentTime));
+        a.addEventListener("seeked", () => syncActive(a.currentTime, true));
+        ws.videoEl = a;
       }
     }
   }
 
   function ensureLines(t) {
     const box = $("#lines");
-    if (ws.linesTask !== currentId) {
-      ws.linesTask = currentId;
+    if (ws.linesTask === currentId) return;
+    // 转写增量会反复重建，这里记住滚动位置与高亮，
+    // 否则每来一次增量预览就被拉回顶部、正在看的那句也丢了高亮
+    const keepScroll = ws.scrollTop || 0;
+    const keepActive = ws.active;
+    ws.linesTask = currentId;
+    ws.segs = (t && t.segments) || [];
+    const live = !!(t && t.status === "running" && t.stage === "transcribing");
+    if (!ws.segs.length) {
+      box.innerHTML = '<div class="empty">' + (live ? "正在识别，文字会陆续出现…" : "暂无转写结果") + "</div>";
+      ws.lineEls = [];
       ws.active = -1;
-      ws.segs = (t && t.segments) || [];
-      box.innerHTML = ws.segs.length
-        ? ws.segs.map((s, i) =>
-            '<div class="line" data-i="' + i + '"><time>' + fmtTime(s.start) + "</time><span>" + esc(s.text || "") + "</span></div>").join("")
-        : '<div class="empty">暂无转写结果</div>';
-      ws.lineEls = Array.prototype.slice.call(box.querySelectorAll(".line"));
-      ws.lineEls.forEach((line) => {
-        line.addEventListener("click", () => {
-          const i = parseInt(line.dataset.i, 10);
-          const s = ws.segs[i];
-          if (!s) return;
-          if (ws.videoEl) {
-            ws.videoEl.currentTime = Math.max(0, (s.start || 0) - 0.3);
-            ws.videoEl.play().catch(() => {});
-          }
-          markActive(i, false);
-        });
-      });
+      return;
     }
+    box.innerHTML = ws.segs.map((s, i) =>
+      '<div class="line" data-i="' + i + '"><time>' + fmtTime(s.start) + "</time><span>" + esc(s.text || "") + "</span></div>").join("")
+      + (live ? '<div class="line pending-line">正在识别后续内容…</div>' : "");
+    ws.lineEls = Array.prototype.slice.call(box.querySelectorAll(".line:not(.pending-line)"));
+    ws.lineEls.forEach((line) => {
+      line.addEventListener("click", () => {
+        const i = parseInt(line.dataset.i, 10);
+        const s = ws.segs[i];
+        if (!s) return;
+        if (ws.videoEl) {
+          ws.videoEl.currentTime = Math.max(0, (s.start || 0) - 0.3);
+          ws.videoEl.play().catch(() => {});
+        }
+        markActive(i, false);
+      });
+    });
+    // 恢复高亮与滚动位置
+    if (keepActive >= 0 && ws.lineEls[keepActive]) {
+      ws.active = -1;
+      markActive(keepActive, false);
+    }
+    box.scrollTop = keepScroll;
+  }
+
+  function saveScroll() {
+    const box = $("#lines");
+    if (box) ws.scrollTop = box.scrollTop;
   }
 
   function ensureNote(t) {
@@ -309,6 +352,14 @@
           if (ev.type === "state") {
             t.status = ev.status; t.stage = ev.stage; t.percent = ev.percent;
             t.spercent = ev.spercent; t.message = ev.message; t.error = ev.error;
+            t.failed_stage = ev.failed_stage || "";
+          } else if (ev.type === "partial") {
+            // 转写增量：边转写边显示，不用等全部分片跑完
+            t.segments = ev.segments || [];
+            t.transcript = ev.transcript || "";
+            if (ev.spercent != null) t.spercent = ev.spercent;
+            // 强制让文字区按新segments 重绘
+            ws.linesTask = null;
           } else if (ev.type === "log") {
             t.events = t.events || [];
             if (!t.events.some((x) => x.t === ev.t && x.text === ev.text)) t.events.push(ev);
@@ -336,8 +387,8 @@
 
   function selectTask(id) {
     currentId = id;
-    ws.videoTask = null; ws.linesTask = null; ws.noteKey = null;
-    ws.videoEl = null; ws.segs = []; ws.lineEls = []; ws.active = -1;
+    ws.videoTask = null; ws.videoKey = null; ws.linesTask = null; ws.noteKey = null;
+    ws.videoEl = null; ws.segs = []; ws.lineEls = []; ws.active = -1; ws.scrollTop = 0;
     $("#video-host").innerHTML = '<div class="empty">加载中…</div>';
     $("#lines").innerHTML = '<div class="empty">加载中…</div>';
     render();
@@ -360,7 +411,7 @@
         (t && t.note_info && t.note_info.styles) ||
         Object.keys((t && t.variants) || {}).filter((k) => t.variants[k] && t.variants[k].note)
       );
-      ws.videoTask = null; ws.linesTask = null; ws.noteKey = null;
+      ws.videoTask = null; ws.videoKey = null; ws.linesTask = null; ws.noteKey = null;
       render();
     } catch (e) {
       toast("加载该记录失败：" + e.message, true);
@@ -420,6 +471,20 @@
     }
   }
 
+  async function retryTask() {
+    if (!currentId) return;
+    try {
+      const r = await api("/api/tasks/" + currentId + "/retry", { method: "POST" });
+      toast(r.message || "已重新开始");
+      const t = tasks.get(currentId);
+      if (t) { t.status = "pending"; t.stage = "queued"; t.error = ""; t.failed_stage = ""; }
+      render();
+      follow(currentId);
+    } catch (e) {
+      toast(e.message, true);
+    }
+  }
+
   async function removeTask(id) {
     try { await api("/api/tasks/" + id, { method: "DELETE" }); } catch (e) {}
     tasks.delete(id);
@@ -430,6 +495,18 @@
       render();
     }
   }
+
+  // 设置面板不展示的配置项。
+  // 这些是部署期参数（接口地址、协议、Token、模型名）或与本项目无关的本地环境项，
+  // 日常使用改不动也不需要改，暴露出来只会让设置面板变得冗长、容易误填。
+  // 注意：只是前端不渲染，后端 DEFAULTS 与接口照常支持，
+  // 需要改时仍可编辑 data/settings.json 或用 V2N_* 环境变量。
+  const HIDDEN_SETTINGS = [
+    "asr_base_url", "asr_api_key", "asr_model",
+    "llm_protocol", "llm_base_url", "llm_api_key", "llm_model",
+    "cookie_browser", "cookie_file",
+    "proxy", "ffmpeg_path",
+  ];
 
   function openSettings() {
     const v = settingsCache.values || {}, help = settingsCache.help || {};
@@ -446,7 +523,8 @@
         + "（容器/云端环境没有浏览器，优先用上面的 Cookie 文本框）",
       cookie_file: "本机已有的 Netscape cookies.txt 绝对路径，例如 D:\\cookies.txt（一般用不到）。",
     };
-    $("#settings-form").innerHTML = Object.keys(help).map((k) => {
+    const keys = Object.keys(help).filter((k) => HIDDEN_SETTINGS.indexOf(k) < 0);
+    $("#settings-form").innerHTML = keys.map((k) => {
       const wide = full.includes(k) ? " full" : "";
       const val = v[k] !== undefined ? v[k] : "";
       const ctl = areas.includes(k)
@@ -505,6 +583,7 @@
     }
     if (e.target.id === "btn-start") start();
     else if (e.target.id === "btn-polish") polish();
+    else if (e.target.id === "btn-retry") retryTask();
     else if (e.target.id === "btn-history") $("#history-panel").classList.toggle("hidden");
     else if (e.target.id === "btn-history-close") $("#history-panel").classList.add("hidden");
     else if (e.target.id === "btn-settings") openSettings();
@@ -539,6 +618,9 @@
   });
 
   // ---------- 启动 ----------
+  // 记住文字区滚动位置：转写增量会重建 DOM，重建后要还原回去
+  $("#lines").addEventListener("scroll", saveScroll, { passive: true });
+
   async function boot() {
     try {
       const list = await api("/api/tasks");

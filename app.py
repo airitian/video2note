@@ -369,6 +369,25 @@ def load_task(tid: str) -> tuple:
     return bundle(t)
 
 
+def retry_task(tid: str) -> tuple:
+    """从失败处重试。
+
+    - 失败在 AI 整理阶段且原文还在 -> 只补 LLM 整理，不重新下载和转写
+    - 其余阶段 -> 重跑整条流程（会复用已下载的媒体文件）
+    """
+    t = store.get((tid or "").strip())
+    if not t:
+        raise gr.Error("任务不存在或已被清理")
+    if t.status not in ("failed", "canceled"):
+        raise gr.Error("只有失败或已取消的任务才能重试")
+    action = pipeline.retry(t)
+    if action == "busy":
+        raise gr.Error("任务正在处理中，请稍后再试")
+    # 后台线程已由 pipeline.submit / submit_polish 接管，
+    # 这里只把当前状态回显到界面，真正结果靠用户刷新查看
+    return bundle(t)
+
+
 def delete_task(tid: str) -> tuple:
     """删除任务及其媒体文件，释放磁盘"""
     if tid:
@@ -558,11 +577,14 @@ with comp(gr.Blocks, title=APP_TITLE, theme=gr.themes.Soft(), css=CUSTOM_CSS,
                 refresh_btn = comp(gr.Button, value="🔄 刷新列表")
                 selected_tb = comp(gr.Textbox, label="任务ID（点击表格行回填）", value="")
                 load_btn = comp(gr.Button, value="📂 载入该任务", variant="primary")
+                retry_btn = comp(gr.Button, value="↻ 重试失败任务")
                 del_btn = comp(gr.Button, value="🗑 删除该任务")
             comp(gr.Markdown,
                  value="<div class='stage-hint'>点击表格行选中，再点「📂 载入该任务」"
                        "即可在「转写工作台」完整回显视频、转写文字稿与当前文稿，"
-                       "并可对该任务按任意风格重新生成。</div>")
+                       "并可对该任务按任意风格重新生成。<br>"
+                       "任务失败时点「↻ 重试失败任务」：若失败发生在 AI 整理阶段，"
+                       "只补这一段；若失败在转写阶段，会复用已下载的媒体重跑流程。</div>")
 
         # ---------------- 设置 ----------------
         with gr.TabItem("⚙️ 设置"):
@@ -580,15 +602,19 @@ with comp(gr.Blocks, title=APP_TITLE, theme=gr.themes.Soft(), css=CUSTOM_CSS,
                                   placeholder=("已由环境变量 %s 托管，页面不可修改"
                                                % _from_env["llm_api_key"])
                                   if _from_env.get("llm_api_key") else "留空则复用 ASR 密钥")
-            with gr.Row():
+            # 接口地址、协议、模型名属于部署期参数，日常使用改不动也不需要改，
+            # 与 Web 版保持一致：页面上不暴露，需要时改 settings.json 或环境变量。
+            # 组件仍保留（visible=False）以维持 save_ui_settings 的入参契约。
+            with gr.Row(visible=False):
                 asr_base_tb = comp(gr.Textbox, label=HELP["asr_base_url"], value=_default["asr_base_url"])
                 llm_base_tb = comp(gr.Textbox, label=HELP["llm_base_url"], value=_default["llm_base_url"])
-            with gr.Row():
+            with gr.Row(visible=False):
                 proto_dd = comp(gr.Dropdown, choices=LLM_PROTOCOLS,
                                 value=_default.get("llm_protocol", "anthropic"),
                                 label=HELP["llm_protocol"])
-                maxtok_tb = comp(gr.Textbox, label=HELP["llm_max_tokens"],
-                                 value=str(_default.get("llm_max_tokens", "8192")))
+            # maxtok / 温度属于可调参数，与 Web 版一致保持可见
+            maxtok_tb = comp(gr.Textbox, label=HELP["llm_max_tokens"],
+                             value=str(_default.get("llm_max_tokens", "8192")))
             with gr.Row():
                 set_asr_model_tb = comp(gr.Dropdown, choices=ASR_MODELS,
                                         value=_default["asr_model"],
@@ -610,7 +636,7 @@ with comp(gr.Blocks, title=APP_TITLE, theme=gr.themes.Soft(), css=CUSTOM_CSS,
             cookie_bili_tb = comp(gr.Textbox, label=HELP["cookie_text_bili"], lines=4,
                                   value=_default.get("cookie_text_bili", ""),
                                   placeholder="粘贴 B站网页的 Cookie 整段，必须包含登录态字段")
-            cookie_tb = comp(gr.Textbox, label=HELP["cookie_browser"],
+            cookie_tb = comp(gr.Textbox, label=HELP["cookie_browser"], visible=False,
                              value=_default.get("cookie_browser", ""),
                              placeholder="chrome / edge / firefox（容器环境不可用，优先用上面的 Cookie 文本）")
             save_btn = comp(gr.Button, value="💾 保存配置", variant="primary")
@@ -657,6 +683,7 @@ with comp(gr.Blocks, title=APP_TITLE, theme=gr.themes.Soft(), css=CUSTOM_CSS,
 
     history_df.select(fn=on_select, inputs=[history_df], outputs=[selected_tb])
     load_btn.click(fn=load_task, inputs=[selected_tb], outputs=OUTPUTS)
+    retry_btn.click(fn=retry_task, inputs=[selected_tb], outputs=OUTPUTS)
     del_btn.click(fn=delete_task, inputs=[selected_tb], outputs=OUTPUTS)
 
     save_btn.click(
