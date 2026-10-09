@@ -504,6 +504,12 @@ def _humanize_error(e: Exception) -> str:
             return BILI_412_HINT
         return ("请求被平台风控拦截（HTTP 412）。"
                 "如为B站链接，请确认「设置」里已配置含登录态凭证的 B站 Cookie。")
+    # yt-dlp 对未登录的抖音固定抛这句，且措辞会让人以为"随便来点新鲜 Cookie 就行"。
+    # 实测：无 Cookie 时抖音返回的是 JS 挑战页，必须登录态 Cookie 才有数据。
+    if "fresh cookies" in low:
+        from .douyin import DOUYIN_COOKIE_HINT
+
+        return DOUYIN_COOKIE_HINT
     if "unsupported url" in low or "no video formats" in low or "not a valid url" in low:
         return f"链接无法解析（请粘贴带 http(s):// 的完整链接）：{msg}"
     if "sign in" in low or "login" in low or "account" in low:

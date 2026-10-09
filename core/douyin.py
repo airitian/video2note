@@ -25,6 +25,33 @@ class DouyinError(RuntimeError):
     pass
 
 
+# 抖音现已全面要求登录态 Cookie：无Cookie 时分享页返回的是 JS 挑战页
+# （内容为 `_$jsvmprt` 虚拟机脚本，既没有 RENDER_DATA 也没有 _ROUTER_DATA），
+# 而yt-dlp 会抛出误导性的 "Fresh cookies are needed"。
+# 所以真正能走通的组合只有：有效抖音 Cookie + yt-dlp。
+DOUYIN_COOKIE_HINT = (
+    "抖音需要登录态 Cookie 才能解析。\n\n"
+    "实测确认：未配置 Cookie 时，抖音分享页返回的是一段 JS 虚拟机挑战脚本"
+    "（`_$jsvmprt`），里面没有任何作品数据，yt-dlp 也会报"
+    "\"Fresh cookies (not necessarily logged in) are needed\"。\n\n"
+    "解决办法：在「⚙️ 设置」页的「抖音 Cookie 文本」框粘贴浏览器里的抖音 Cookie，"
+    "保存后立即生效（F12 → Network → 任意 douyin.com 请求 → "
+    "Request Headers → 复制整段 Cookie）。\n\n"
+    "注意：抖音与B站 Cookie 必须分开填，混填会因域名不匹配全部失效。"
+)
+
+
+def _pyktok_supports_douyin(api_cls: type) -> bool:
+    """判断这个 TikTokApi 类能否为国内抖音生成签名
+
+    海外版 TikTokApi（由 pyktok 误装）在 create_sessions 里硬编码 tiktok.com，
+    国内网络下必定超时；只有真正的抖音签名实现才可用。
+    判据：类所在模块路径。真正的抖音实现不会来自 TikTokApi 包。
+    """
+    mod = getattr(api_cls, "__module__", "") or ""
+    return not mod.startswith("TikTokApi")
+
+
 def _cookie_header() -> str:
     """把配置里的 cookie_text 拼成请求头用的 Cookie 串
 
@@ -199,6 +226,15 @@ def _pyktok_detail(url: str, cookies: dict) -> dict | None:
     except Exception as e:
         raise DouyinError(_friendly_sign_error(e)) from e
 
+    # 关键校验：`pyktok` 这个名字在 PyPI 上被两个包占用。
+    #   -真 pyktok 0.0.31（支持抖音）依赖的是另一个包
+    #   - `pyktok` 里的 `from TikTokApi import TikTokApi` 会去装**海外版** TikTokApi 7.x
+    # 装错时 `from pyktok import TikTokApi` 依然成功（拿到的是海外版类），
+    # 但它内部硬编码 tiktok.com，国内网络必然30s 超时—— 表现为"兜底已启用却永远失败"，
+    # 比直接报错更浪费时间。这里提前识别并快速失败。
+    if not _pyktok_supports_douyin(TikTokApi):
+        raise DouyinError(DOUYIN_COOKIE_HINT)
+
     async def sign() -> dict:
         api = TikTokApi(logging_level=40)
         try:
@@ -281,6 +317,13 @@ def _scrape_mobile(url: str) -> tuple[dict | None, str]:
         d = ((item or {}).get("videoInfoRes") or {}).get("item_list") or []
         if d:
             return d[0], ""
+
+    # 两个数据脚本都没有，但响应体很长 —— 这是抖音的 JS 挑战页
+    # （`_$jsvmprt` 虚拟机），意味着请求被当成爬虫拦下了。
+    # 直接说"需要 Cookie"比"可能已删除"有用得多。
+    if "_$jsvmprt" in html or "__ac_signature" in html:
+        return None, DOUYIN_COOKIE_HINT
+
     return None, "分享页未返回作品数据（可能需要登录或已删除）"
 
 
