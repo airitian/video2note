@@ -15,7 +15,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Callable
 
-from .config import load_settings
+from .config import _sanitize_cookie_component, load_settings
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
@@ -26,14 +26,30 @@ class DouyinError(RuntimeError):
 
 
 def _cookie_header() -> str:
-    """把配置里的 cookie_text 拼成请求头用的 Cookie 串"""
+    """把配置里的 cookie_text 拼成请求头用的 Cookie 串
+
+    Cookie 里常混有中文（如 `SEARCH_RESULT_LIST_TYPE={"keyword":"搜索词"}`），
+    而 HTTP 头只能按 latin-1 编码，直接发送会抛
+    `'latin-1' codec can't encode characters in position N`。
+    这里对名/值统一做 ASCII 化处理，与落盘逻辑保持一致。
+    """
     s = load_settings()
     text = (s.get("cookie_text") or "").strip()
     if not text:
         return ""
     # 去掉我们为落盘而加的 `# domain=xxx` 提示行
     text = re.sub(r"^#\s*domain\s*=\s*\S+[ \t]*\n?", "", text, flags=re.I | re.M)
-    return " ".join(x.strip() for x in text.split("\n") if x.strip())
+    parts = []
+    for chunk in re.split(r"[;\n]", text):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        k, _, v = chunk.partition("=")
+        k = _sanitize_cookie_component(k.strip())
+        if not k:
+            continue
+        parts.append(f"{k}={_sanitize_cookie_component(v.strip())}")
+    return "; ".join(parts)
 
 
 def is_douyin(url: str) -> bool:
@@ -77,19 +93,33 @@ def _resolve_short(url: str) -> str:
 
 
 def _pick_url(data: dict) -> str:
-    """从 play_addr / download_addr 里挑一个可用直链（去掉水印参数）"""
-    for key in ("play_addr", "download_addr", "playAddr", "downloadAddr"):
-        item = data.get(key) or {}
-        urls = item.get("url_list") or item.get("urlList") or []
-        for u in urls:
-            u = (u or "").replace("http://", "https://")
-            if u:
-                return u
-    # 兜底：老结构
-    for key in ("playApi", "videoApi"):
-        v = data.get(key) or ""
-        if isinstance(v, str) and v.startswith("http"):
-            return v.replace("http://", "https://")
+    """从 play_addr / download_addr 里挑一个可用直链（去掉水印参数）
+
+    直链通常嵌在 `video.play_addr` 下（抖音 aweme/detail 的标准结构），
+    但移动端分享页抓到的结构可能直接摊在顶层，所以两层都要找。
+    """
+    scopes = [data]
+    vid = data.get("video")
+    if isinstance(vid, dict):
+        scopes.insert(0, vid)          # video 优先，标准结构都在这
+
+    for scope in scopes:
+        for key in ("play_addr", "download_addr", "playAddr", "downloadAddr"):
+            item = scope.get(key) or {}
+            if not isinstance(item, dict):
+                continue
+            urls = item.get("url_list") or item.get("urlList") or []
+            for u in urls:
+                u = (u or "").replace("http://", "https://")
+                if u:
+                    return u
+
+    # 兜底：老结构，字段值本身就是 URL 字符串
+    for scope in scopes:
+        for key in ("playApi", "videoApi", "play_url", "download_url"):
+            v = scope.get(key) or ""
+            if isinstance(v, str) and v.startswith("http"):
+                return v.replace("http://", "https://")
     raise DouyinError("未找到可用的视频直链")
 
 
@@ -111,15 +141,25 @@ def fetch_info(url: str) -> dict:
 
     pyktok 的 TikTokApi 会用 Playwright 起浏览器执行 JS 签名，产出
     a_bogus / X-Bogus，这是 yt-dlp 目前做不到的部分。
+
+    pyktok 不可用时（未安装 / 无 Playwright 内核）不能直接失败——
+    必须继续走 _scrape_mobile 抓移动端分享页，那条路只要 Cookie 对就能出数据。
     """
     real = _resolve_short(url)
     cookies = _cookie_dict()
 
-    detail = _pyktok_detail(real, cookies)
+    # pyktok 缺失属于「兜底手段不可用」，不是「抖音解析失败」：
+    # 记下来继续往下走，最终报错时才把它作为原因说明一并给出。
+    sign_err = ""
+    try:
+        detail = _pyktok_detail(real, cookies)
+    except DouyinError as e:
+        detail, sign_err = None, str(e)
+
     if not detail:
         detail, err = _scrape_mobile(real)
         if not detail:
-            raise DouyinError(err or "pyktok 未返回作品数据")
+            raise DouyinError(err or sign_err or "pyktok 未返回作品数据")
         return _normalize(detail)
     return _normalize(detail)
 
@@ -132,10 +172,12 @@ def _pyktok_detail(url: str, cookies: dict) -> dict | None:
     请求自己发，行为与 yt-dlp 抓包一致。
 
     注意 pyktok 默认导航 tiktok.com（国内不可达），必须用 starting_url 指向抖音。
+
+    pyktok 是可选依赖（requirements 里列了但服务器常默认不装）。导入必须放在
+    try 内：否则 `ModuleNotFoundError` 会在异常处理之外抛出，
+    既给不出可读提示，也拦不下本该走的 _scrape_mobile 兜底。
     """
     import asyncio
-
-    from pyktok import TikTokApi
 
     ck_list = [{"name": k, "value": v, "domain": ".douyin.com", "path": "/"}
                for k, v in cookies.items()]
@@ -151,6 +193,11 @@ def _pyktok_detail(url: str, cookies: dict) -> dict | None:
                "&channel=channel_pc_web&version_code=190500&version_name=19.5.0"
                "&cookie_enabled=true&platform=PC&browser_language=zh-CN"
                "&msToken=&a_bogus=")
+
+    try:
+        from pyktok import TikTokApi
+    except Exception as e:
+        raise DouyinError(_friendly_sign_error(e)) from e
 
     async def sign() -> dict:
         api = TikTokApi(logging_level=40)
@@ -255,9 +302,20 @@ def _normalize(item: dict) -> dict:
 
 
 def _friendly_sign_error(e: Exception) -> str:
-    """把 Playwright 的长篇报错压缩成一句能读懂的话"""
+    """把 Playwright / 依赖缺失的长篇报错压缩成一句能读懂的话"""
     msg = str(e)
-    if "Executable doesn't exist" in msg or "playwright install" in msg:
+    # pyktok 本身没装：requirements 里是可选依赖，服务器常默认不装
+    if isinstance(e, ImportError) and "pyktok" in msg.lower():
+        return ("抖音兜底不可用：服务器未安装 pyktok。"
+                "如需启用请执行 `pip install pyktok` 并"
+                "`python -m playwright install --with-deps chromium`；"
+                "否则请依靠 yt-dlp 解析（抖音 Cookie 已配好即可）。")
+    if isinstance(e, ModuleNotFoundError) and "pyktok" in msg.lower():
+        return ("抖音兜底不可用：服务器未安装 pyktok。"
+                "如需启用请执行 `pip install pyktok` 并"
+                "`python -m playwright install --with-deps chromium`；"
+                "否则请依靠 yt-dlp 解析（抖音 Cookie 已配好即可）。")
+    if "playwright install" in msg and "Executable doesn't exist" in msg:
         return ("抖音兜底失败：服务器未安装 Playwright 浏览器内核。"
                 "如需在服务端启用抖音兜底，请执行 `playwright install --with-deps chromium`；"
                 "否则请更新 Cookie 或改用yt-dlp 解析。")

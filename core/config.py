@@ -210,6 +210,41 @@ _NOT_COOKIE = {"domain", "path", "expires", "max-age", "secure", "httponly", "sa
 _FAR_FUTURE = "2147483647"
 
 
+def _sanitize_cookie_component(value: str) -> str:
+    """把 Cookie 的名/值压成可安全放进 HTTP 头的ASCII。
+
+    HTTP 头只能按 latin-1 编码，而抖音 Cookie 里常混有中文：
+    `SEARCH_RESULT_LIST_TYPE={"keyword":"搜索词"}`、备注类字段、表情等。
+    这些字符一旦进到请求头，yt-dlp 会在发请求前直接抛
+    `'latin-1' codec can't encode characters in position N`。
+
+    处理方式：优先整体百分号编码（语义正确、浏览器也能还原）；
+    只有当值里本来就有 `%XX` 时才退让为逐字符编码，避免双重编码把
+    已正确的 `%7B%22keyword%22` 变成 `%257B`。
+    分隔符 `;` `,` 必须先剔除，否则会破坏 Cookie 的字段边界。
+    """
+    if not value:
+        return value
+    # 去掉会破坏字段结构的分隔符与空白
+    cleaned = value.replace(";", "%3B").replace(",", "%2C")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    try:
+        cleaned.encode("ascii")
+        return cleaned
+    except UnicodeEncodeError:
+        pass
+    # 已含百分号编码 -> 说明多半是 URL 编码过的 JSON，逐字符安全编码
+    if re.search(r"%[0-9A-Fa-f]{2}", cleaned):
+        return "".join(
+            ch if ord(ch) < 128 else "".join(f"%{b:02X}" for b in ch.encode("utf-8"))
+            for ch in cleaned
+        )
+    # 纯明文含非 ASCII -> 整体编码
+    from urllib.parse import quote
+
+    return quote(cleaned, safe="%!$&'()*+,-./:;=?@_~")
+
+
 def normalize_cookie_text(text: str, default_domain: str = "") -> str:
     """把粘贴进来的 Cookie 文本规整成 Netscape cookies.txt 内容。
 
@@ -221,6 +256,9 @@ def normalize_cookie_text(text: str, default_domain: str = "") -> str:
 
     default_domain 用来把各平台 Cookie 钉到自己的域名上：B站的登录态落在
     .douyin.com 下是无效的，不能靠猜。
+
+    Cookie 名与值都会被压成纯 ASCII（含中文时做百分号编码），
+    否则请求头阶段的 latin-1 编码会失败。
     """
     raw = (text or "").replace("\r\n", "\n").strip()
     if not raw:
@@ -252,7 +290,8 @@ def normalize_cookie_text(text: str, default_domain: str = "") -> str:
         k = k.strip()
         if not k or k.lower().lstrip(".") in _NOT_COOKIE:
             continue
-        pairs.append((k, v.strip()))
+        pairs.append((_sanitize_cookie_component(k), _sanitize_cookie_component(v.strip())))
+    pairs = [(k, v) for k, v in pairs if k]
     if not pairs:
         return ""
 

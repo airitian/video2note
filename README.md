@@ -184,6 +184,31 @@ PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
   python -m playwright install chromium
 ```
 
+> 没装 pyktok 也不会出问题：程序会跳过签名步骤，直接回退到移动端分享页抓取
+> （`_scrape_mobile`），并在最终失败时提示如何补装。
+
+### 常见报错
+
+**`'latin-1' codec can't encode characters in position N: ordinal not in range(256)`**
+
+Cookie 里混进了非 ASCII 字符（最常见是中文搜索词，比如
+`SEARCH_RESULT_LIST_TYPE={"keyword":"中文"}`），而 HTTP 请求头只能按 latin-1 编码，
+yt-dlp 在**发出请求之前**就会抛这个错。
+
+程序已自动处理：Cookie 名与值会统一压成纯 ASCII（含中文时做百分号编码，
+且不会对已有的 `%XX` 二次编码）。若仍看到此报错，说明 `data/cookies.txt` 是旧版本生成的，
+删掉它后在设置页重新保存一次 Cookie 即可重建。
+
+**`No module named 'pyktok'`**
+
+pyktok 是可选依赖，服务器上默认不装。此时程序会自动跳过签名、
+改走移动端分享页抓取；若抖音仍解析失败，按上面的命令补装即可：
+
+```bash
+pip install pyktok
+python -m playwright install --with-deps chromium
+```
+
 排查要点：
 
 1. 确认 Cookie 里含 `s_v_web_id`、`ttwid`、`sessionid`
