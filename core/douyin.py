@@ -25,14 +25,20 @@ class DouyinError(RuntimeError):
     pass
 
 
-# 抖音现已全面要求登录态 Cookie：无 Cookie 时分享页返回的是 JS 挑战页
-# （内容为 `_$jsvmprt` 虚拟机脚本，既没有 RENDER_DATA 也没有 _ROUTER_DATA），
-# 而 yt-dlp 会抛出误导性的 "Fresh cookies are needed"。
+# 抖音的失败原因有三种，解法完全不同，不能混为一谈：
 #
-# ★ 关键区分：「没配 Cookie」和「Cookie 已失效」解法完全不同，
-#   但yt-dlp 两者都报同一句 Fresh cookies。必须自己探测登录态才能说对原因。
-#   实测判据：GET /aweme/v1/web/user/profile/self/ 返回 status_code=0 表示登录态有效，
-#             status_code=8 表示 Cookie 已被抖音侧作废（改密/退出/风控，即使未到过期时间）。
+#   missing  没配 Cookie   -> 去设置页粘贴 Cookie
+#   blocked  IP 被风控     -> 配代理或换网络（换 Cookie 没用！）
+#
+# ★ 踩过的坑：曾经用 `aweme/v1/web/user/profile/self` 的 status_code=8
+#   当作「登录态作废」的判据 —— **这个判据是错的**，已被对照实验推翻：
+#   无 Cookie / 伪造 sessionid / 随机垃圾串 打这个接口，返回值**完全相同**
+#   都是 status_code=8。说明 8 只表示「这个接口需要签名参数」，与登录态无关。
+#   后来用真实 Chromium 验证，Cookie 登录态完全有效，
+#   真正卡住的是 IP 被风控（滑块验证码）—— 属于第三种原因。
+#
+# 所以这里**不再猜测 Cookie 是否过期**，只如实区分「没配 Cookie」和「被风控」。
+# 后者靠页面特征判定（验证码中间页 / JS 挑战页），不靠接口返回码。
 COOKIE_MISSING_HINT = (
     "未配置抖音 Cookie，无法解析。\n\n"
     "实测确认：未配置 Cookie 时，抖音分享页返回的是一段 JS 虚拟机挑战脚本"
@@ -45,29 +51,33 @@ COOKIE_MISSING_HINT = (
     "注意：抖音与B站 Cookie 必须分开填，混填会因域名不匹配全部失效。"
 )
 
-COOKIE_EXPIRED_HINT = (
-    "抖音 Cookie 已失效，需要重新获取。\n\n"
-    "实测结果：Cookie 字段齐全（sessionid / ttwid / sid_guard 都在），"
-    "但抖音登录态校验接口返回 `status_code=8`——这是抖音侧的登录态作废标记，"
-    "常见于改密码、主动退出、被风控顶下线。\n\n"
-    "注意：**Cookie 里写的过期时间未到，不代表登录态仍然有效**。"
-    "实测案例里 sid_guard 标称的有效期还剩 40 天，接口却已返回作废。"
-    "所以不要等过期——重新登录后重新复制一份即可。\n\n"
-    "操作：浏览器重新登录抖音 → F12 → Network → 任意 douyin.com 请求 → "
-    "Request Headers → 复制整段 Cookie → 覆盖到「⚙️ 设置」的「抖音 Cookie 文本」→ 保存。"
+COOKIE_BLOCKED_HINT = (
+    "请求被抖音风控拦截（IP 层面），**不是 Cookie 的问题**。\n\n"
+    "实测现象：用真实 Chromium 加载已登录的 Cookie 打开作品页，"
+    "停在「验证码中间页」，要求拖动滑块完成验证。\n\n"
+    "关键点：这种情况**重新获取 Cookie 也解决不了** —— "
+    "拦在前面的是 IP 风险识别，与登录态无关。\n\n"
+    "解决办法（按推荐顺序）：\n"
+    "1. 在「⚙️ 设置」页的**代理**栏填一个可用代理（最直接）\n"
+    "2. 换网络环境（如手机热点）\n"
+    "3. 关掉可能劫持流量的代理软件后重试\n\n"
+    "抖音对云服务器 IP 的风控尤其严格，家用宽带一般不触发。"
 )
 
 # 兼容旧引用
 DOUYIN_COOKIE_HINT = COOKIE_MISSING_HINT
 
+# 抖音风控拦截的页面特征
+_BLOCK_MARKERS = ("验证码中间页", "请完成下列验证后继续",
+                  "captcha", "_$jsvmprt", "__ac_signature")
+
 
 def cookie_state() -> str:
-    """探测抖音登录态：ok / expired / missing / unknown
+    """探测抖音请求的受阻原因：ok / missing / blocked / unknown
 
-    用的是抖音自己的「当前登录用户」接口。status_code 语义：
-      0  -> 登录态有效
-      8  -> 未登录 / 登录态作废
-    网络不通等异常统一返回 unknown，调用方据此决定要不要展示原因。
+    只区分「没配 Cookie」与「被风控」，**不猜测 Cookie 是否过期**——
+    公开接口在缺签名参数时一律返回 status_code=8，无论 Cookie 是否有效
+    （已用对照实验验证），拿它判断登录态必然误报。
     """
     ck = _cookie_header()
     if not ck:
@@ -76,23 +86,27 @@ def cookie_state() -> str:
         import requests
 
         r = requests.get(
-            "https://www.douyin.com/aweme/v1/web/user/profile/self/",
-            headers={"User-Agent": UA, "Cookie": ck, "Referer": "https://www.douyin.com/"},
+            "https://www.iesdouyin.com/share/video/1/",
+            headers={"User-Agent": UA, "Cookie": ck,
+                     "Referer": "https://www.iesdouyin.com/"},
             timeout=(8, 20),
         )
-        code = (r.json() or {}).get("status_code")
+        html = r.text or ""
     except Exception:
         return "unknown"
-    if code == 0:
-        return "ok"
-    if code == 8:
-        return "expired"
-    return "unknown"
+    low = html.lower()
+    if any(m in low or m in html for m in _BLOCK_MARKERS):
+        return "blocked"
+    return "ok"
 
 
 def cookie_hint() -> str:
-    """按实际登录态返回对应提示——避免让"已配 Cookie"的用户去反复重填"""
-    return COOKIE_EXPIRED_HINT if cookie_state() == "expired" else COOKIE_MISSING_HINT
+    """按实际受阻原因返回提示
+
+    两种情况解法相反：missing 要去填 Cookie，blocked 要换 IP 或加代理。
+    弄反会让用户白折腾 —— 之前就发生过「明明配了 Cookie 却被告知没配」。
+    """
+    return COOKIE_BLOCKED_HINT if cookie_state() == "blocked" else COOKIE_MISSING_HINT
 
 
 def _pyktok_supports_douyin(api_cls: type) -> bool:
