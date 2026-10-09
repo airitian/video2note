@@ -25,20 +25,74 @@ class DouyinError(RuntimeError):
     pass
 
 
-# 抖音现已全面要求登录态 Cookie：无Cookie 时分享页返回的是 JS 挑战页
+# 抖音现已全面要求登录态 Cookie：无 Cookie 时分享页返回的是 JS 挑战页
 # （内容为 `_$jsvmprt` 虚拟机脚本，既没有 RENDER_DATA 也没有 _ROUTER_DATA），
-# 而yt-dlp 会抛出误导性的 "Fresh cookies are needed"。
-# 所以真正能走通的组合只有：有效抖音 Cookie + yt-dlp。
-DOUYIN_COOKIE_HINT = (
-    "抖音需要登录态 Cookie 才能解析。\n\n"
+# 而 yt-dlp 会抛出误导性的 "Fresh cookies are needed"。
+#
+# ★ 关键区分：「没配 Cookie」和「Cookie 已失效」解法完全不同，
+#   但yt-dlp 两者都报同一句 Fresh cookies。必须自己探测登录态才能说对原因。
+#   实测判据：GET /aweme/v1/web/user/profile/self/ 返回 status_code=0 表示登录态有效，
+#             status_code=8 表示 Cookie 已被抖音侧作废（改密/退出/风控，即使未到过期时间）。
+COOKIE_MISSING_HINT = (
+    "未配置抖音 Cookie，无法解析。\n\n"
     "实测确认：未配置 Cookie 时，抖音分享页返回的是一段 JS 虚拟机挑战脚本"
     "（`_$jsvmprt`），里面没有任何作品数据，yt-dlp 也会报"
-    "\"Fresh cookies (not necessarily logged in) are needed\"。\n\n"
+    "\"Fresh cookies (not necessarily logged in) are needed\"（这句措辞有误导，"
+    "并不是\"放久了的 Cookie\"问题）。\n\n"
     "解决办法：在「⚙️ 设置」页的「抖音 Cookie 文本」框粘贴浏览器里的抖音 Cookie，"
     "保存后立即生效（F12 → Network → 任意 douyin.com 请求 → "
     "Request Headers → 复制整段 Cookie）。\n\n"
     "注意：抖音与B站 Cookie 必须分开填，混填会因域名不匹配全部失效。"
 )
+
+COOKIE_EXPIRED_HINT = (
+    "抖音 Cookie 已失效，需要重新获取。\n\n"
+    "实测结果：Cookie 字段齐全（sessionid / ttwid / sid_guard 都在），"
+    "但抖音登录态校验接口返回 `status_code=8`——这是抖音侧的登录态作废标记，"
+    "常见于改密码、主动退出、被风控顶下线。\n\n"
+    "注意：**Cookie 里写的过期时间未到，不代表登录态仍然有效**。"
+    "实测案例里 sid_guard 标称的有效期还剩 40 天，接口却已返回作废。"
+    "所以不要等过期——重新登录后重新复制一份即可。\n\n"
+    "操作：浏览器重新登录抖音 → F12 → Network → 任意 douyin.com 请求 → "
+    "Request Headers → 复制整段 Cookie → 覆盖到「⚙️ 设置」的「抖音 Cookie 文本」→ 保存。"
+)
+
+# 兼容旧引用
+DOUYIN_COOKIE_HINT = COOKIE_MISSING_HINT
+
+
+def cookie_state() -> str:
+    """探测抖音登录态：ok / expired / missing / unknown
+
+    用的是抖音自己的「当前登录用户」接口。status_code 语义：
+      0  -> 登录态有效
+      8  -> 未登录 / 登录态作废
+    网络不通等异常统一返回 unknown，调用方据此决定要不要展示原因。
+    """
+    ck = _cookie_header()
+    if not ck:
+        return "missing"
+    try:
+        import requests
+
+        r = requests.get(
+            "https://www.douyin.com/aweme/v1/web/user/profile/self/",
+            headers={"User-Agent": UA, "Cookie": ck, "Referer": "https://www.douyin.com/"},
+            timeout=(8, 20),
+        )
+        code = (r.json() or {}).get("status_code")
+    except Exception:
+        return "unknown"
+    if code == 0:
+        return "ok"
+    if code == 8:
+        return "expired"
+    return "unknown"
+
+
+def cookie_hint() -> str:
+    """按实际登录态返回对应提示——避免让"已配 Cookie"的用户去反复重填"""
+    return COOKIE_EXPIRED_HINT if cookie_state() == "expired" else COOKIE_MISSING_HINT
 
 
 def _pyktok_supports_douyin(api_cls: type) -> bool:
@@ -233,7 +287,7 @@ def _pyktok_detail(url: str, cookies: dict) -> dict | None:
     # 但它内部硬编码 tiktok.com，国内网络必然30s 超时—— 表现为"兜底已启用却永远失败"，
     # 比直接报错更浪费时间。这里提前识别并快速失败。
     if not _pyktok_supports_douyin(TikTokApi):
-        raise DouyinError(DOUYIN_COOKIE_HINT)
+        raise DouyinError(cookie_hint())
 
     async def sign() -> dict:
         api = TikTokApi(logging_level=40)
@@ -322,7 +376,7 @@ def _scrape_mobile(url: str) -> tuple[dict | None, str]:
     # （`_$jsvmprt` 虚拟机），意味着请求被当成爬虫拦下了。
     # 直接说"需要 Cookie"比"可能已删除"有用得多。
     if "_$jsvmprt" in html or "__ac_signature" in html:
-        return None, DOUYIN_COOKIE_HINT
+        return None, cookie_hint()
 
     return None, "分享页未返回作品数据（可能需要登录或已删除）"
 
