@@ -231,6 +231,33 @@ curl -s http://127.0.0.1:8765/api/health
 
 > 想对比排查接口通道，可用 `downloader.download_media(..., prefer_api=False)` 强制跳过。
 
+### 自定义解析请求模板（可选）
+
+设置页有一项**「抖音解析请求模板」**。绝大多数情况**留空即可**，它只在
+站点改了字段名时你需要介入。
+
+填法：浏览器打开解析接口页 → F12 → Network → 随便点一次解析请求 →
+右键「复制」→「复制为 cURL」，整段粘进输入框，点「校验这段 curl」确认。
+
+程序会自动做三件事：
+
+| 部分 | 处理方式 |
+|---|---|
+| `_token` / `t0ken` / `csrf_token` | **替换为页面实时值**，不信任模板里的旧值 |
+| `url` | 替换为你在首页提交的链接 |
+| Cookie | **注入浏览器会话**（不是脚本裸发） |
+| 其余自定义头 | 原样保留 |
+
+保存时会先校验格式，粘错立刻报错，不会拖到下载时才失败。
+
+> **为什么要保留 Cookie 而不是直接裸发请求？**
+> 实测 `curl_cffi` 带完整浏览器指纹 + 含 `cf_clearance` 的全套 Cookie，
+> 依然被 Cloudflare 403 —— clearance 与浏览器指纹绑定，脚本伪造不了。
+> 所以这些头是用来**驱动真实浏览器**的，不是给 Python 用的。
+
+模板本身含 Cookie，等价于会话凭证，因此与 Token 一起存在
+`data/secrets.json`（权限 600），接口只回「配没配」不回内容。
+
 ### 常见报错
 
 **`'latin-1' codec can't encode characters in position N: ordinal not in range(256)`**

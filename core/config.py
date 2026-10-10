@@ -65,11 +65,17 @@ DEFAULTS: dict[str, str] = {
     "cookie_file": "",
     "proxy": "",
     "ffmpeg_path": "",
+    # 解析接口的浏览器抓包模板（dlpanda 等）。含 Cookie，等价于会话凭证，
+    # 所以归入敏感项，只落 secrets.json。
+    "resolver_curl": "",
 }
 
 # 敏感配置：只落在 secrets.json，永不经接口下发。
 # Cookie 文本同样算敏感——它就是登录态，回显到浏览器等于把账号会话交出去。
-SECRET_KEYS = {"asr_api_key", "llm_api_key", "cookie_text", "cookie_text_bili"}
+SECRET_KEYS = {
+    "asr_api_key", "llm_api_key", "cookie_text", "cookie_text_bili",
+    "resolver_curl",
+}
 
 # ASR 可用模型（实测于 /v1/models），UI 下拉使用
 ASR_MODELS = [
@@ -111,6 +117,10 @@ HELP: dict[str, str] = {
                    "例如 D:\\cookies.txt。一般用不到，前两种任选其一即可",
     "proxy": "代理地址，如 http://127.0.0.1:7890",
     "ffmpeg_path": "ffmpeg 可执行文件路径，留空则使用 PATH 中的 ffmpeg",
+    "resolver_curl": "抖音解析接口的请求模板 —— 在浏览器里 F12 → Network → "
+                     "任选一次解析请求 → 右键「复制」→ 「复制为 cURL」，整段粘到这里。"
+                     "程序会自动替换其中的 _token / t0ken 与 url 字段，"
+                     "Cookie 也会注入浏览器会话。留空则用内置模板",
 }
 
 
@@ -464,6 +474,7 @@ def public_settings() -> dict:
         "llm": bool(s.get("llm_api_key") or s.get("asr_api_key")),
         "cookie_douyin": bool(s.get("cookie_text")),
         "cookie_bilibili": bool(s.get("cookie_text_bili")),
+        "resolver_curl": bool(s.get("resolver_curl")),
     }
     out["_from_env"] = from_env
     # 密钥落盘位置，页面据此提示用户去哪里改

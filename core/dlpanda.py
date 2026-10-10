@@ -150,15 +150,57 @@ def parse_html(page_html: str) -> ParseResult:
     )
 
 
+def _load_template() -> dict | None:
+    """读取用户配置的 curl 模板；没有或解析失败则回退内置路由。
+
+    用户模板的价值在于：站点改了 token 字段名时，不用等我们发版。
+    """
+    try:
+        from .config import load_settings
+
+        raw = (load_settings().get("resolver_curl") or "").strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        from . import curlparse
+
+        tpl = curlparse.parse_curl(raw)
+        # 抖音强制走独立路由：用户从首页抓的包会指向 /zh-CN，
+        # 但那个路由对抖音无效（实测首页解析拿不到作品数据）
+        tpl["path"] = PLATFORM_PATH["douyin"]
+        return tpl
+    except Exception:
+        return None
+
+
+def _cookies_to_pairs(cookie_str: str) -> list[dict]:
+    """把 'a=1; b=2' 转成 Playwright 需要的 [{name, value}]"""
+    out = []
+    for part in cookie_str.split(";"):
+        k, _, v = part.partition("=")
+        k, v = k.strip(), v.strip()
+        if k and v:
+            out.append({"name": k, "value": v})
+    return out
+
+
 def resolve(url: str, platform: str = "douyin", timeout_ms: int = 45000) -> ParseResult:
     """用真实浏览器解析，返回媒体直链。
 
     必须走浏览器的原因见模块 docstring：Cloudflare 的 cf_clearance
     与浏览器指纹绑定，纯 HTTP 无法伪造。
+
+    支持用户自定义 curl 模板（设置项「抖音解析请求模板」）：
+    模板里的 _token / t0ken 等动态字段一律用页面实时值替换，
+    只有 url 换成用户提交的链接。
     """
     path = PLATFORM_PATH.get(platform)
     if not path:
         raise DlpandaError(f"dlpanda 暂不支持 {platform}")
+
+    tpl = _load_template() if platform == "douyin" else None
 
     try:
         from playwright.sync_api import sync_playwright
@@ -175,6 +217,14 @@ def resolve(url: str, platform: str = "douyin", timeout_ms: int = 45000) -> Pars
         try:
             ctx = browser.new_context(user_agent=UA, locale="zh-CN",
                                       viewport={"width": 1440, "height": 900})
+            # 用户模板里的 Cookie 注入浏览器上下文 —— 这是让请求带上
+            # cf_clearance 的唯一有效方式（脚本裸发一律被 403）
+            if tpl and tpl.get("cookies"):
+                try:
+                    ctx.add_cookies(_cookies_to_pairs(tpl["cookies"]))
+                except Exception:
+                    pass          # 域名不匹配等，忽略：模板 Cookie 未必完整
+
             pg = ctx.new_page()
             # CF 挑战需要真实浏览器执行 JS 才能放行
             pg.goto(BASE + path, wait_until="domcontentloaded",
@@ -190,19 +240,35 @@ def resolve(url: str, platform: str = "douyin", timeout_ms: int = 45000) -> Pars
             if "Attention Required" in (pg.title() or ""):
                 raise DlpandaError("被Cloudflare 拦截（站点要求人工验证）")
 
-            token_m = pg.evaluate(
-                "() => document.querySelector('[name=\"_token\"]')?.value || ''")
-            t0_m = pg.evaluate(
-                "() => document.querySelector('#token')?.value || ''")
-            if not token_m:
+            # 动态字段一律取页面实时值，不信模板里的旧值
+            live = pg.evaluate(
+                """() => {
+                    const get = (s) => document.querySelector(s)?.value || '';
+                    return {_token: get('[name="_token"]'),
+                            t0ken: get('#token'),
+                            csrf: get('[name="csrf-token"]')};
+                }""")
+            if not live.get("_token"):
                 raise DlpandaError("未能取得会话令牌（站点结构可能已变更）")
 
+            form = dict((tpl or {}).get("form") or {})
+            for key in curl_dyn_keys():
+                if key in form and live.get(_dyn_source(key)):
+                    form[key] = live[_dyn_source(key)]
+            if not form.get("_token"):
+                form["_token"] = live["_token"]
+            if not form.get("t0ken"):
+                form["t0ken"] = live.get("t0ken", "")
+            # url 永远用用户提交的那条
+            form["url"] = url
+
+            post_path = (tpl or {}).get("path", path)
             page_html = pg.evaluate(
                 """async (a) => {
                     const fd = new FormData();
-                    fd.append('_token', a.token);
-                    fd.append('url', a.url);
-                    fd.append('t0ken', a.t0);
+                    for (const [k, v] of Object.entries(a.form)) {
+                        if (v !== '' && v != null) fd.append(k, v);
+                    }
                     const r = await fetch(a.path, {
                         method: 'POST',
                         body: fd,
@@ -214,7 +280,7 @@ def resolve(url: str, platform: str = "douyin", timeout_ms: int = 45000) -> Pars
                     });
                     return await r.text();
                 }""",
-                {"token": token_m, "url": url, "t0": t0_m, "path": path},
+                {"form": form, "path": post_path},
             )
         finally:
             browser.close()
@@ -224,7 +290,98 @@ def resolve(url: str, platform: str = "douyin", timeout_ms: int = 45000) -> Pars
     return parse_html(page_html)
 
 
-def download(url: str, dest: Path, referer: str = BASE + "/",
+def curl_dyn_keys() -> tuple[str, ...]:
+    from .curlparse import DYNAMIC_FIELDS
+
+    return DYNAMIC_FIELDS
+
+
+def _dyn_source(key: str) -> str:
+    """动态字段名 -> 页面实时值来源
+
+    模板里叫 _token / token / csrf_token / authenticity_token 的都映射到
+    同一个实时令牌；t0ken 是站点自己的隐藏域，单独取。
+    """
+    if key == "t0ken":
+        return "t0ken"
+    return "_token"
+
+
+def probe(url: str, referer: str | None = None) -> tuple[bool, str]:
+    """探测地址能否下载，只取前 64KB。返回 (可用, 说明)。
+
+    Referer 不是可选项：实测 douyinvod.com 域的地址不带Referer 直接 403，
+    带上就正常 206。所以先试无 Referer，失败再带 Referer 复测一次——
+    否则会把「能用」误判成「失效」，进而错误地降级到音频。
+    """
+    if not url:
+        return False, "地址为空"
+
+    try:
+        from curl_cffi import requests as cr
+
+        def fetch(h):
+            return cr.get(url, headers=h, impersonate="chrome136",
+                          timeout=(10, 45), verify=False)
+    except ImportError:
+        import requests
+
+        def fetch(h):
+            return requests.get(url, headers=h, timeout=(10, 45), stream=False)
+
+    last = ""
+    for ref in ((None, referer) if referer else (None,)):
+        h = {"User-Agent": UA, "Range": "bytes=0-65535"}
+        if ref:
+            h["Referer"] = ref
+        try:
+            r = fetch(h)
+        except Exception as e:
+            last = f"{type(e).__name__}: {str(e)[:60]}"
+            continue
+        # 状态码非 2xx 一律视为不可用。这里必须显式判断：
+        # curl_cffi 遇到 403 不会抛异常，只看有无异常会把 403 误判成可用。
+        if not (200 <= r.status_code < 300):
+            last = (f"HTTP {r.status_code}"
+                    f"（{(r.headers.get('content-type') or '')[:28]}）")
+            continue
+        body = r.content
+        if not body:
+            last = "响应体为空"
+            continue
+        cr_ = r.headers.get("content-range", "")
+        total = (cr_.rsplit("/", 1)[1] if "/" in cr_
+                 else r.headers.get("content-length") or "?")
+        tag = "（补 Referer 后可用）" if ref else ""
+        return True, (f"HTTP {r.status_code} | 实收 {len(body)} 字节 "
+                      f"| 声明 {total} {tag}")
+    return False, last
+
+
+def pick_media(video_url: str | None, audio_url: str | None,
+               referer: str | None = None) -> tuple[str | None, str | None, str]:
+    """按「视频优先，不可用则退音频」挑选可下载的媒体。
+
+    返回 (类型, 地址, 说明)；类型为 None 表示两者都不可用。
+    抖音地址在多数情况下需Referer，默认用抖音站点作为来源。
+    """
+    ref = referer or "https://www.douyin.com/"
+    vfail = "无视频地址"
+    if video_url:
+        ok, info = probe(video_url, ref)
+        if ok:
+            return "VIDEO", video_url, info
+        vfail = info
+    afail = "无音频地址"
+    if audio_url:
+        ok, info = probe(audio_url, ref)
+        if ok:
+            return "AUDIO", audio_url, f"{info}（视频不可用：{vfail}）"
+        afail = info
+    return None, None, f"视频: {vfail} / 音频: {afail}"
+
+
+def download(url: str, dest: Path, referer: str = "https://www.douyin.com/",
              progress=None, chunk: int = 1 << 18) -> Path:
     """下载 CDN 直链到本地。
 
@@ -319,22 +476,36 @@ def download_video(url: str, workdir: Path, max_height: int = 1080,
     workdir.mkdir(parents=True, exist_ok=True)
     result = resolve(url, platform="douyin")
 
-    if not result.video_url:
-        raise DlpandaError("该作品是图文，没有视频轨")
-
     if progress:
         progress(8.0, f"解析成功：{result.title[:40]}")
 
-    out = workdir / f"source{_ext_for(result.video_url)}"
-    download(result.video_url, out, progress=progress)
+    # 视频优先；不可用时自动退到音频 —— 图文作品、或视频地址失效
+    # （实测有地址会因缺 Referer 返回 403）都不该让整个任务失败。
+    kind, media_url, info = pick_media(result.video_url, result.audio_url)
+    if progress:
+        label = "视频" if kind == "VIDEO" else "音频"
+        progress(10.0, f"{label}可用：{info}")
+    if not media_url:
+        raise DlpandaError(f"没有可下载的媒体。{info}")
 
-    # 与 yt-dlp 路径保持一致：确保浏览器可预览，再抽音频给 ASR
-    playable = audio.ensure_playable(out, max_height)
+    out = workdir / f"source{_ext_for(media_url)}"
+    download(media_url, out, progress=progress)
+
     audio_path = workdir / "audio.mp3"
-    try:
-        audio.extract_audio(playable, audio_path)
-    except Exception as e:
-        raise DlpandaError(f"视频无可用音轨，无法转写：{e}") from e
+    if kind == "VIDEO":
+        # 与 yt-dlp 路径保持一致：确保浏览器可预览，再抽音频给 ASR
+        playable = audio.ensure_playable(out, max_height)
+        try:
+            audio.extract_audio(playable, audio_path)
+        except Exception as e:
+            raise DlpandaError(f"视频无可用音轨，无法转写：{e}") from e
+    else:
+        # 已经是音频，直接转成 ASR 要的格式
+        playable = out
+        try:
+            audio.extract_audio(out, audio_path)
+        except Exception as e:
+            raise DlpandaError(f"音频转码失败：{e}") from e
 
     if progress:
         progress(100.0, "下载完成")
@@ -345,6 +516,9 @@ def download_video(url: str, workdir: Path, max_height: int = 1080,
         "id": result.aweme_id,
         "webpage_url": url,
         "extractor": "dlpanda",
+        "audio_only": "1" if kind == "AUDIO" else "",
+        "media_note": info,
+        "video_url": media_url,
         "audio_url": result.audio_url or "",
         "cover_url": result.cover_url or "",
         "video_codec": audio.video_codec(playable) or "",

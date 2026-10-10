@@ -111,6 +111,17 @@ def post_settings(body: SettingsIn):
         if err:
             raise HTTPException(status_code=400, detail=err)
         body.values["cookie_browser"] = name
+    # curl 模板先试解析再存：粘错（少了引号、不是 curl 格式）要立刻告知，
+    # 否则错误会延后到下载时才暴露成难懂的解析失败
+    curl_summary = None
+    raw_curl = (body.values.get("resolver_curl") or "").strip()
+    if raw_curl:
+        from .curlparse import parse_curl, summarize
+
+        try:
+            curl_summary = summarize(parse_curl(raw_curl))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"curl 模板无法识别：{e}")
     save_settings(body.values, clear_secrets=set(body.clear))
     # Cookie 文本有变化时立刻落盘，供后续下载使用。
     # 即使被清空也要调一次——ensure_cookie_file 内部会删掉残留文件，
@@ -125,7 +136,29 @@ def post_settings(body: SettingsIn):
         if p:
             files["bilibili"] = p
     return {"ok": True, "values": public_settings(), "help": HELP,
-            "cookie_files": files}
+            "cookie_files": files, "curl": curl_summary}
+
+
+@app.post("/api/settings/check-curl")
+def check_curl(body: SettingsIn):
+    """只校验不保存。用于设置页的「校验这段 curl」按钮。"""
+    raw = (body.values.get("resolver_curl") or "").strip()
+    if not raw:
+        return {"ok": True, "summary": None, "message": "未填写，将使用内置模板"}
+    from .curlparse import parse_curl, summarize
+
+    try:
+        s = summarize(parse_curl(raw))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"curl 模板无法识别：{e}")
+    bits = [f"地址 {s['url']}"]
+    if s["fields"]:
+        bits.append("字段 " + "、".join(s["fields"]))
+    if s["dynamic"]:
+        bits.append("将自动替换 " + "、".join(s["dynamic"]) + "（取页面实时值）")
+    if s["cookie_present"]:
+        bits.append(f"Cookie {s['cookie_count']} 条已识别，将注入浏览器")
+    return {"ok": True, "summary": s, "message": "；".join(bits)}
 
 
 @app.get("/api/health")

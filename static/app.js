@@ -514,15 +514,16 @@
   const SECRET_UI = {
     cookie_text: "cookie_douyin",
     cookie_text_bili: "cookie_bilibili",
+    resolver_curl: "resolver_curl",
   };
 
   function openSettings() {
     const v = settingsCache.values || {}, help = settingsCache.help || {};
     const cfg = v._configured || {};
     const full = ["asr_base_url", "llm_base_url", "cookie_file", "cookie_text",
-                  "cookie_text_bili", "proxy", "ffmpeg_path"];
+                  "cookie_text_bili", "resolver_curl", "proxy", "ffmpeg_path"];
     // 抖音与B站的 Cookie 必须分开填：域名不同，混在一起两边都会失效
-    const areas = ["cookie_text", "cookie_text_bili"];
+    const areas = ["cookie_text", "cookie_text_bili", "resolver_curl"];
     const PH = {
       cookie_text: "【抖音】F12 → Network → 点任意请求 → Request Headers → 复制整段 Cookie"
         + "（形如 a=1; b=2）粘到这里，程序自动转 cookies.txt。也接受 Netscape 格式全文。"
@@ -533,7 +534,13 @@
       cookie_browser: "只填浏览器名，不要粘贴 Cookie 内容。chrome / edge / firefox / brave。"
         + "（容器/云端环境没有浏览器，优先用上面的 Cookie 文本框）",
       cookie_file: "本机已有的 Netscape cookies.txt 绝对路径，例如 D:\\cookies.txt（一般用不到）。",
+      resolver_curl: "抖音解析接口的请求模板（可选，通常留空即可）。"
+        + "在 dlpanda 页面上 F12 → Network → 随便点一次解析请求 → 右键「复制」→"
+        + "「复制为 cURL」，把整段粘到这里。程序会自动："
+        + "① 替换 _token / t0ken 为页面实时值 ② 只替换 url 字段为你要解析的链接 "
+        + "③ 把 Cookie 注入浏览器会话。留空则使用内置模板。",
     };
+    const rows = { cookie_text: 4, cookie_text_bili: 4, resolver_curl: 9 };
     const keys = Object.keys(help).filter((k) => HIDDEN_SETTINGS.indexOf(k) < 0);
     $("#settings-form").innerHTML = keys.map((k) => {
       const wide = full.includes(k) ? " full" : "";
@@ -546,11 +553,16 @@
         const state = on
           ? "✅ 已配置（内容不回显，留空保持不变）"
           : "未配置 —— 粘贴后点保存";
-        ctl = '<textarea data-key="' + k + '" rows="4" placeholder="'
-          + esc(PH[k] || "") + '">' + esc(val) + "</textarea>"
+        ctl = '<textarea data-key="' + k + '" rows="' + (rows[k] || 4)
+          + '" placeholder="' + esc(PH[k] || "") + '">' + esc(val) + "</textarea>"
           + '<div class="secret-row"><span class="secret-state">' + state + "</span>"
           + (on ? '<button type="button" class="btn small danger" data-clear="' + k
-                 + '">清除</button>' : "") + "</div>";
+                 + '">清除</button>' : "") + "</div>"
+          + (k === "resolver_curl"
+            ? '<div class="secret-row"><button type="button" class="btn small"'
+              + ' data-parse-curl="1">校验这段 curl</button>'
+              + '<span class="secret-state" id="curl-check"></span></div>'
+            : "");
       } else {
         ctl = '<input data-key="' + k + '" value="' + esc(val) + '" placeholder="'
           + esc(PH[k] || "") + '">';
@@ -561,8 +573,13 @@
   }
 
   async function clearSecret(key) {
-    const label = key === "cookie_text" ? "抖音" : "B站";
-    if (!confirm("确定清除已保存的" + label + " Cookie？清除后下载这两个平台的视频会因缺少登录态而失败。")) return;
+    const labels = { cookie_text: "抖音", cookie_text_bili: "B站",
+                     resolver_curl: "解析请求模板" };
+    const label = labels[key] || key;
+    const extra = key === "resolver_curl"
+      ? "清除后抖音解析将回到内置模板。"
+      : "清除后下载这两个平台的视频会因缺少登录态而失败。";
+    if (!confirm("确定清除已保存的" + label + "？" + extra)) return;
     try {
       settingsCache = await api("/api/settings", {
         method: "POST", body: JSON.stringify({ values: {}, clear: [key] }),
@@ -570,6 +587,23 @@
       openSettings();
       toast(label + " Cookie 已清除");
     } catch (e) { toast(e.message, true); }
+  }
+
+  async function checkCurl() {
+    const box = $('#settings-form [data-key="resolver_curl"]');
+    const out = $("#curl-check");
+    if (!box || !out) return;
+    const raw = box.value.trim();
+    if (!raw) { out.textContent = "未填写，将使用内置模板"; return; }
+    out.textContent = "校验中…";
+    try {
+      const r = await api("/api/settings/check-curl", {
+        method: "POST", body: JSON.stringify({ values: { resolver_curl: raw } }),
+      });
+      out.textContent = "✓ " + (r.message || "格式可用");
+    } catch (err) {
+      out.textContent = "✗ " + err.message;
+    }
   }
 
   async function saveSettings() {
@@ -599,6 +633,8 @@
 
   // ---------- 事件 ----------
   document.addEventListener("click", async (e) => {
+    const chk = e.target.closest("[data-parse-curl]");
+    if (chk) { e.stopPropagation(); checkCurl(); return; }
     const clr = e.target.closest("[data-clear]");
     if (clr) { e.stopPropagation(); clearSecret(clr.dataset.clear); return; }
     const del = e.target.closest("[data-del]");
