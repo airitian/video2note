@@ -10,8 +10,8 @@ URL / 文件 → 解析下载(视频轨+音频轨) → ffmpeg(合并 mp4 / 抽 1
 ## 快速开始
 
 ```bash
-# 0. 确认解释器名。容器/多数 Linux 上只有 python3，没有 python，
-#    写 python 会直接 command not found。下文统一用 python3。
+# 0. 确认解释器名。Debian/Ubuntu 默认只有 python3，没有 python
+#    （PEP 394 规范；若要 python 命令可apt install python-is-python3）
 command -v python3 || command -v python
 
 # 1. 安装依赖
@@ -301,9 +301,9 @@ apt-get update && apt-get install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2
 python3 -m playwright install --with-deps chromium
 ```
 
-> 云服务器尤其容易踩：容器镜像通常不带桌面依赖，而
-> `scripts/deploy_debian.sh` 与本仓库的 Dockerfile 已预装这些包——
-> 手工起的容器往往没走那条路径。
+> **Debian/Ubuntu 上尤其容易踩**：手工装的系统往往没装浏览器依赖。
+> `scripts/deploy_debian.sh` 与本仓库的 Dockerfile 都已预装这些包，
+> 直接手工`pip install` 的路径则不会——所以脚本会直接把包名列出来。
 
 **`'latin-1' codec can't encode characters in position N: ordinal not in range(256)`**
 
@@ -522,13 +522,7 @@ cd <项目目录> && git pull && git log --oneline -1
 
 然后按你的部署方式选一条：
 
-**systemd（有 systemctl）：**
-
-```bash
-sudo systemctl restart video2note
-```
-
-**容器 / 无 systemd（`nohup` 常驻，最常见）：**
+**`nohup` 常驻（无 systemd 时唯一可行的方式）：**
 
 ```bash
 pkill -f "run.py"
@@ -543,8 +537,26 @@ docker restart v2n
 
 > `sudo: command not found` 说明当前不是 root、且环境里没装 sudo。
 > 先用 `whoami` 确认身份：若已是 root，去掉 `sudo` 直接执行即可。
-> 容器里通常也没有 systemd，用上面的 `nohup` 方式。
 > 不确定服务是怎么起的，先跑 `bash diag_restart.sh` 看看进程与监听情况。
+
+### Debian 上没有 systemctl？
+
+Debian 通常自带 systemd，但**精简安装、云厂商镜像、以及跑在容器里的
+Debian 基础镜像都可能没有**——`systemctl: command not found` 就是信号。
+
+确认一下：
+
+```bash
+ls /run/systemd/system 2>/dev/null && echo "systemd 在运行" || echo "systemd 不在运行"
+```
+
+若 systemd 确实不在运行（常见于云厂商的 Web 面板、云沙箱、容器），
+`nohup` 就是当前唯一可行的方式。但要注意它**不会开机自启、也不会崩溃重启**，
+进程被杀后需要手动拉起。
+
+想要长期免维护，建议改用supervisor 或 pm2 守护进程；或者干脆在
+带systemd 的机器上跑 `scripts/deploy_debian.sh`，它会把服务注册成
+systemd 单元，具备开机自启与崩溃自愈。
 
 ## 合规提示
 

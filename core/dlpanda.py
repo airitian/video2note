@@ -48,10 +48,12 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
 
 # Chromium 启动参数。业务解析与健康检查必须用同一份——曾因两处各写一份
-# 而出现反向误报：健康检查少传 --disable-dev-shm-usage，容器里/dev/shm
-# 默认仅 64MB，Chromium 一启动就崩，health 报「不可用」而业务其实能用。
-# --no-sandbox：容器内以 root 运行，Chromium 沙箱无法启动。
-# --disable-dev-shm-usage：改用 /tmp 承载共享内存，绕开 64MB 上限。
+# 而出现反向误报：健康检查少传 --disable-dev-shm-usage，服务器 /dev/shm
+# 默认仅 64MB（容器与部分云主机都是），Chromium 一启动就崩，
+# health 报「不可用」而业务其实能用。
+# --no-sandbox：以 root 运行时 Chromium 沙箱（user namespace）
+#              不可用，必须关掉；普通用户去掉也无妨。
+# --disable-dev-shm-usage：共享内存改用 /tmp，绕开 64MB 上限。
 _LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled",
                 "--no-sandbox", "--disable-dev-shm-usage"]
 
@@ -59,9 +61,10 @@ _LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled",
 def _exe() -> str:
     """当前解释器的绝对路径。
 
-    给用户的修复命令里不能写死 `python`：容器里通常只有 python3，
-    写死等于给出一条必然 command not found 的建议。用 sys.executable
-    可确保命令指向的正是跑服务的那个环境（内核必须装进同一个解释器）。
+    给用户的修复命令里不能写死 `python`：Debian/Ubuntu 默认只有 python3
+    （PEP 394 规范），写死等于给出一条必然 command not found 的建议。
+    用 sys.executable 可确保命令指向的正是跑服务的那个环境
+    （浏览器内核必须装进同一个解释器，装到别处等于没装）。
     """
     import sys
     return sys.executable or "python3"
@@ -567,7 +570,7 @@ def browser_ready() -> tuple[bool, str]:
     但能把「看着正常、一用就炸」提前暴露在健康检查里。
 
     启动参数必须与业务侧chromium.launch 处保持一致，否则会出现
-    「健康检查说不可用、业务其实能用」的反向误报：容器里 /dev/shm
+    「健康检查说不可用、业务其实能用」的反向误报：服务器 /dev/shm
     默认只有 64MB，缺 --disable-dev-shm-usage 时 Chromium 一启动就崩，
     报的还是一句含糊的「Target page, context or browser has been closed」。
     """

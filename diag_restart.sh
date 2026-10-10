@@ -18,10 +18,11 @@ echo
 echo "⚠ 若「git 仓库根」不在上面列出的项目目录里，那 git pull 更新的不是服务在跑的那份代码。"
 echo
 echo "真正的项目目录（按优先级探测）："
-# 容器里的路径不固定：Dockerfile 用 /app，托管平台常用 /workspace，
-# 手动部署常见 /opt/video2note。所以按 run.py 实际位置探测，不写死。
+# 路径取决于部署方式，不能假设。Debian 手工部署常见 /opt 或 /root，
+# 也有人直接放在 /workspace 或家目录下；按 run.py 实际位置探测。
 APP_FOUND=""
-for d in /workspace /app /opt/video2note "$HOME/video2note" /root/video2note /data; do
+for d in /workspace /app /opt/video2note "$HOME/video2note" /root/video2note \
+         "$HOME/video2note" /data /srv/video2note /usr/local/video2note; do
   if [ -f "$d/run.py" ] && [ -d "$d/core" ]; then
     echo "  ✅ 找到: $d"
     [ -z "$APP_FOUND" ] && APP_FOUND="$d"
@@ -46,7 +47,26 @@ fi
 echo
 
 echo "========== 4. 有哪些重启方式可用 =========="
-echo "systemctl: $(command -v systemctl >/dev/null 2>&1 && echo '存在' || echo '不存在')"
+# Debian 通常自带 systemd，但精简安装/云厂商镜像/容器化的 Debian 可能没有。
+# 「systemctl 命令不存在」和「systemd 根本没运行」是两回事，必须分开判断：
+# 前者换个方式重启即可，后者决定了该用哪种守护方案。
+if command -v systemctl >/dev/null 2>&1; then
+  echo "systemctl: 存在"
+  if [ -d /run/systemd/system ]; then
+    echo "  ✅ systemd 正在运行 → 直接用 systemctl restart 即可（推荐）"
+  else
+    echo "  ⚠ systemctl 存在但 systemd 未运行（PID 1 不是 systemd）"
+    echo "    常见于容器/云沙箱，改用 nohup 或 supervisor"
+  fi
+else
+  echo "systemctl: 不存在"
+  if [ -d /run/systemd/system ]; then
+    echo "  ⚠ systemd 在跑但 systemctl 不在 PATH，试试 /usr/bin/systemctl"
+  else
+    echo "  ⚠ 这台机器的 systemd 未运行 —— 可能精简安装、云厂商镜像或容器。"
+    echo "    systemd 场景只能 nohup（无开机自启、无崩溃自愈）。"
+  fi
+fi
 echo "supervisorctl: $(command -v supervisorctl >/dev/null 2>&1 && echo '存在' || echo '不存在')"
 echo "service: $(command -v service >/dev/null 2>&1 && echo '存在' || echo '不存在')"
 echo "docker: $(command -v docker >/dev/null 2>&1 && echo '存在' || echo '不存在')"
@@ -79,7 +99,8 @@ if [ -z "$PY_BIN" ]; then
   done
 fi
 echo
-echo "  ⚠ 容器里通常只有 python3，没有 python。所以写 python 会 command not found。"
+echo "  ⚠ Debian/Ubuntu 默认只有 python3，没有 python 命令（PEP 394 规范）。"
+echo"    所以写 python 会 command not found，请统一用上面查到的解释器路径。"
 echo "    请用下面这条（把解释器换成实际路径）："
 echo "      ${PY_BIN:-python3} -m playwright install chromium"
 echo
