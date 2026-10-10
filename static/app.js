@@ -11,7 +11,7 @@
   let settingsCache = { values: {}, help: {} };
   // 记录设置接口的加载错误；为空表示加载正常
   let settingsLoadErr = "";
-  const ws = { videoTask: null, videoEl: null, videoKey: null, linesTask: null, lineEls: [], segs: [], active: -1, follow: true, noteKey: null, logCount: -1 };
+  const ws = { videoTask: null, videoEl: null, videoKey: null, linesTask: null, linesSig: null, lineEls: [], segs: [], active: -1, follow: true, noteKey: null, logCount: -1 };
 
   const ORDER = ["upload", "downloading", "extracting", "slicing", "transcribing", "polishing"];
   const STATUS_TEXT = { pending: "排队中", running: "处理中", transcribed: "转写完成", done: "已完成", failed: "失败", canceled: "已取消" };
@@ -327,14 +327,23 @@
 
   function ensureLines(t) {
     const box = $("#lines");
-    if (ws.linesTask === currentId) return;
+    // 缓存守卫必须按「内容 + 状态」判断，不能只看 taskId。
+    // 只比taskId 会漏掉这种情况：增量预览渲染过一次后 linesTask 就等于
+    // currentId，此后转写阶段结束、后端停止推 partial，但最终结果比
+    // 增量更多 —— 于是页面永远停留在中间那一句，表现为
+    //「已经转写完了，文字稿却没显示 / 显示不全」。
+    const segs = (t && t.segments) || [];
+    const live = !!(t && t.status === "running" && t.stage === "transcribing");
+    const sig = currentId + "|" + segs.length + "|" + (live ? "1" : "0")
+      + "|" + (segs.length ? (segs[segs.length - 1].text || "") : "");
+    if (ws.linesSig === sig) return;
     // 转写增量会反复重建，这里记住滚动位置与高亮，
     // 否则每来一次增量预览就被拉回顶部、正在看的那句也丢了高亮
     const keepScroll = ws.scrollTop || 0;
     const keepActive = ws.active;
     ws.linesTask = currentId;
-    ws.segs = (t && t.segments) || [];
-    const live = !!(t && t.status === "running" && t.stage === "transcribing");
+    ws.linesSig = sig;
+    ws.segs = segs;
     if (!ws.segs.length) {
       box.innerHTML = '<div class="empty">' + (live ? "正在识别，文字会陆续出现…" : "暂无转写结果") + "</div>";
       ws.lineEls = [];
@@ -447,7 +456,7 @@
             t.transcript = ev.transcript || "";
             if (ev.spercent != null) t.spercent = ev.spercent;
             // 强制让文字区按新segments 重绘
-            ws.linesTask = null;
+            ws.linesTask = null; ws.linesSig = null;
           } else if (ev.type === "log") {
             t.events = t.events || [];
             if (!t.events.some((x) => x.t === ev.t && x.text === ev.text)) t.events.push(ev);
@@ -456,7 +465,23 @@
             t.meta = ev.meta || {};
             ws.videoKey = null;
           } else if (ev.type === "eof") {
+            // eof 携带最终结果，先就地采用，避免依赖 refreshOne 的网络往返
+            // ——那次往返失败或慢时，页面就会停在不完整的增量内容上。
+            if (ev.segments && ev.segments.length) {
+              t.segments = ev.segments;
+              t.transcript = ev.transcript || t.transcript || "";
+            }
+            if (ev.note !== undefined && ev.note !== null && ev.note !== "") {
+              t.note = ev.note; t.note_sig = ev.note_sig || "";
+              t.note_info = ev.note_info || t.note_info;
+              t.variants = ev.variants || t.variants;
+            }
+            if (ev.meta && Object.keys(ev.meta).length) t.meta = ev.meta;
+            if (ev.status) { t.status = ev.status; t.stage = ev.stage || t.stage; }
+            // 强制重绘：最终句数常与最后一次增量不同
+            ws.linesTask = null; ws.linesSig = null;
             await refreshOne(tid);
+            ws.linesTask = null; ws.linesSig = null;
             render();
             return;
           }
@@ -479,7 +504,8 @@
 
   function selectTask(id) {
     currentId = id;
-    ws.videoTask = null; ws.videoKey = null; ws.linesTask = null; ws.noteKey = null; ws.logCount = -1;
+    ws.videoTask = null; ws.videoKey = null; ws.linesTask = null; ws.linesSig = null;
+    ws.noteKey = null; ws.logCount = -1;
     ws.videoEl = null; ws.segs = []; ws.lineEls = []; ws.active = -1; ws.scrollTop = 0;
     $("#video-host").innerHTML = '<div class="empty">加载中…</div>';
     $("#lines").innerHTML = '<div class="empty">加载中…</div>';
@@ -503,7 +529,8 @@
         (t && t.note_info && t.note_info.styles) ||
         Object.keys((t && t.variants) || {}).filter((k) => t.variants[k] && t.variants[k].note)
       );
-      ws.videoTask = null; ws.videoKey = null; ws.linesTask = null; ws.noteKey = null;
+      ws.videoTask = null; ws.videoKey = null; ws.linesTask = null; ws.linesSig = null;
+      ws.noteKey = null;
       render();
     } catch (e) {
       toast("加载该记录失败：" + e.message, true);

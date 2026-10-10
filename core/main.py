@@ -436,8 +436,12 @@ async def task_events(tid: str):
                 e = t.events[last]
                 last += 1
                 yield "data: " + json.dumps({"type": "log", **e}, ensure_ascii=False) + "\n\n"
-            # 转写进行中：增量推送已转写出的句子
-            if t.status == "running" and t.stage == "transcribing":
+            # 转写进度推送：只要句数增加就推，不限定 stage。
+            # 曾经只在 stage == "transcribing" 时推，但转写结束到
+            # stage 切走之间存在窗口，最后几个分片正好落在窗口里，
+            # 前端就永远停在倒数第几句 —— 表现为「已经转写完了，
+            # 文字稿却没显示 / 显示不全」。末尾那个分片往往是最重要的。
+            if t.status == "running":
                 n = len(t.segments or [])
                 if n and n != sent_segs:
                     sent_segs = n
@@ -454,7 +458,17 @@ async def task_events(tid: str):
                  "failed_stage": t.failed_stage},
                 ensure_ascii=False) + "\n\n"
             if t.status in ("done", "failed", "canceled"):
-                yield 'data: {"type":"eof"}\n\n'
+                # eof 带上最终结果兜底：任务可能在两次心跳之间直接结束，
+                # 此时前端一次 partial 都没收到过，光靠增量会拿不到任何内容。
+                yield "data: " + json.dumps(
+                    {"type": "eof", "status": t.status,
+                     "segments": t.segments or [],
+                     "transcript": t.transcript or "",
+                     "note": t.note or "", "note_sig": t.note_sig or "",
+                     "note_info": t.note_info or {},
+                     "variants": t.variants or [],
+                     "meta": t.meta or {}},
+                    ensure_ascii=False) + "\n\n"
                 break
             idle += 1
             if idle > 900:
