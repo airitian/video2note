@@ -537,6 +537,37 @@ def _ext_for(url: str) -> str:
     return ".mp4"
 
 
+def browser_ready() -> tuple[bool, str]:
+    """Chromium 内核是否真的装好了。
+
+    为什么不能只看 import：`pip install playwright` 只装 Python 包，
+    浏览器二进制是另一套东西，默认落在 ~/.cache/ms-playwright/。
+    两者独立，服务器上「装了库没装内核」是最常见的坑，
+    表现为一启动就报
+        BrowserType.launch: Executable doesn't exist at ...
+        /root/.cache/ms-playwright/chromium-XXXX/chrome-linux/chrome
+    而`import playwright` 依然成功——不实际启动一次就分辨不出来。
+
+    这里真启动一个 headless 实例再关掉，多花不到一秒，
+    但能把「看着正常、一用就炸」提前暴露在健康检查里。
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return False, "未安装 playwright 库（pip install playwright）"
+    try:
+        with sync_playwright() as p:
+            b = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            b.close()
+        return True, ""
+    except Exception as e:
+        first = str(e).strip().splitlines()[0]
+        if "Executable doesn't exist" in first or "playwright install" in first:
+            return False, ("已装 playwright 库但缺 Chromium 内核，"
+                           "执行：python -m playwright install chromium")
+        return False, f"Chromium 启动失败：{first}"
+
+
 def available() -> bool:
     """运行环境是否具备该通道的依赖。"""
     try:

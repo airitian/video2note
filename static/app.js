@@ -929,6 +929,16 @@ if (rest.length) {
       const bits = [];
       bits.push(h.ffmpeg ? "ffmpeg 就绪" : '<span class="bad">缺少 ffmpeg</span>');
       bits.push(h.yt_dlp ? "yt-dlp 就绪" : '<span class="bad">缺少 yt-dlp</span>');
+      // 抖音通道：必须报真实原因。「装了 playwright 库但没装浏览器内核」
+      // 时import 是成功的，只显示 ready 会让用户跑到下载时才炸出
+      // Executable doesn't exist，title 里直接给出修复命令。
+      if (h.playwright) {
+        bits.push('<span class="ok" title="' + esc(h.playwright_msg || "")
+          + '">抖音通道就绪</span>');
+      } else {
+        bits.push('<span class="bad" title="' + esc(h.playwright_msg || "")
+          + '">抖音通道不可用</span>');
+      }
       const v = h.version || {};
       // 把版本号亮出来：云机器上「看不到某个功能」时，第一件事就是确认
       // 浏览器连的是不是最新代码，而不是靠猜缓存/没重启

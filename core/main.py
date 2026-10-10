@@ -198,21 +198,25 @@ def health():
         yt = True
     except ImportError:
         yt = False
-    # 抖音首选通道（dlpanda）。分开报两项：装了库但没装浏览器内核
-    # 是服务器上最常见的坑，光看available() 分辨不出来。
+    # 抖音首选通道（dlpanda）。要真启动一次 Chromium 才知道内核在不在：
+    # 「装了库没装内核」时 import 是成功的，光看 available() 会一路显示
+    # 正常，直到用户真跑任务才炸出 Executable doesn't exist。
+    pw_msg = ""
     try:
-        import playwright  # noqa
-        pw = True
-    except ImportError:
-        pw = False
+        from .dlpanda import browser_ready
+
+        pw, pw_msg = browser_ready()
+    except Exception as e:
+        pw, pw_msg = False, f"检测失败：{e}"
     try:
         from .dlpanda import available as _dlp_ok
 
-        dy = bool(_dlp_ok())
+        dy = bool(_dlp_ok()) and pw
     except Exception:
         dy = False
     return {"ffmpeg": ff, "ffmpeg_msg": ffmsg, "yt_dlp": yt,
-            "douyin_api": dy, "playwright": pw, **_build_info()}
+            "douyin_api": dy, "playwright": pw,
+            "playwright_msg": pw_msg, **_build_info()}
 
 
 def _git_rev() -> str:
