@@ -47,6 +47,25 @@ from pathlib import Path
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
 
+# Chromium 启动参数。业务解析与健康检查必须用同一份——曾因两处各写一份
+# 而出现反向误报：健康检查少传 --disable-dev-shm-usage，容器里/dev/shm
+# 默认仅 64MB，Chromium 一启动就崩，health 报「不可用」而业务其实能用。
+# --no-sandbox：容器内以 root 运行，Chromium 沙箱无法启动。
+# --disable-dev-shm-usage：改用 /tmp 承载共享内存，绕开 64MB 上限。
+_LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled",
+                "--no-sandbox", "--disable-dev-shm-usage"]
+
+
+def _exe() -> str:
+    """当前解释器的绝对路径。
+
+    给用户的修复命令里不能写死 `python`：容器里通常只有 python3，
+    写死等于给出一条必然 command not found 的建议。用 sys.executable
+    可确保命令指向的正是跑服务的那个环境（内核必须装进同一个解释器）。
+    """
+    import sys
+    return sys.executable or "python3"
+
 BASE = "https://dlpanda.com"
 # 平台 -> 解析路径（取自 window.downloadRoutes）
 PLATFORM_PATH = {
@@ -209,11 +228,7 @@ def resolve(url: str, platform: str = "douyin", timeout_ms: int = 45000) -> Pars
 
     page_html = ""
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled",
-                  "--no-sandbox", "--disable-dev-shm-usage"],
-        )
+        browser = p.chromium.launch(headless=True, args=_LAUNCH_ARGS)
         try:
             ctx = browser.new_context(user_agent=UA, locale="zh-CN",
                                       viewport={"width": 1440, "height": 900})
@@ -550,14 +565,19 @@ def browser_ready() -> tuple[bool, str]:
 
     这里真启动一个 headless 实例再关掉，多花不到一秒，
     但能把「看着正常、一用就炸」提前暴露在健康检查里。
+
+    启动参数必须与业务侧chromium.launch 处保持一致，否则会出现
+    「健康检查说不可用、业务其实能用」的反向误报：容器里 /dev/shm
+    默认只有 64MB，缺 --disable-dev-shm-usage 时 Chromium 一启动就崩，
+    报的还是一句含糊的「Target page, context or browser has been closed」。
     """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        return False, "未安装 playwright 库（pip install playwright）"
+        return False, f"未安装 playwright 库（{_exe()} -m pip install playwright）"
     try:
         with sync_playwright() as p:
-            b = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            b = p.chromium.launch(headless=True, args=_LAUNCH_ARGS)
             b.close()
         return True, ""
     except Exception as e:
@@ -566,12 +586,18 @@ def browser_ready() -> tuple[bool, str]:
             # 不能写死 "python"：容器里通常只有 python3，写死等于
             # 给出一条必然 command not found 的建议。用当前解释器，
             # 确保命令指向的正是跑服务的那个环境。
-            import sys
-            exe = sys.executable or "python3"
             return False, ("已装 playwright 库但缺 Chromium 内核，执行："
-                           f"{exe} -m playwright install chromium"
+                           f"{_exe()} -m playwright install chromium"
                            "（内核与 Python 包是两套独立的东西，"
                            "必须装到跑服务的这个解释器里）")
+        # 这句含糊的报错实际常见于两类问题，不分类用户就只能瞎试：
+        # 1) 内核与playwright 库版本对不上；2) 系统库缺失
+        if "has been closed" in first or "Target closed" in first:
+            return False, ("Chromium 内核已装但启动即崩溃（" + first + "）。"
+                           f"多为两类原因：①内核与 playwright 库版本不匹配，"
+                           f"执行 {_exe()} -m playwright install --force chromium；"
+                           f"②系统库缺失，执行 "
+                           f"{_exe()} -m playwright install --with-deps chromium")
         return False, f"Chromium 启动失败：{first}"
 
 

@@ -472,6 +472,7 @@ location /v2n/ {
 | 重启后历史记录没了 | 数据目录被清理；用 `V2N_DATA_DIR` 指定持久化路径，并挂卷 |
 | 抖音一直解析失败 | IP 风控（与 Cookie 无关）：在设置页填代理，或换网络环境 |
 | **抖音解析报 `Executable doesn't exist`** | `python3 -m pip install playwright` 只装 Python 包，浏览器内核是另一套。执行 `python3 -m playwright install chromium`（容器里可能还需 `--with-deps`）。健康检查的 `playwright` 字段会真启动一次 Chromium，此项为 false 时 `playwright_msg` 直接给出该命令 |
+| **`playwright_msg` 报「启动即崩溃」** | 内核已装但 Chromium 一启动就退出（`Target page, context or browser has been closed`）。两个原因：内核与库版本不匹配 → `playwright install --force chromium`；系统库缺失 → `playwright install --with-deps chromium`。**命令里的解释器要用服务实际在用的那个**（`readlink -f /proc/<服务PID>/exe`），装到别的环境等于没装 |
 | 抖音报验证码 / 滑块拦截 | 服务器 IP 被抖音风控，**换 Cookie 无效**。按序尝试：设置页填代理 → 换网络（手机热点）→ 关闭本机代理软件 |
 | **设置面板是空的 / 少了某几项** | 多半是「前端新、后端旧」：`git pull` 只更新磁盘文件，运行中的 Python 进程不会重新加载，**必须重启服务**。先看设置面板顶部的自检条，它会直接说明是哪种情况；重启方式见下方「按部署方式重启」 |
 | **curl 输入框不显示** | 同上。自检条显示「后端未返回 resolver_curl」即属此类，重启后应变为「✅ 已就位」 |
