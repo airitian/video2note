@@ -239,7 +239,7 @@ print("""
  按顺序执行：
 
    1. 确认磁盘上的代码已是最新
-        cd /opt/video2note && git pull && git log --oneline -1
+        cd <项目目录> && git pull && git log --oneline -1
 
    2. 重启服务（关键，这一步才会让后端加载新代码）
         sudo systemctl restart video2note

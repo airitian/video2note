@@ -40,6 +40,26 @@ python3 run.py --port 8765         # 打开 http://127.0.0.1:8765
 
 ## 前置条件
 
+### 先确认项目路径
+
+部署路径**不固定**，取决于怎么部署的：
+
+| 部署方式 | 典型路径 |
+|---|---|
+| 本仓库的 Dockerfile | `/app` |
+| 托管平台 / 工作区挂载 | `/workspace` |
+| 手动 systemd 部署（`scripts/deploy_debian.sh`） | `/opt/video2note` |
+
+所以别照抄路径，先查出来：
+
+```bash
+ps -eo pid,args | grep '[r]un\.py'          # 服务在哪跑
+ls -d /app /workspace /opt/video2note 2>/dev/null
+python3 -c "import core, os; print(os.path.dirname(core.__file__))" 2>/dev/null
+```
+
+下文所有命令都在**项目根目录**（含 `run.py` 和 `core/` 的那层）执行。
+
 | 依赖 | 说明 |
 |---|---|
 | Python 3.10+ | 必需 |
@@ -467,7 +487,7 @@ location /v2n/ {
 先确认代码到位：
 
 ```bash
-cd /opt/video2note && git pull && git log --oneline -1
+cd <项目目录> && git pull && git log --oneline -1
 ```
 
 然后按你的部署方式选一条：

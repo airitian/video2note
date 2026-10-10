@@ -73,4 +73,4 @@ EXPOSE 8765
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8765/api/health >/dev/null || exit 1
 
-CMD ["sh", "-c", "exec python -u run.py --host \"${SERVER_HOST}\" --port \"${SERVER_PORT}\""]
+CMD ["sh", "-c", "exec /opt/venv/bin/python -u run.py --host \"${SERVER_HOST}\" --port \"${SERVER_PORT}\""]

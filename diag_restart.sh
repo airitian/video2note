@@ -15,12 +15,20 @@ echo "当前目录: $(pwd)"
 echo "git 仓库根: $(git rev-parse --show-toplevel 2>/dev/null || echo '不在 git 仓库里')"
 echo "HEAD: $(git log --oneline -1 2>/dev/null || echo '无')"
 echo
-echo "⚠ 若「git 仓库根」不是 /opt/video2note，那 git pull 更新的不是服务在跑的那份代码。"
+echo "⚠ 若「git 仓库根」不在上面列出的项目目录里，那 git pull 更新的不是服务在跑的那份代码。"
 echo
 echo "真正的项目目录（按优先级探测）："
-for d in /opt/video2note "$HOME/video2note" /root/video2note /app /workspace; do
-  [ -f "$d/core/main.py" ] && echo "  ✅ 找到: $d"
+# 容器里的路径不固定：Dockerfile 用 /app，托管平台常用 /workspace，
+# 手动部署常见 /opt/video2note。所以按 run.py 实际位置探测，不写死。
+APP_FOUND=""
+for d in /workspace /app /opt/video2note "$HOME/video2note" /root/video2note /data; do
+  if [ -f "$d/run.py" ] && [ -d "$d/core" ]; then
+    echo "  ✅ 找到: $d"
+    [ -z "$APP_FOUND" ] && APP_FOUND="$d"
+  fi
 done
+[ -z "$APP_FOUND" ] && echo "  （都没找到。若服务在跑，用第3 节的 ps 输出反推）"
+echo "  ⚠ 后续所有 git pull / 重启命令都要在上述目录里执行，路径写错等于没生效。"
 echo
 
 echo "========== 3. 服务进程怎么起来的 =========="
@@ -66,7 +74,7 @@ for pid in $(ps -eo pid,args 2>/dev/null | grep -E "run\.py" | grep -v grep | aw
   [ -n "$exe" ] && { echo "  服务 PID $pid的解释器: $exe"; PY_BIN="$exe"; }
 done
 if [ -z "$PY_BIN" ]; then
-  for c in python3 python /opt/video2note/.venv/bin/python "$HOME/video2note/.venv/bin/python"; do
+  for c in python3 python "${APP_FOUND:-/nonexistent}/.venv/bin/python"; do
     if command -v "$c" >/dev/null 2>&1 || [ -x "$c" ]; then PY_BIN="$c"; echo "  回退候选: $(command -v "$c" 2>/dev/null || echo "$c")"; break; fi
   done
 fi
@@ -86,10 +94,14 @@ ls -d ~/.cache/ms-playwright/* 2>/dev/null || echo "  （不存在——这就�
 echo
 
 echo "========== 6. 启动脚本长什么样（决定怎么重启）=========="
-for d in /opt/video2note "$HOME/video2note" /root/video2note; do
-  if [ -f "$d/run.sh" ]; then echo "--- $d/run.sh ---"; head -30 "$d/run.sh"; fi
-  if [ -f "$d/start.sh" ]; then echo "--- $d/start.sh ---"; head -30 "$d/start.sh"; fi
+for d in ${APP_FOUND:-/nonexistent} /workspace /app; do
+  [ -d "$d" ] || continue
+  for f in run.sh start.sh entrypoint.sh; do
+    [ -f "$d/$f" ] && { echo "--- $d/$f ---"; head -30 "$d/$f"; }
+  done
 done
+echo "--- Docker CMD 决定了默认启动命令 ---"
+grep -E "^CMD|^ENTRYPOINT|^WORKDIR" Dockerfile 2>/dev/null | head || echo "（无 Dockerfile）"
 echo
 echo "========== 诊断结束 =========="
 echo "把上面全部输出发回，我据此给你一条可直接执行的启动命令。"
