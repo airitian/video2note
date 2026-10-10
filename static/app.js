@@ -9,6 +9,8 @@
   let pickedFile = null;
   let uploadPct = null;
   let settingsCache = { values: {}, help: {} };
+  // 记录设置接口的加载错误；为空表示加载正常
+  let settingsLoadErr = "";
   const ws = { videoTask: null, videoEl: null, videoKey: null, linesTask: null, lineEls: [], segs: [], active: -1, follow: true, noteKey: null, logCount: -1 };
 
   const ORDER = ["upload", "downloading", "extracting", "slicing", "transcribing", "polishing"];
@@ -582,7 +584,15 @@
     resolver_curl: "resolver_curl",
   };
 
-  function openSettings() {
+  async function openSettings() {
+    // 首屏加载失败过时，点开面板再试一次——可能只是当时服务没起来。
+    // 不重试就永远停在空面板，用户会以为这个版本没有这些设置项。
+    if (settingsLoadErr) {
+      try {
+        settingsCache = await api("/api/settings");
+        settingsLoadErr = "";
+      } catch (e) { /* 保持原错误，面板里会显示 */ }
+    }
     const v = settingsCache.values || {}, help = settingsCache.help || {};
     const cfg = v._configured || {};
     const full = ["asr_base_url", "llm_base_url", "cookie_file", "cookie_text",
@@ -628,6 +638,15 @@
     }
     if (rest.length) {
       blocks.push(rest.map((k) => field(k, v, help, cfg, full, areas, PH, rows)).join(""));
+    }
+    // 加载失败时 help 为空，上面什么都不渲染，面板会是一片空白。
+    // 空白面板最坏——用户看不到任何配置项，也看不到原因，
+    // 只会以为「这个版本没有这些设置」。必须显式报错。
+    if (!blocks.length) {
+      blocks.push('<div class="sgroup"><div class="sload-err">'
+        + "设置加载失败：无法连接后端 /api/settings。"
+        + "<br>请刷新页面；若持续失败，可能是后端未启动或版本过旧（需 git pull 后重启服务）。"
+        + "</div></div>");
     }
     $("#settings-form").innerHTML = blocks.join("");
     $("#settings-modal").classList.remove("hidden");
@@ -834,7 +853,15 @@
       bits.push(h.yt_dlp ? "yt-dlp 就绪" : '<span class="bad">缺少 yt-dlp</span>');
       $("#health").innerHTML = bits.join(" · ");
     } catch (e) {}
-    try { settingsCache = await api("/api/settings"); } catch (e) {}
+    // 设置项加载失败不能静默：留一个标记，openSettings 据此给出明确提示。
+    // 云机器上最常见的原因是代码没更新——接口存在但字段不同，或直接连不上。
+    try {
+      settingsCache = await api("/api/settings");
+      settingsLoadErr = "";
+    } catch (e) {
+      settingsLoadErr = (e && e.message) || String(e);
+      settingsCache = {};
+    }
   }
 
   boot();

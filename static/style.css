@@ -174,8 +174,6 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 .modal-body { background: var(--surface); border-radius: 14px; width: 640px; max-width: 100%; padding: 20px; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; }
 .modal-head h2 { margin: 0; font-size: 16px; font-weight: 600; }
-.modal-tip { font-size: 12px; color: var(--text-3); margin: 6px 0 16px; }
-.modal-tip code { background: #f2f4f7; padding: 1px 5px; border-radius: 4px; }
 .form { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .form .full { grid-column: 1 / -1; }
 .field input { width: 100%; height: 36px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 8px; font-size: 13px; }
@@ -260,6 +258,17 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 }
 .field-note {
   margin: 6px 0 0; font-size: 12px; color: var(--text-3); line-height: 1.55;
+}
+
+/* 设置接口加载失败时的占位：必须显眼，
+   否则用户看到空白面板只会以为「这个版本没有这些设置」 */
+.sload-err {
+  grid-column: 1 / -1;
+  padding: 14px 16px; line-height: 1.7; font-size: 13px;
+  color: var(--err);
+  background: color-mix(in srgb, var(--err) 6%, transparent);
+  border: 1px solid color-mix(in srgb, var(--err) 30%, var(--border));
+  border-radius: var(--radius);
 }
 
 /* 窄屏时分组内部也退成单列，否则 640px 的弹窗里两列各只剩 ~280px */
