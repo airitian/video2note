@@ -329,6 +329,7 @@ video2note/
 │   verify_wordcount.py        文字稿/成稿字数展示与多风格不串号
 │   verify_settings_curl.py    设置面板分组顺序与 curl 输入框可用性
 │   verify_cloud_settings.py   设置接口失败时是否显式报错而非空白
+│   verify_cloud_curl.py       云端排障四道防线：缓存头/版本自述/接口失败/自检条
 │   verify_history_note.py     历史记录回显成稿
 │   verify_ui.py               端到端 UI 冒烟
 ├── scripts/
@@ -432,7 +433,9 @@ location /v2n/ {
 | 页面能开但样式/接口 404 | 反代前缀问题：启动时加 `--root-path /你的前缀` |
 | 重启后历史记录没了 | 数据目录被清理；用 `V2N_DATA_DIR` 指定持久化路径，并挂卷 |
 | 抖音一直解析失败 | IP 风控（与 Cookie 无关）：在设置页填代理，或换网络环境 |
-| **设置面板是空的 / 少了某几项** | 面板会直接显示「设置加载失败」——多半是代码没更新。在服务器上 `cd /opt/video2note && git pull && sudo systemctl restart video2note`，然后**强制刷新浏览器**（Ctrl+F5，静态资源带版本戳，一般不用清缓存） |
+| **设置面板是空的 / 少了某几项** | 打开设置面板，顶部会直接给出结论与处置办法（已就位 / 代码版本过旧 / 被前端过滤）。若显示「代码版本过旧」，在服务器执行 `cd /opt/video2note && git pull && sudo systemctl restart video2note`，然后刷新页面 |
+| **改了代码但页面没变化** | 先看页面右上角的版本号（形如 `v63f7a8e · 20261011q`）。它对不上就是浏览器拿的旧页面——首页已设`no-store`，正常情况下刷新即生效，若仍不变请用 Ctrl+F5 |
+| 提示「无法连接后端 /api/settings」 | 服务本身没起来，或反代把 `/api/*` 拦了。与「代码版本过旧」是两回事，先确认服务在运行 |
 
 ## 合规提示
 
