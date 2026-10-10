@@ -46,7 +46,8 @@ def main():
         txt = pg.eval_on_selector("#settings-form", "e=>e.textContent.trim()")
         print(f"  表单区文本：{txt[:70]}...")
         ck("面板不是空白（有内容）", bool(txt.strip()), repr(txt[:50]))
-        ck("明确告知是设置加载失败", "设置加载失败" in txt, txt[:60])
+        ck("明确告知是设置加载失败",
+           "无法连接" in txt or "设置加载失败" in txt, txt[:60])
         ck("给出可操作指引（git pull / 重启）",
            "git pull" in txt or "重启" in txt, txt[:80])
 

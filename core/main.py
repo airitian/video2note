@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 import uuid
 from pathlib import Path
@@ -96,7 +97,19 @@ def export_task(tid: str, fmt: str = "md"):
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return (STATIC / "index.html").read_text("utf-8")
+    """首页。
+
+    必须显式 no-store：浏览器对没有缓存头的 HTML 会走启发式缓存，
+    用 Last-Modified 猜测有效期。结果就是「代码明明更新了、页面还是旧的」，
+    云机器上尤其明显（改完 git pull + 重启，但浏览器仍渲染旧 HTML，
+    于是新的设置面板分组、新的字数显示全都看不到）。
+    """
+    return Response(
+        (STATIC / "index.html").read_text("utf-8"),
+        media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": "no-store, must-revalidate",
+                 "Pragma": "no-cache", "Expires": "0"},
+    )
 
 
 @app.get("/api/settings")
@@ -199,7 +212,44 @@ def health():
     except Exception:
         dy = False
     return {"ffmpeg": ff, "ffmpeg_msg": ffmsg, "yt_dlp": yt,
-            "douyin_api": dy, "playwright": pw}
+            "douyin_api": dy, "playwright": pw, **_build_info()}
+
+
+def _git_rev() -> str:
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(ROOT), capture_output=True, text=True, timeout=3)
+        return (out.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _build_info() -> dict:
+    """版本与能力自述。
+
+    「云机器上改了代码但页面没变」这类问题，光靠猜是猜不出来的——
+    到底是没 git pull、pull 了没重启、还是浏览器缓存，得让人一眼看到。
+    页面右下角会显示这个 commit，点「设置」也能看到接口返回了哪些字段。
+    """
+    static = {}
+    try:
+        html = (STATIC / "index.html").read_text("utf-8")
+        m = re.search(r"v=(\d+[a-z]*)", html)
+        static["assets"] = m.group(1) if m else ""
+    except Exception:
+        static["assets"] = ""
+    return {
+        "version": {
+            "commit": _git_rev(),
+            "assets": static["assets"],
+            # 关键能力位：前端据此判断后端是不是新版本
+            "has_groups": bool(SETTINGS_GROUPS),
+            "settings_keys": len(HELP),
+            "has_resolver_curl": "resolver_curl" in HELP,
+        }
+    }
 
 
 @app.get("/api/tasks")

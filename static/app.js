@@ -612,13 +612,17 @@
   };
 
   async function openSettings() {
-    // 首屏加载失败过时，点开面板再试一次——可能只是当时服务没起来。
-    // 不重试就永远停在空面板，用户会以为这个版本没有这些设置项。
-    if (settingsLoadErr) {
-      try {
-        settingsCache = await api("/api/settings");
-        settingsLoadErr = "";
-      } catch (e) { /* 保持原错误，面板里会显示 */ }
+    // ★每次打开都重新拉，不能只依赖页面加载时那份缓存。
+    // 云机器上最典型的卡死场景：管理员 git pull + 重启了后端，
+    // 但用户这个标签页是更新前打开的，settingsCache 里还是旧字段列表
+    // （没有 resolver_curl / 没有 groups），于是面板永远渲染不出新东西，
+    // 而刷新一下就好。这个缓存不省多少流量，却正好把「已更新」藏起来。
+    try {
+      settingsCache = await api("/api/settings");
+      settingsLoadErr = "";
+    } catch (e) {
+      //拉取失败时保留上一次成功的结果（若有），面板会显示错误提示
+      settingsLoadErr = (e && e.message) || String(e);
     }
     const v = settingsCache.values || {}, help = settingsCache.help || {};
     const cfg = v._configured || {};
@@ -663,23 +667,64 @@
         }
       });
     }
-    if (rest.length) {
+if (rest.length) {
       blocks.push(rest.map((k) => field(k, v, help, cfg, full, areas, PH, rows)).join(""));
     }
-    // 加载失败时 help 为空，上面什么都不渲染，面板会是一片空白。
-    // 空白面板最坏——用户看不到任何配置项，也看不到原因，
-    // 只会以为「这个版本没有这些设置」。必须显式报错。
-    if (!blocks.length) {
-      blocks.push('<div class="sgroup"><div class="sload-err">'
-        + "设置加载失败：无法连接后端 /api/settings。"
-        + "<br>请刷新页面；若持续失败，可能是后端未启动或版本过旧（需 git pull 后重启服务）。"
-        + "</div></div>");
+    // 拉取失败时必须优先报错，且不能只报「版本过旧」——
+    // 后端没起来和代码没更新是两回事，混为一谈会让用户做无用功。
+    // 保留上一次成功的表单内容供参考，但错误块放最上面。
+    // 提示条都不包 .sgroup —— 包进去会多出一个空分组，
+    // 既打乱「首个分组是平台登录态」的顺序，也把 curl 输入框往下挤。
+    if (settingsLoadErr) {
+      blocks.unshift('<div class="sload-err">'
+        + '<b>⚠️ 无法连接后端 /api/settings</b>（'
+        + esc(settingsLoadErr) + "）<br>下面显示的是上次成功获取的内容，"
+        + "可能已过期。请确认服务在运行；若是刚更新过代码，"
+        + "需<b>重启服务</b>后再打开本面板。"
+        + "</div>");
+    } else if (!blocks.length) {
+      // help 为空说明后端确实没返回任何字段——这才是「版本过旧」
+      blocks.push('<div class="sload-err">'
+        + "后端未返回任何设置字段，代码版本可能过旧。"
+        + "<br>请执行 <b>git pull</b> 后<b>重启服务</b>，再刷新页面。"
+        + "</div>");
     }
+    // 渲染后立刻核对 curl 框是否真的在 DOM 里，并把结论写在面板顶部。
+    // 「看不到 curl 输入框」这个问题，靠猜是猜不出来的——可能是没更新、
+    // 可能接口失败、可能被隐藏规则过滤。这里把判定摊开给用户看。
+    if (!settingsLoadErr) blocks.unshift(selfCheck(help, blocks.join("")));
     $("#settings-form").innerHTML = blocks.join("");
     $("#settings-modal").classList.remove("hidden");
     // 打开即定位到「平台登录态」：用户十有八九是来改 Cookie 或 curl 模板的
     const first = $("#settings-form .sgroup");
     if (first) first.scrollIntoView({ block: "start" });
+  }
+
+  // 设置面板顶部的自检条：把「curl 输入框到底为什么看不见」摊开成可判断的几项。
+  // 过去这个只能靠猜——是没更新代码、接口挂了、还是被隐藏规则过滤掉了。
+  function selfCheck(help, renderedHtml) {
+    const inHelp = Object.prototype.hasOwnProperty.call(help, "resolver_curl");
+    const hidden = HIDDEN_SETTINGS.indexOf("resolver_curl") >= 0;
+    const inDom = /data-key="resolver_curl"/.test(renderedHtml);
+    let state, cls;
+    if (inDom) {
+      state = "✅ 解析请求模板输入框已就位，在下方「平台登录态」分组里";
+      cls = "ok";
+    } else if (!inHelp) {
+      state = "❌ 后端未返回 resolver_curl 字段——代码版本过旧，"
+    + "请 git pull 后<b>重启服务</b>再刷新";
+      cls = "bad";
+    } else if (hidden) {
+      state = "❌ resolver_curl 被前端隐藏规则过滤，属前端 bug";
+      cls = "bad";
+    } else {
+ state = "❌ 后端返回了该字段但未渲染，请把上面信息反馈给我";
+      cls = "bad";
+    }
+    // ★不能包在 .sgroup 里：.sgroup 是分组容器，包进去会多出一个「空分组」，
+    // 既破坏「首个分组是平台登录态」的约定，也会把 curl 输入框往下挤。
+    // 自检条自己横跨整行即可。
+    return '<div class="scheck ' + cls + '">' + state + "</div>";
   }
 
   function field(k, v, help, cfg, full, areas, PH, rows) {
@@ -878,8 +923,20 @@
       const bits = [];
       bits.push(h.ffmpeg ? "ffmpeg 就绪" : '<span class="bad">缺少 ffmpeg</span>');
       bits.push(h.yt_dlp ? "yt-dlp 就绪" : '<span class="bad">缺少 yt-dlp</span>');
+      const v = h.version || {};
+      // 把版本号亮出来：云机器上「看不到某个功能」时，第一件事就是确认
+      // 浏览器连的是不是最新代码，而不是靠猜缓存/没重启
+      if (v.commit || v.assets) {
+        bits.push('<span class="ver" title="git commit / 静态资源版本戳">v'
+          + esc(v.commit || "?") + (v.assets ? " · " + esc(v.assets) : "") + "</span>");
+      }
+      if (v.has_groups === false) {
+        bits.push('<span class="bad">后端版本过旧，请 git pull 后重启</span>');
+      }
       $("#health").innerHTML = bits.join(" · ");
-    } catch (e) {}
+    } catch (e) {
+      $("#health").innerHTML = '<span class="bad">后端未连接</span>';
+    }
     // 设置项加载失败不能静默：留一个标记，openSettings 据此给出明确提示。
     // 云机器上最常见的原因是代码没更新——接口存在但字段不同，或直接连不上。
     try {

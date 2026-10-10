@@ -275,6 +275,35 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
   border-radius: var(--radius);
 }
 
+/* 设置面板顶部自检条：把「curl 输入框为什么看不见」变成可判断的结论 */
+.scheck {
+  grid-column: 1 / -1;
+  padding: 10px 14px; font-size: 13px; line-height: 1.6;
+  border-radius: var(--radius); border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--text-3) 5%, transparent);
+  color: var(--text-2);
+}
+.scheck.ok {
+  color: var(--ok, #1a7f37);
+  border-color: color-mix(in srgb, var(--ok, #1a7f37) 30%, var(--border));
+  background: color-mix(in srgb, var(--ok, #1a7f37) 6%, transparent);
+}
+.scheck.bad {
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 30%, var(--border));
+  background: color-mix(in srgb, var(--err) 6%, transparent);
+}
+.scheck b { color: inherit; text-decoration: underline; }
+
+/* 顶栏版本号：一眼确认浏览器连的是不是最新代码 */
+.health .ver {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px; color: var(--text-3);
+  padding: 1px 6px; border: 1px solid var(--border); border-radius: 4px;
+  background: color-mix(in srgb, var(--text-3) 6%, transparent);
+  cursor: help;
+}
+
 /* 窄屏时分组内部也退成单列，否则 640px 的弹窗里两列各只剩 ~280px */
 @media (max-width: 700px) {
   .form, .sgroup { grid-template-columns: 1fr; }
