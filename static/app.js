@@ -606,35 +606,67 @@
         + "③ 把 Cookie 注入浏览器会话。留空则使用内置模板。",
     };
     const rows = { cookie_text: 4, cookie_text_bili: 4, resolver_curl: 9 };
-    const keys = Object.keys(help).filter((k) => HIDDEN_SETTINGS.indexOf(k) < 0);
-    $("#settings-form").innerHTML = keys.map((k) => {
-      const wide = full.includes(k) ? " full" : "";
-      const isSecret = Object.prototype.hasOwnProperty.call(SECRET_UI, k);
-      // 敏感项不回显真实值，val 恒为空
-      const val = isSecret ? "" : (v[k] !== undefined ? v[k] : "");
-      let ctl;
-      if (areas.includes(k)) {
-        const on = isSecret && !!cfg[SECRET_UI[k]];
-        const state = on
-          ? "✅ 已配置（内容不回显，留空保持不变）"
-          : "未配置 —— 粘贴后点保存";
-        ctl = '<textarea data-key="' + k + '" rows="' + (rows[k] || 4)
-          + '" placeholder="' + esc(PH[k] || "") + '">' + esc(val) + "</textarea>"
-          + '<div class="secret-row"><span class="secret-state">' + state + "</span>"
-          + (on ? '<button type="button" class="btn small danger" data-clear="' + k
-                 + '">清除</button>' : "") + "</div>"
-          + (k === "resolver_curl"
-            ? '<div class="secret-row"><button type="button" class="btn small"'
-              + ' data-parse-curl="1">校验这段 curl</button>'
-              + '<span class="secret-state" id="curl-check"></span></div>'
-            : "");
-      } else {
-        ctl = '<input data-key="' + k + '" value="' + esc(val) + '" placeholder="'
-          + esc(PH[k] || "") + '">';
-      }
-      return '<div class="field' + wide + '"><label>' + esc(help[k]) + "</label>" + ctl + "</div>";
-    }).join("");
+
+    // 按后端给的分组顺序渲染，不用 HELP 的键序——
+    // resolver_curl 属于「不配也能跑」的可选项，排在末尾等于事实上看不见。
+    // groups 缺失时退回原来的单列布局（老后端兼容）。
+    const groups = settingsCache.groups || [];
+    const known = new Set(groups.flatMap((g) => g.keys || []));
+    const rest = Object.keys(help).filter(
+      (k) => !known.has(k) && HIDDEN_SETTINGS.indexOf(k) < 0);
+    const blocks = [];
+    if (groups.length) {
+      groups.forEach((g) => {
+        const keys = (g.keys || []).filter(
+          (k) => help[k] && HIDDEN_SETTINGS.indexOf(k) < 0);
+        if (keys.length) {
+          blocks.push('<div class="sgroup"><div class="sgroup-t">' + esc(g.title)
+            + "</div>" + keys.map((k) => field(k, v, help, cfg, full, areas,
+                                           PH, rows)).join("") + "</div>");
+        }
+      });
+    }
+    if (rest.length) {
+      blocks.push(rest.map((k) => field(k, v, help, cfg, full, areas, PH, rows)).join(""));
+    }
+    $("#settings-form").innerHTML = blocks.join("");
     $("#settings-modal").classList.remove("hidden");
+    // 打开即定位到「平台登录态」：用户十有八九是来改 Cookie 或 curl 模板的
+    const first = $("#settings-form .sgroup");
+    if (first) first.scrollIntoView({ block: "start" });
+  }
+
+  function field(k, v, help, cfg, full, areas, PH, rows) {
+    const wide = full.indexOf(k) >= 0 ? " full" : "";
+    const isSecret = Object.prototype.hasOwnProperty.call(SECRET_UI, k);
+    // 敏感项不回显真实值，val 恒为空
+    const val = isSecret ? "" : (v[k] !== undefined ? v[k] : "");
+    let ctl;
+    if (areas.indexOf(k) >= 0) {
+      const on = isSecret && !!cfg[SECRET_UI[k]];
+      const state = on
+        ? "✅ 已配置（内容不回显，留空保持不变）"
+        : "未配置 —— 粘贴后点保存";
+      ctl = '<textarea data-key="' + k + '" rows="' + (rows[k] || 4)
+        + '" placeholder="' + esc(PH[k] || "") + '">' + esc(val) + "</textarea>"
+        + '<div class="secret-row"><span class="secret-state">' + state + "</span>"
+        + (on ? '<button type="button" class="btn small danger" data-clear="' + k
+               + '">清除</button>' : "") + "</div>"
+        + (k === "resolver_curl"
+          ? '<div class="secret-row"><button type="button" class="btn small"'
+            + ' data-parse-curl="1">校验这段 curl</button>'
+            + '<span class="secret-state" id="curl-check"></span></div>'
+            + '<p class="field-note">解析接口改版或解析失败时，用这段模板让程序沿用'
+            + '你浏览器里的真实请求；不填也能正常用内置模板。</p>'
+          : "");
+    } else {
+      ctl = '<input data-key="' + k + '" value="' + esc(val) + '" placeholder="'
+        + esc(PH[k] || "") + '">';
+    }
+    // resolver_curl 额外加一个醒目标记，避免用户在一堆字段里找不到它
+    const mark = k === "resolver_curl" ? ' data-mark="curl"' : "";
+    return '<div class="field' + wide + '"' + mark + '><label>' + esc(help[k])
+      + "</label>" + ctl + "</div>";
   }
 
   async function clearSecret(key) {

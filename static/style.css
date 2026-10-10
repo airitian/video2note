@@ -213,3 +213,56 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 .secret-state { font-size: 12px; color: var(--text-3); }
 .btn.danger { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border-strong)); }
 .btn.danger:hover { background: color-mix(in srgb, var(--err) 8%, transparent); }
+
+/* 设置面板分组：让「平台登录态」这类高频项排在最上面，不用在一长条表单里翻。
+
+   注意分组容器自己就是 grid —— 原本 .form 是两列网格、.full靠
+   grid-column: 1/-1 撑满；把 .field 包进 .sgroup 后 grid 上下文被隔断，
+   .full 会失效（textarea 缩回单列宽）。所以每组内部要重新声明网格，
+   否则「撑满整行」这个既有行为会被静默破坏。 */
+.sgroup {
+  /* .form 本身是两列网格，分组容器必须跨满整行，
+     否则三个 .sgroup 会被塞进两列里，宽度只剩一半 */
+  grid-column: 1 / -1;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 14px;
+  margin-bottom: 18px;
+}
+/* .sgroup 里的 .field 需要与 .field 自身一致的纵向排列，
+   否则 grid item 默认 stretch + label/控件不换行 */
+.sgroup > .field { display: flex; flex-direction: column; gap: 5px; }
+.sgroup + .sgroup { border-top: 1px solid var(--border); padding-top: 16px; }
+.sgroup-t {
+  grid-column: 1 / -1;
+  font-size: 12px; font-weight: 600; color: var(--text-2);
+  letter-spacing: .04em; margin-bottom: 10px;
+  display: flex; align-items: center; gap: 8px;
+}
+.sgroup-t::after {
+  content: ""; flex: 1; height: 1px; background: var(--border);
+}
+/* 无分组的兜底块（老后端没有 groups 时）同样需要网格上下文 */
+.form > .field { display: flex; flex-direction: column; gap: 5px; }
+
+/* resolver_curl 加左侧色条 + 角标：这是最容易被漏看的一项 */
+.field[data-mark="curl"] {
+  grid-column: 1 / -1;
+  border-left: 3px solid var(--primary);
+  padding-left: 12px;
+  background: color-mix(in srgb, var(--primary) 3%, transparent);
+  border-radius: 0 var(--radius) var(--radius) 0;
+}
+.field[data-mark="curl"] label::before {
+  content: "可选";
+  display: inline-block; margin-right: 6px; padding: 1px 6px;
+  font-size: 11px; font-weight: 500; line-height: 1.5;
+  color: var(--primary); background: var(--primary-soft);
+  border-radius: 4px; vertical-align: 1px;
+}
+.field-note {
+  margin: 6px 0 0; font-size: 12px; color: var(--text-3); line-height: 1.55;
+}
+
+/* 窄屏时分组内部也退成单列，否则 640px 的弹窗里两列各只剩 ~280px */
+@media (max-width: 700px) {
+  .form, .sgroup { grid-template-columns: 1fr; }
+}

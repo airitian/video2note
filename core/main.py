@@ -14,9 +14,10 @@ from pydantic import BaseModel
 
 from . import audio, downloader, exporters, store
 from .downloader import detect_platform, extract_url
-from .config import (HELP, MEDIA_DIR, ROOT, SECRET_KEYS, ensure_cookie_file,
-                     ensure_dirs, load_settings, migrate_secrets,
-                     normalize_browser, public_settings, save_settings)
+from .config import (HELP, MEDIA_DIR, ROOT, SECRET_KEYS, SETTINGS_GROUPS,
+                     ensure_cookie_file, ensure_dirs, load_settings,
+                     migrate_secrets, normalize_browser, public_settings,
+                     save_settings)
 from .pipeline import (_apply_variant, _mark_idempotent_hit, _sync_variant_meta,
                        polish_needed, retry as pipeline_retry,
                        submit, submit_polish)
@@ -100,7 +101,17 @@ def index():
 
 @app.get("/api/settings")
 def get_settings():
-    return {"values": public_settings(), "help": HELP}
+    """设置面板数据。
+
+    groups 决定渲染顺序与分组标题——前端按它排，而不是按 HELP 的键序。
+    resolver_curl 这类「不配也能跑」的可选项如果只按字母/插入序排到末尾，
+    等于事实上看不见，所以顺序必须显式指定。
+    """
+    return {
+        "values": public_settings(),
+        "help": HELP,
+        "groups": [{"title": t, "keys": ks} for t, ks in SETTINGS_GROUPS],
+    }
 
 
 @app.post("/api/settings")
@@ -136,6 +147,7 @@ def post_settings(body: SettingsIn):
         if p:
             files["bilibili"] = p
     return {"ok": True, "values": public_settings(), "help": HELP,
+            "groups": [{"title": t, "keys": ks} for t, ks in SETTINGS_GROUPS],
             "cookie_files": files, "curl": curl_summary}
 
 

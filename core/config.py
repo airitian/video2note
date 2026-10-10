@@ -90,6 +90,17 @@ ASR_MODELS = [
 ]
 
 HELP: dict[str, str] = {
+    # ---- 平台登录态（最高频，且解析模板紧随其后，改一处就能接着改下一处）----
+    "cookie_text": "【抖音】Cookie 文本 —— 直接粘贴一整段 Cookie。"
+                   "浏览器 F12 → Network → 任意请求 → Request Headers → 复制 Cookie 整段粘进来即可"
+                   "（形如 a=1; b=2），程序会自动转成 cookies.txt；"
+                   "也接受 Netscape cookies.txt 全文。抖音视频需要登录态时必填",
+    "cookie_text_bili": "【B站】Cookie 文本 —— 与上面的抖音 Cookie 分开填写。"
+                        "B站登录后在 F12 → Network → 点任意请求 → Request Headers → 复制 Cookie 整段。"
+                        "务必包含登录会话凭证（F12 里能看到的三项），否则风控会返回 412。"
+                        "程序自动转成 cookies_bili.txt，域名固定为 .bilibili.com",
+    "resolver_curl": "抖音解析接口的请求模板（可选）",
+    # ---- 模型与生成 ----
     "asr_base_url": "ASR 接口地址（OpenAI 兼容，结尾的 /v1）",
     "asr_api_key": "模力方舟 API Token",
     "asr_model": "ASR 模型名，如 SenseVoiceSmall / whisper-large-v3",
@@ -100,16 +111,10 @@ HELP: dict[str, str] = {
     "llm_model": "LLM 模型名",
     "llm_max_tokens": "单次生成最大 token 数（Anthropic 协议必填）",
     "llm_temperature": "生成温度 0-1",
+    # ---- 性能 ----
     "chunk_seconds": "长音频切片时长（秒），短视频无需调整",
     "max_concurrency": "转写并发数",
-    "cookie_text": "【抖音】Cookie 文本 —— 直接粘贴一整段 Cookie。"
-                   "浏览器 F12 → Network → 任意请求 → Request Headers → 复制 Cookie 整段粘进来即可"
-                   "（形如 a=1; b=2），程序会自动转成 cookies.txt；"
-                   "也接受 Netscape cookies.txt 全文。抖音视频需要登录态时必填",
-    "cookie_text_bili": "【B站】Cookie 文本 —— 与上面的抖音 Cookie 分开填写。"
-                        "B站登录后在 F12 → Network → 点任意请求 → Request Headers → 复制 Cookie 整段。"
-                        "务必包含登录会话凭证（F12 里能看到的三项），否则风控会返回 412。"
-                        "程序自动转成 cookies_bili.txt，域名固定为 .bilibili.com",
+    # ---- 其他 ----
     "cookie_browser": "【方式2】从浏览器读取 —— 只填浏览器名，不要粘贴任何 Cookie 内容。"
                       "可用值：chrome / edge / firefox / brave / chromium / opera / safari / vivaldi / whale。"
                       "程序会调用 browser-cookie 库直接读本机该浏览器的 Cookie（需先在浏览器登录）",
@@ -117,11 +122,18 @@ HELP: dict[str, str] = {
                    "例如 D:\\cookies.txt。一般用不到，前两种任选其一即可",
     "proxy": "代理地址，如 http://127.0.0.1:7890",
     "ffmpeg_path": "ffmpeg 可执行文件路径，留空则使用 PATH 中的 ffmpeg",
-    "resolver_curl": "抖音解析接口的请求模板 —— 在浏览器里 F12 → Network → "
-                     "任选一次解析请求 → 右键「复制」→ 「复制为 cURL」，整段粘到这里。"
-                     "程序会自动替换其中的 _token / t0ken 与 url 字段，"
-                     "Cookie 也会注入浏览器会话。留空则用内置模板",
 }
+
+# 设置面板的分组与顺序。设面板从长表单里找出某一项很费力——
+#尤其 resolver_curl 这种「不配置也能跑、但配了能救场」的可选项，
+# 排在最后等于事实上不可见。这里显式定序，前端按它渲染。
+#
+# 每一项: (分组标题, [该组内的配置键...])
+SETTINGS_GROUPS: list[tuple[str, list[str]]] = [
+    ("平台登录态", ["cookie_text", "cookie_text_bili", "resolver_curl"]),
+    ("模型与生成", ["asr_language", "llm_max_tokens", "llm_temperature"]),
+    ("性能", ["chunk_seconds", "max_concurrency"]),
+]
 
 
 def ensure_dirs() -> None:
