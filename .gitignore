@@ -50,3 +50,7 @@ ui_*.png
 # OS
 .DS_Store
 Thumbs.db
+
+# 验证脚本的输出报告（每次运行重新生成）
+rt2.txt
+sse_e2e.txt

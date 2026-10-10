@@ -416,9 +416,12 @@ async def task_events(tid: str):
     async def gen():
         last = 0
         idle = 0
-        # 记录上次推过的句数，只有新增分片才推 partial，
-        # 否则 0.8 秒一次心跳会把同一份全文反复推一遍
-        sent_segs = -1
+        # 记录上次推过的内容签名（句数 + 最后一句文本）。
+        # 用内容而不是句数：重排序、补写场景下句数可能不变但文本变了。
+        # 初值 None → 第一次 tick 必然推一次全量，客户端刚连上就能拿到已有内容。
+        sent_sig = None
+        # 状态指纹：任一字段变化都算「有进展」，用来给 idle 归零
+        last_state = None
         # meta 里带着 video_path，下载一落盘就推给前端，
         # 预览区不必等到整个任务跑完才出现
         sent_vp = ""
@@ -436,21 +439,34 @@ async def task_events(tid: str):
                 e = t.events[last]
                 last += 1
                 yield "data: " + json.dumps({"type": "log", **e}, ensure_ascii=False) + "\n\n"
-            # 转写进度推送：只要句数增加就推，不限定 stage。
-            # 曾经只在 stage == "transcribing" 时推，但转写结束到
-            # stage 切走之间存在窗口，最后几个分片正好落在窗口里，
-            # 前端就永远停在倒数第几句 —— 表现为「已经转写完了，
-            # 文字稿却没显示 / 显示不全」。末尾那个分片往往是最重要的。
-            if t.status == "running":
-                n = len(t.segments or [])
-                if n and n != sent_segs:
-                    sent_segs = n
-                    yield "data: " + json.dumps(
-                        {"type": "partial", "segments": t.segments,
-                         "transcript": t.transcript,
-                         "spercent": t.spercent}, ensure_ascii=False) + "\n\n"
-            elif t.status != "running":
-                sent_segs = -1
+            # 转写进度推送：只要内容有变化就推，**不看 status**。
+            # ★这里曾经写成 `if t.status == "running"`，是个隐蔽但致命的坑：
+            # 转写结束的标志恰恰是把 status 改成 "transcribed"，所以最后一批
+            # 分片一定落在「非 running」的窗口里 —— 而 0.8 秒的心跳很可能
+            # 直接从 running 跳到 transcribed，中间那一次都没观察到。
+            # 结果就是短视频（单分片）从头到尾一个 partial 都推不出去，
+            # 长视频则丢掉结尾几句。页面表现为「已经转写完了，文字稿空的，
+            # 刷新一下才有」——因为刷新走详情接口，不依赖 SSE。
+            # 现在改成按内容签名（句数 + 最后一句文本）判断，与状态无关：
+            # 重连后 sent_sig 归零，还会把当前全量补推一次，天然自愈。
+            segs = t.segments or []
+            # 显式拆开写：`a or b if c else d` 的优先级很容易看错
+            last_text = (segs[-1].get("text") or "") if segs else ""
+            sig = (len(segs), last_text)
+            if segs and sig != sent_sig:
+                sent_sig = sig
+                yield "data: " + json.dumps(
+                    {"type": "partial", "segments": t.segments,
+                     "transcript": t.transcript,
+                     "spercent": t.spercent}, ensure_ascii=False) + "\n\n"
+                idle = 0          # 有实质进展就不计入空闲
+            # 状态指纹：下载、抽音频、切片这些阶段没有 segments，
+            # 但同样是在推进。旧代码只看 segments，于是下载一个长视频
+            # 就会把 idle 顶满 12 分钟然后被服务端掐断连接。
+            state_sig = (t.status, t.stage, t.percent, t.spercent, t.message)
+            if state_sig != last_state:
+                last_state = state_sig
+                idle = 0
             yield "data: " + json.dumps(
                 {"type": "state", "status": t.status, "stage": t.stage,
                  "percent": t.percent, "spercent": t.spercent,
@@ -471,7 +487,13 @@ async def task_events(tid: str):
                     ensure_ascii=False) + "\n\n"
                 break
             idle += 1
-            if idle > 900:
+            # idle 只统计「任务还在跑但确实没进展」的时间。
+            # 原来它是只增不减的：900 × 0.8s = 12 分钟后连接必然被服务端
+            # 掐断，而前端断开后没有任何重连 —— 长视频必然触发，
+            # 表现同样是「转写完成了但页面不更新，刷新一下才有」。
+            # 现在有 partial 推送就归零；另外把上限放宽到 2 小时，
+            # 即使是超长音频也不会被误杀（前端已有自动重连兜底）。
+            if idle > 9000:
                 break
             await asyncio.sleep(0.8)
 

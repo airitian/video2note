@@ -426,9 +426,41 @@
   }
 
   // ---------- SSE ----------
+  // SSE 会因为各种原因断开：服务端 idle 上限、云端网关/反向代理的空闲超时、
+  // 移动网络切换、笔记本休眠……断开后如果只是安静地结束，页面就会永远停在
+  // 最后一帧 —— 用户看到的正是「已经转写完了，文字稿不出来，刷新才有」。
+  // 所以这里必须自己重连；重连后后端会因为 sent_sig 归零而补推一次全量，
+  // 状态自然对齐。
+  const RECONNECT_MIN = 1200, RECONNECT_MAX = 15000;
+  const retryAt = new Map();
+
+  function scheduleReconnect(tid) {
+    const t = tasks.get(tid);
+    if (!t) return;
+    // 任务已是终态，重连没有意义；等用户点历史记录时 loadDetail 会补齐
+    if (t.status === "done" || t.status === "failed" || t.status === "canceled") return;
+    if (retryAt.has(tid)) return;
+    // n 是「已经重试过几次」。连接成功并收到数据后由下面的 clearRetry 归零，
+    // 否则这里会一直递增，退避最终顶到上限再也降不下来。
+    const n = (retryAt.get(tid) || 0) + 1;
+    retryAt.set(tid, n);
+    const wait = Math.min(RECONNECT_MIN * Math.pow(1.6, n - 1), RECONNECT_MAX);
+    setTimeout(() => {
+      retryAt.delete(tid);
+      follow(tid);
+    }, wait);
+  }
+
+  // 连上并收到第一个事件 = 这次连接是好的，退避计数清零，
+  // 下次真断时又从最短间隔开始重试。
+  function clearRetry(tid) {
+    if (retryAt.has(tid)) retryAt.set(tid, 0);
+  }
+
   async function follow(tid) {
     if (following.has(tid)) return;
     following.add(tid);
+    let reachedEof = false;
     try {
       const r = await fetch("/api/tasks/" + tid + "/events");
       const reader = r.body.getReader();
@@ -446,6 +478,7 @@
           try { ev = JSON.parse(p.slice(6)); } catch (e) { continue; }
           const t = tasks.get(tid);
           if (!t) continue;
+          clearRetry(tid);          // 收到事件 = 连接正常，退避计数归零
           if (ev.type === "state") {
             t.status = ev.status; t.stage = ev.stage; t.percent = ev.percent;
             t.spercent = ev.spercent; t.message = ev.message; t.error = ev.error;
@@ -467,6 +500,7 @@
           } else if (ev.type === "eof") {
             // eof 携带最终结果，先就地采用，避免依赖 refreshOne 的网络往返
             // ——那次往返失败或慢时，页面就会停在不完整的增量内容上。
+            reachedEof = true;
             if (ev.segments && ev.segments.length) {
               t.segments = ev.segments;
               t.transcript = ev.transcript || t.transcript || "";
@@ -489,9 +523,12 @@
         }
       }
     } catch (e) {
-      /* 忽略网络中断 */
+      /* 忽略网络中断，下面统一重连 */
     } finally {
       following.delete(tid);
+      // 只有「没走到 eof 就断了」才重连。走到 eof 说明任务真的结束了，
+      // 再连也是浪费；但polishing 可能紧跟着发生，交给 polish() 里的 follow。
+      if (!reachedEof) scheduleReconnect(tid);
     }
   }
 
@@ -998,6 +1035,24 @@ if (rest.length) {
       settingsCache = {};
     }
   }
+
+  // 后台标签页会被浏览器冻结计时器，SSE 也可能被网关悄悄掐掉。
+  // 用户切回来时页面还停在离开前那一帧，看起来就像「转写完了但没显示」。
+  // 这里在页面重新可见时主动对账一次：拉详情、重绘、并重连 SSE。
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible" || !currentId) return;
+    const t = tasks.get(currentId);
+    if (!t) return;
+    // 已经是终态就不用折腾了，详情在点历史记录时就拉全了
+    if (t.status === "done" || t.status === "failed" || t.status === "canceled") return;
+    retryAt.delete(currentId);
+    ws.linesTask = null; ws.linesSig = null; ws.videoKey = null;
+    refreshOne(currentId).then(() => {
+      ws.linesTask = null; ws.linesSig = null;
+      render();
+      follow(currentId);
+    });
+  });
 
   boot();
 })();
