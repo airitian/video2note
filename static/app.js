@@ -711,8 +711,14 @@ if (rest.length) {
       state = "✅ 解析请求模板输入框已就位，在下方「平台登录态」分组里";
       cls = "ok";
     } else if (!inHelp) {
-      state = "❌ 后端未返回 resolver_curl 字段——代码版本过旧，"
-    + "请 git pull 后<b>重启服务</b>再刷新";
+      // 这条最容易把人带偏：页面样式是新的（前端文件已更新），
+      // 但后端进程还在跑旧代码。git pull 换的是磁盘上的文件，
+      // 运行中的 Python 进程不会重新加载——所以光pull 不够，必须重启。
+      state = "❌ 后端未返回 resolver_curl 字段——<b>后端进程仍是旧代码</b>。"
+        + "静态文件已更新，但运行中的服务不会自动重新加载，"
+        + "所以这一步<b>仅刷新页面没用，必须重启服务</b>："
+        + "<code>sudo systemctl restart video2note</code>，再刷新本页。"
+        + "（若磁盘代码也不是最新，先 <code>git pull</code> 再重启）";
       cls = "bad";
     } else if (hidden) {
       state = "❌ resolver_curl 被前端隐藏规则过滤，属前端 bug";
@@ -929,6 +935,14 @@ if (rest.length) {
       if (v.commit || v.assets) {
         bits.push('<span class="ver" title="git commit / 静态资源版本戳">v'
           + esc(v.commit || "?") + (v.assets ? " · " + esc(v.assets) : "") + "</span>");
+      } else {
+        // ★ 后端连版本自述都没有 = 它跑的是 63f7a8e 之前的代码。
+        // 这种情况顶栏必须开口，否则用户看到的是一个「一切正常」的页面，
+        // 只有设置面板里才冒出那句「后端未返回 resolver_curl」——
+        // 而那句会被理解成前端坏了。版本不一致必须在这里就说清楚。
+        bits.push('<span class="bad" title="后端进程仍在运行旧代码，'
+          + 'git pull 只更新磁盘文件，不会让运行中的进程重新加载">'
+          + "后端代码过旧（无版本自述），请重启服务</span>");
       }
       if (v.has_groups === false) {
         bits.push('<span class="bad">后端版本过旧，请 git pull 后重启</span>');

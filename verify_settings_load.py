@@ -140,9 +140,26 @@ else:
     visible = [k for k in help_d if k not in HIDDEN]
 
     check(len(help_d) > 0, f"help 返回 {len(help_d)} 个字段")
+    check("resolver_curl" in help_d, "help 里含 resolver_curl（curl 输入框的数据源）")
     check(len(groups) > 0, f"groups 返回 {len(groups)} 个分组",
           "没有 groups 说明后端是 d9dfbab 之前的版本")
-    check("resolver_curl" in help_d, "help 里含 resolver_curl（curl 输入框的数据源）")
+
+    # 关键：前端是静态文件，后端是常驻进程。git pull 只换了磁盘上的文件，
+    # 不会让已在运行的进程重新加载 Python 模块——于是出现「前端新、后端旧」。
+    # 症状极具迷惑性：页面样式和自检条都是新的，但字段列表是旧的。
+    if not groups:
+        print("\n       ★★ 后端没有返回 groups —— 前后端版本不一致 ★★")
+        print("       这是「curl 输入框不见了」最常见的真实原因：")
+        print("         git pull 更新了 static/ 下的文件（前端立刻变新），")
+        print("         但 uvicorn 进程仍在跑旧的 Python 模块（后端还是旧版）。")
+        print("       证据：新前端才有自检条，旧后端没有 groups / resolver_curl。")
+        print("       修复：重启服务让后端加载新代码（见文末）。")
+    if "resolver_curl" not in help_d:
+        print("\n       ★★ 后端没有 resolver_curl 字段 —— 无法渲染 curl 输入框 ★★")
+        print(f"       当前 help 字段：{sorted(help_d)}")
+        print("       后端跑的是 d9dfbab 之前的旧代码。git pull 不会让运行中的")
+        print("       进程重新加载 Python 模块，必须重启服务。")
+
     check(len(visible) > 0, f"扣掉隐藏项后仍有 {len(visible)} 个可渲染字段")
 
     # 前端只有在「一个 block 都没渲染出来」时才会弹那句提示。
@@ -206,16 +223,33 @@ if _bad == 0:
    3. 若必须走反代（nginx 等），确认 /api/ 有转发规则
       少了这条，首页能开、/api/settings 却 502/404，
       前端就会把这两种情况都显示成同一句「连不上后端」。
-
- 顺带一提：63f7a8e 之后的面板已经自带自检条，
- 会直接告诉你 curl 输入框在不在、为什么看不见，不必再靠猜。
 """.strip())
     sys.exit(0)
 
 print(f" 结论：发现 {_bad} 项异常（{_ok} 项通过）")
 print("=" * 64)
 print("""
- 后端侧确实有问题，请按上面 [!!] 标记的条目处理。
- 若第 [3] 项失败但服务是活的，多半是反代没转发 /api。
+ 后端代码是旧的——这正是 curl 输入框消失的原因。
+
+ 为什么会这样：git pull 只更新了磁盘上的文件。
+ static/ 是静态文件，浏览器刷新就拿到新的；
+ 但 uvicorn 进程里的 Python 模块是启动时载入的，
+ 不重启就一直跑旧代码。于是前端新、后端旧，字段对不上。
+
+ 按顺序执行：
+
+   1. 确认磁盘上的代码已是最新
+        cd /opt/video2note && git pull && git log --oneline -1
+
+   2. 重启服务（关键，这一步才会让后端加载新代码）
+        sudo systemctl restart video2note
+
+   3. 确认没有旧进程还占着端口
+        sudo ss -lntp | grep 8765
+      若看到陌生 PID 占用该端口，说明有僵尸进程：
+        sudo pkill -f "run.py" && sudo systemctl restart video2note
+
+   4. 刷新页面（Ctrl+Shift+R），面板顶部应显示
+      「✅ 解析请求模板输入框已就位」
 """.strip())
 sys.exit(1)
