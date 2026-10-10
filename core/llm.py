@@ -19,6 +19,17 @@ from .config import load_settings
 SHORT_LIMIT = 3000      # 低于此长度一次性完成
 CHUNK_LIMIT = 3500      # map 阶段每块字符数
 
+# 术语抽样：均匀取 5 段、共 8000 字
+# 旧实现只取「首 3000 + 尾 2000」，正中间（比如 40 分钟处）第一次出现的
+# 产品名/术语会整个漏掉——后面所有块都拿不到这个词的写法，纠错就失效了。
+TERMS_TOTAL_CHARS = 8000
+TERMS_SAMPLES = 5
+
+# 块间前文摘要：传递多少字上一段的清洗结果尾部
+# 解决指代断裂（「他刚才提到的那个方案」里的"他/那个方案"指谁），
+# 同时让同一个词在相邻块里的写法保持一致。
+CARRY_CHARS = 500
+
 # Anthropic 协议要求必带此头
 ANTHROPIC_VERSION = "2023-06-01"
 
@@ -242,7 +253,7 @@ GENERAL_TMPL = """你是专业的中文文字编辑。用户提供一段语音�
 CLEAN_TMPL = """下面是视频「{title}」转写稿的第 {idx}/{total} 段原始文本（来自语音识别，可能有同音错字、缺标点、口语冗余）。
 
 已知专有名词：{terms}
-
+{prev}
 请仅做以下处理，输出清洗后的正文：
 1. 删除口语填充词与重复啰嗦（嗯、啊、那个、就是说、然后呢、对不对、大家知道吧 等），保留全部有信息量的内容
 2. 删除引流/广告话术：求关注点赞转发、加微信/进群/私信领取资料、报课报名引导、
@@ -252,6 +263,7 @@ CLEAN_TMPL = """下面是视频「{title}」转写稿的第 {idx}/{total} 段原
 5. 数字、单位、代码、英文原词保持原样
 6. 严禁新增原文没有的事实、数据、案例或观点；无法判断的地方保留原样或标 [?]
 7. 保持原有叙述顺序与人称，不要改变风格
+8. 上文摘要仅用于理解指代与统一术语用词，**不要重复输出它的内容**，也不要加「上文提到」之类的衔接语
 
 只输出清洗后的正文，不要任何解释、标题或Markdown标记。
 
@@ -344,15 +356,65 @@ def _split_chunks(text: str, limit: int = CHUNK_LIMIT) -> list[str]:
     return chunks
 
 
+def _sample_terms(text: str, total: int = TERMS_TOTAL_CHARS,
+                  parts: int = TERMS_SAMPLES) -> str:
+    """从全文均匀取若干段做术语抽样
+
+    为什么不用「首 N 字 + 尾 N 字」：那样只覆盖开头和结尾。一小时视频里
+    某个产品名若在第 40 分钟才第一次出现，就永远进不了术语表，后面所有块
+    都会把它写错。均匀切分保证全文任何位置的专有名词都有机会被抽到。
+
+    段落边界尽量落在换行/句号上，减少把一个词切成两半的情况。
+    """
+    if len(text) <= total:
+        return text
+
+    per = max(total // parts, 200)
+    # 起点按「首段贴头、末段贴尾」均分，而不是 step = len // parts。
+    # 后者会让末段停在 len-per 之前，尾部一整块（约 1/parts 的长度）
+    # 完全落在抽样之外——而结尾的总结与出镜感谢往往正是术语出处。
+    span = len(text) - per
+    bounds = [int(i * span / max(parts - 1, 1)) for i in range(parts)]
+
+    out: list[str] = []
+    for i, start in enumerate(bounds):
+        if i > 0:
+            # 起点回退到最近的换行，避免从半个词开始；首段不回退，否则会漏开头
+            head = text.rfind("\n", 0, start + 1)
+            if head != -1 and start - head <= 80:
+                start = head + 1
+        end = len(text) if i == parts - 1 else min(start + per, len(text))
+        seg = text[start:max(end, start)].strip()
+        if seg:
+            out.append(seg)
+    return "\n...\n".join(out) if out else text[:total]
+
+
 def _extract_terms(raw: str, title: str, model: str | None = None) -> str:
-    sample = raw[:3000]
-    if len(raw) > 3000:
-        sample += "\n...\n" + raw[-2000:]
+    sample = _sample_terms(raw)
     try:
         out = chat(SYSTEM, TERMS_TMPL.format(title=title, sample=sample), model=model)
         return out.replace("\n", " ").strip()[:600]
     except Exception:
         return "无"
+
+
+def _carry_block(done: list[str], limit: int = CARRY_CHARS) -> str:
+    """生成注入下一块的「前文摘要」
+
+    取已清洗内容的尾部若干字。刻意用**尾部**而不是摘要：中文的指代
+    （「他刚才提到的那个方案」）几乎总是回指紧邻上文，尾部信噪比最高；
+    而跨段的术语一致性已由全局术语表负责，不必重复携带。
+    """
+    if not done:
+        return ""
+    tail = "\n".join(p for p in done if p.strip()).strip()
+    if not tail:
+        return ""
+    if len(tail) > limit:
+        tail = "…" + tail[-limit:]
+    return (f"\n上文摘要（紧邻本段之前的已清洗内容，仅供理解指代，"
+            f"不要重复输出）：\n{tail}\n")
 
 
 def polish(raw: str, meta: dict, style: str = "note", progress=None,
@@ -374,23 +436,34 @@ def polish(raw: str, meta: dict, style: str = "note", progress=None,
             title=title, uploader=meta.get("uploader", ""),
             description=meta.get("description", "")[:300], cleaned=raw), model=model))
 
-    terms = "无"
     if progress:
         progress("抽取专有名词，用于纠错")
     terms = _extract_terms(raw, title, model)
 
     chunks = _split_chunks(raw)
     total = len(chunks)
-
-    def work(i: int) -> str:
-        return chat(SYSTEM, CLEAN_TMPL.format(
-            title=title, idx=i + 1, total=total, terms=terms, chunk=chunks[i]), model=model)
+    maxw = max(min(int(load_settings().get("max_concurrency") or 4), 8), 1)
 
     if progress:
         progress(f"分 {total} 块清洗文本")
-    maxw = min(int(load_settings().get("max_concurrency") or 4), 8)
-    with ThreadPoolExecutor(max_workers=max(maxw, 1)) as ex:
-        cleaned_parts = list(ex.map(work, range(total)))
+
+    # 分批推进：批内并行（互不依赖，可并发），批与批之间把上文摘要带进下一批。
+    # 为什么不全串行——串行上下文最完整，但耗时会翻数倍；
+    # 分批在并发度和连贯性之间取平衡，断点只落在相邻两批之间。
+    cleaned_parts: list[str] = []
+    for start in range(0, total, maxw):
+        batch = list(range(start, min(start + maxw, total)))
+        prev = _carry_block(cleaned_parts)
+
+        def work(i: int, _prev: str = prev) -> str:
+            return chat(SYSTEM, CLEAN_TMPL.format(
+                title=title, idx=i + 1, total=total, terms=terms,
+                prev=_prev, chunk=chunks[i]), model=model)
+
+        if progress:
+            progress(f"清洗第 {batch[0] + 1}-{batch[-1] + 1} 段 / 共 {total} 段")
+        with ThreadPoolExecutor(max_workers=maxw) as ex:
+            cleaned_parts.extend(ex.map(work, batch))
     cleaned = "\n\n".join(p for p in cleaned_parts if p.strip())
 
     if progress:

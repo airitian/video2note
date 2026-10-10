@@ -102,6 +102,9 @@ cp .env.example .env
 - ASR 不返回时间戳时按句长比例估算时间轴，保证字幕可用
 - LLM 三种风格：结构化笔记 / 公众号文章 / 仅清洗润色；长文本走 **map-reduce**
   （先抽专有名词表 → 分块并行清洗 → 合并结构化）
+- **跨段上下文不丢**：专有名词表从全文均匀抽 5 段（首段贴头、末段贴尾），
+  正中间才出现的术语也能抽到；分块清洗按批推进，批内并行、批间把上一批的
+  清洗结果尾部带进下一批，解决「他刚才提到的那个方案」这类指代断裂
 - 转写完成后可**多次重跑 AI 整理、随时换风格**，不必重新转写
 - 转写失败后重跑会**复用已下载的媒体文件**，不再重复下载
 - 历史任务里记录的模型若已下线，会自动回退到当前配置里的默认模型
@@ -305,7 +308,7 @@ video2note/
 │   ├── curlparse.py        解析「粘贴 curl」得到自定义请求模板
 │   ├── audio.py            ffmpeg 合并/抽音频/转码、静音点切片、时长探测
 │   ├── asr.py              在线语音识别（/v1/audio/transcriptions）+ 事件标记清洗
-│   ├── llm.py              LLM 整理：anthropic/openai 双协议、map-reduce、按风格缓存
+│   ├── llm.py              LLM 整理：anthropic/openai 双协议、map-reduce、术语抽样、块间上文摘要、按风格缓存
 │   ├── store.py            任务存储（内存索引 + data/tasks/*.json）
 │   ├── exporters.py        导出 md / txt / srt / raw / json（入口已隐藏）
 │   ├── pipeline.py         流水线编排（线程池异步版）
@@ -315,7 +318,9 @@ video2note/
 │   verify_dlpanda_prio.py    两级下载调度：接口优先、失败降级、错误文案
 │   verify_dy_state.py        Cookie 状态判定与提示分流
 │   verify_mux.py              ffmpeg 合并（-c copy 优先，必要时转 AAC）
-│   verify_realtime.py        转写结果是否增量推送
+│   verify_llm_context.py      术语抽样与块间上文摘要（mock LLM，不花钱）
+│   verify_llm_real.py         同上，真实调用 LLM 验证成稿质量
+│   verify_realtime.py         转写结果是否增量推送
 │   verify_ui.py               端到端 UI 冒烟
 ├── scripts/
 │   ├── deploy_debian.sh              # Debian/Ubuntu 一键部署
