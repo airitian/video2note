@@ -54,3 +54,6 @@ Thumbs.db
 # 验证脚本的输出报告（每次运行重新生成）
 rt2.txt
 sse_e2e.txt
+first_sentence.txt
+chunks.txt
+lines_append.txt

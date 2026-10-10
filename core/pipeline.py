@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import hashlib
+import queue
 import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -52,13 +54,23 @@ def _set(t: store.Task, stage: str, pct: float, msg: str,
             pass
 
 
-def _publish_segments(t: store.Task, segments: list[dict]) -> None:
+def _publish_segments(t: store.Task, segments: list[dict], force: bool = False) -> None:
     """把已转写出的分片结果排序后写到任务上并落盘，供前端实时预览。
 
     segments 是乱序累积的（并发返回），必须按 start 排序，否则预览里
     句子会跳来跳去。transcript 同步刷新，这样刷新页面也能看到中间结果。
+
+    force=False 时按最小间隔节流（默认 0.4 秒）：
+    首片压到 15 秒后片数会明显增多，每片都全量写盘 + 全量推送是 O(n²)。
+    而 SSE 本身 0.8 秒才推一次，推得再密界面也看不出来，
+    只会把磁盘和网络写满、反而更卡。
+    force=True 用于收尾，确保最后一批一定落盘（否则末尾几句会丢）。
     """
     segs = sorted((s for s in segments if s), key=lambda x: x.get("start", 0))
+    now = time.monotonic()
+    if not force and now - t._pub_at < 0.4:
+        return
+    t._pub_at = now
     t.segments = segs
     t.transcript = asr.segments_to_text(segs)
     store.save(t)          # 落盘，刷新页面也能看到已转出的部分
@@ -141,46 +153,117 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
         chunk_seconds = int(s.get("chunk_seconds") or 180)
     except ValueError:
         chunk_seconds = 180
-    chunks = audio.prepare_chunks(Path(meta["audio_path"]), workdir / "chunks", chunk_seconds)
-    t.log("info", f"音频处理完成，共 {len(chunks)} 个分片")
+    # 首片单独取短，让第一句话尽快出现。ASR 耗时与音频长度近似成正比，
+    # 180 秒的片要等 30~60 秒才出第一句；首片压到 15 秒则约 3~6 秒。
+    # 代价是多几次调用，但切片与转写并行后总时长反而更短。
+    try:
+        first_seconds = int(s.get("first_chunk_seconds") or 15)
+    except ValueError:
+        first_seconds = 15
+    first_seconds = max(5, min(first_seconds, chunk_seconds))
 
     _check_cancel(t)
-    _set(t, "transcribing", 0.0, f"开始语音转写（{len(chunks)} 个分片）", emit=emit)
+    _set(t, "transcribing", 0.0, "开始语音转写", emit=emit)
     lang = t.options.get("language") or "auto"
     model = t.options.get("asr_model") or None
     maxw = min(int(s.get("max_concurrency") or 4), 8)
 
-    def do_chunk(i: int) -> list[dict]:
-        c = chunks[i]
+    segments: list[dict] = []
+    done = 0
+    lock = threading.Lock()
+    total_hint = {"n": 0}
+    finished = threading.Event()
+
+    def do_chunk(c: dict) -> list[dict]:
         return asr.transcribe_file(c["path"], c["offset"], c["duration"],
                                    language=lang, model=model)
 
-    segments: list[dict] = []
-    if len(chunks) == 1:
-        segments = do_chunk(0)
-        _publish_segments(t, segments)
-        _set(t, "transcribing", 1.0, "转写完成", emit=emit)
-    else:
-        done = 0
-        lock = threading.Lock()
-        with ThreadPoolExecutor(max_workers=max(maxw, 1)) as ex:
-            # 必须按「谁先完成」取结果：若按提交顺序等，第 1 片卡住时
-            # 后面先跑完的分片没法提前推送，界面就一直空着
-            futs = [ex.submit(do_chunk, i) for i in range(len(chunks))]
-            for f in as_completed(futs):
-                segs = f.result()
-                with lock:
-                    done += 1
-                    segments.extend(segs)
-                    # 每完成一个分片就落一次盘，用户能边转写边看到文字，
-                    # 而不是干等全部跑完才一次性出现
-                    _publish_segments(t, segments)
-                    _set(t, "transcribing", done / len(chunks),
-                         f"转写进度 {done}/{len(chunks)}", emit=emit)
+    def on_first_chunk(c: dict) -> None:
+        total_hint["n"] = max(total_hint["n"], 1)
+        t.log("info", f"首片就绪（{int(c['duration'])} 秒），开始转写")
+
+    def on_chunk(i: int, c: dict, n: int) -> None:
+        nonlocal done
+        total_hint["n"] = max(total_hint["n"], n)
+        with lock:
+            done += 1
+            # 每完成一个分片就落一次盘并推送，用户能边转写边看到文字，
+            # 而不是干等全部跑完才一次性出现
+            _publish_segments(t, segments)
+            cur = done
+        _set(t, "transcribing", min(0.99, cur / max(total_hint["n"], 1)),
+             f"转写进度 {cur}/{total_hint['n']}", emit=emit)
+
+    run_err: list = []
+
+    def run() -> None:
+        """切片线程：边切边把分片塞进队列，供转写线程池即时消费"""
+        q: queue.Queue = queue.Queue(maxsize=max(maxw * 2, 4))
+        ex = ThreadPoolExecutor(max_workers=max(maxw, 1))
+        pending: list = []
+
+        def pump() -> None:
+            # 有界队列 = 背压：切片跑太快时会被挡住，不会堆满磁盘
+            for i, c in enumerate(audio.iter_chunks(
+                    Path(meta["audio_path"]), workdir / "chunks",
+                    chunk_seconds, first_seconds=first_seconds)):
+                while True:
+                    try:
+                        q.put((i, c), timeout=0.5)
+                        break
+                    except queue.Full:
+                        if finished.is_set():
+                            return
+
+        def consume() -> None:
+            while True:
+                try:
+                    i, c = q.get(timeout=0.5)
+                except queue.Empty:
+                    if finished.is_set():
+                        return
+                    continue
+                segs = ex.submit(do_chunk, c)
+                pending.append(segs)
+                if i == 0:
+                    on_first_chunk(c)
+                total_hint["n"] = max(total_hint["n"], i + 1)
+
+        pump_th = threading.Thread(target=pump, daemon=True)
+        consume_th = threading.Thread(target=consume, daemon=True)
+        pump_th.start()
+        consume_th.start()
+        pump_th.join()
+        consume_th.join()
+        # 队列已空，等所有在途请求返回；按完成顺序取，先跑完的先推送
+        for f in as_completed(pending):
+            segments.extend(f.result())
+            on_chunk(-1, {"duration": 0}, total_hint["n"])
+        ex.shutdown(wait=True)
+
+    def runner() -> None:
+        # ★异常必须带回主线程：run() 跑在线程里，直接 raise 只会让线程
+        # 静默死掉，任务会以「成功但没有任何文字」收场——比报错更难查。
+        try:
+            run()
+        except BaseException as e:      # noqa: BLE001 - 跨线程传递
+            run_err.append(e)
+            finished.set()
+
+    th = threading.Thread(target=runner, name="v2n-transcribe", daemon=True)
+    th.start()
+    while th.is_alive():
+        th.join(timeout=0.3)
+        _check_cancel(t)
+    th.join()
+    if run_err:
+        raise run_err[0]
+    t.log("info", f"分片转写完成，共 {len(segments)} 句")
 
     segments.sort(key=lambda x: x.get("start", 0))
-    t.segments = segments
-    t.transcript = asr.segments_to_text(segments)
+    # force=True：收尾必须落盘。上面按 0.4 秒节流，最后一批可能正好
+    # 被节流掉，那就会重演「转写完成了但末尾几句不见了」。
+    _publish_segments(t, segments, force=True)
     if not t.transcript:
         raise RuntimeError("语音转写结果为空，请确认音频有效或更换 ASR 模型")
     t.log("info", f"转写完成，共 {len(segments)} 句、{len(t.transcript)} 字")

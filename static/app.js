@@ -11,7 +11,7 @@
   let settingsCache = { values: {}, help: {} };
   // 记录设置接口的加载错误；为空表示加载正常
   let settingsLoadErr = "";
-  const ws = { videoTask: null, videoEl: null, videoKey: null, linesTask: null, linesSig: null, lineEls: [], segs: [], active: -1, follow: true, noteKey: null, logCount: -1 };
+  const ws = { videoTask: null, videoEl: null, videoKey: null, linesTask: null, linesSig: null, lineEls: [], segs: [], active: -1, follow: true, noteKey: null, logCount: -1, lineCount: 0, lineTail: "", renderedTask: null };
 
   const ORDER = ["upload", "downloading", "extracting", "slicing", "transcribing", "polishing"];
   const STATUS_TEXT = { pending: "排队中", running: "处理中", transcribed: "转写完成", done: "已完成", failed: "失败", canceled: "已取消" };
@@ -325,6 +325,24 @@
     }
   }
 
+  function lineHtml(s, i) {
+    return '<div class="line" data-i="' + i + '"><time>' + fmtTime(s.start)
+      + "</time><span>" + esc(s.text || "") + "</span></div>";
+  }
+
+  function bindLine(line) {
+    line.addEventListener("click", () => {
+      const i = parseInt(line.dataset.i, 10);
+      const s = ws.segs[i];
+      if (!s) return;
+      if (ws.videoEl) {
+        ws.videoEl.currentTime = Math.max(0, (s.start || 0) - 0.3);
+        ws.videoEl.play().catch(() => {});
+      }
+      markActive(i, false);
+    });
+  }
+
   function ensureLines(t) {
     const box = $("#lines");
     // 缓存守卫必须按「内容 + 状态」判断，不能只看 taskId。
@@ -337,35 +355,71 @@
     const sig = currentId + "|" + segs.length + "|" + (live ? "1" : "0")
       + "|" + (segs.length ? (segs[segs.length - 1].text || "") : "");
     if (ws.linesSig === sig) return;
-    // 转写增量会反复重建，这里记住滚动位置与高亮，
-    // 否则每来一次增量预览就被拉回顶部、正在看的那句也丢了高亮
     const keepScroll = ws.scrollTop || 0;
     const keepActive = ws.active;
     ws.linesTask = currentId;
     ws.linesSig = sig;
     ws.segs = segs;
-    if (!ws.segs.length) {
-      box.innerHTML = '<div class="empty">' + (live ? "正在识别，文字会陆续出现…" : "暂无转写结果") + "</div>";
+
+    if (!segs.length) {
+      box.innerHTML = '<div class="empty">'
+        + (live ? "正在识别，文字会陆续出现…" : "暂无转写结果") + "</div>";
       ws.lineEls = [];
       ws.active = -1;
       return;
     }
-    box.innerHTML = ws.segs.map((s, i) =>
-      '<div class="line" data-i="' + i + '"><time>' + fmtTime(s.start) + "</time><span>" + esc(s.text || "") + "</span></div>").join("")
-      + (live ? '<div class="line pending-line">正在识别后续内容…</div>' : "");
+
+    //转写中的增量是**只增不改**的（分片按时间顺序拼接），所以只追加
+    // 新句子，不重建整个列表。首片压到 15 秒后分片数明显增多，
+    // 每次都重建 innerHTML 会让长稿频繁重排：滚动条跳动、
+    // 正在看的那句丢失选中、选中文字被清掉。
+    //
+    // ★追加的前提是「已有句子不会被改写」。后端 segments 是并发返回后
+    // 按 start 排序的，理论上后到的分片可能插到中间（时间更早）。
+    // 所以这里额外校验：已渲染部分的「最后一句文本 + 总句数」必须与
+    // 新数据吻合，否则退回全量重建。宁可偶尔重排，也不能让句子错位。
+    const prev = ws.lineCount || 0;
+    const prevTail = ws.lineTail || "";
+    const tail = segs.length ? (segs[segs.length - 1].text || "") : "";
+    const samePrefix = prev > 0 && prev <= segs.length
+      && ws.renderedTask === currentId
+      && prev < segs.length
+      && (prevTail === "" || segs[prev - 1].text === prevTail);
+    const canAppend = live && samePrefix && box.querySelector(".line");
+
+    if (canAppend) {
+      for (let i = prev; i < segs.length; i++) {
+        const d = document.createElement("div");
+        d.innerHTML = lineHtml(segs[i], i);
+        const el = d.firstChild;
+        bindLine(el);
+        box.insertBefore(el, box.querySelector(".pending-line"));
+      }
+    } else {
+      box.innerHTML = segs.map(lineHtml).join("");
+      ws.lineEls = Array.prototype.slice.call(
+        box.querySelectorAll(".line:not(.pending-line)"));
+      ws.lineEls.forEach(bindLine);
+    }
+    // 「正在识别后续内容…」始终压在最后一句下面
+    const tip = box.querySelector(".pending-line");
+    if (live) {
+      if (tip) {
+        box.appendChild(tip);
+      } else {
+        const d = document.createElement("div");
+        d.className = "line pending-line";
+        d.textContent = "正在识别后续内容…";
+        box.appendChild(d);
+      }
+    } else if (tip) {
+      tip.remove();
+    }
     ws.lineEls = Array.prototype.slice.call(box.querySelectorAll(".line:not(.pending-line)"));
-    ws.lineEls.forEach((line) => {
-      line.addEventListener("click", () => {
-        const i = parseInt(line.dataset.i, 10);
-        const s = ws.segs[i];
-        if (!s) return;
-        if (ws.videoEl) {
-          ws.videoEl.currentTime = Math.max(0, (s.start || 0) - 0.3);
-          ws.videoEl.play().catch(() => {});
-        }
-        markActive(i, false);
-      });
-    });
+    ws.lineCount = segs.length;
+    ws.lineTail = tail;
+    ws.renderedTask = currentId;
+
     // 恢复高亮与滚动位置
     if (keepActive >= 0 && ws.lineEls[keepActive]) {
       ws.active = -1;
@@ -544,6 +598,9 @@
     ws.videoTask = null; ws.videoKey = null; ws.linesTask = null; ws.linesSig = null;
     ws.noteKey = null; ws.logCount = -1;
     ws.videoEl = null; ws.segs = []; ws.lineEls = []; ws.active = -1; ws.scrollTop = 0;
+    // 增量追加依赖「已渲染多少句」，换任务必须清零，
+    // 否则会把上一个任务的句数当成本任务的起点
+    ws.lineCount = 0; ws.renderedTask = null; ws.lineTail = "";
     $("#video-host").innerHTML = '<div class="empty">加载中…</div>';
     $("#lines").innerHTML = '<div class="empty">加载中…</div>';
     render();

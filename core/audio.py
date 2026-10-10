@@ -165,10 +165,20 @@ def ensure_playable(src: Path, max_height: int | None = None) -> Path:
         raise
 
 
-def _silence_points(path: Path, noise: str = "-35dB", min_dur: float = 0.6) -> list[float]:
-    """返回静音区间的中点，作为优先切分点"""
-    r = _run([ff_bin("ffmpeg"), "-hide_banner", "-i", str(path),
-              "-af", f"silencedetect=noise={noise}:d={min_dur}", "-f", "null", "-"])
+def _silence_points(path: Path, noise: str = "-35dB", min_dur: float = 0.6,
+                    total_limit: float | None = None) -> list[float]:
+    """返回静音区间的中点，作为优先切分点
+
+    total_limit：只扫描音频开头这么多秒。
+    首片切片时用它避开「为了找一个切点先扫完整个文件」——
+    ffmpeg 的 silencedetect 是全量扫描，长视频要好几秒，
+    而首片只需要开头一小段的静音点。
+    """
+    args = [ff_bin("ffmpeg"), "-hide_banner", "-i", str(path)]
+    if total_limit and total_limit > 0:
+        args += ["-t", f"{total_limit:.3f}"]
+    args += ["-af", f"silencedetect=noise={noise}:d={min_dur}", "-f", "null", "-"]
+    r = _run(args)
     starts: list[float] = []
     ends: list[float] = []
     for line in (r.stderr or "").splitlines():
@@ -205,28 +215,107 @@ def _split_points(total: float, chunk: float, silences: list[float]) -> list[flo
 
 
 def prepare_chunks(src: Path, outdir: Path, chunk_seconds: int = 600) -> list[dict]:
-    """输出 16k 单声道 mp3 分片（同时完成标准化），返回 [{path, offset, duration}]"""
+    """输出 16k 单声道 mp3 分片（同时完成标准化），返回 [{path, offset, duration}]
+
+    保留给「一次性切完」的调用方。流水线路径请用 iter_chunks()。
+    """
+    return list(iter_chunks(src, outdir, chunk_seconds, stream=False))
+
+
+def iter_chunks(src: Path, outdir: Path, chunk_seconds: int = 600,
+                first_seconds: int = 0, stream: bool = True):
+    """逐片产出分片，**边切边交**，让调用方立刻开始转写。
+
+    为什么必须流式：原来 prepare_chunks 会把 N 个分片全部转码完才返回，
+    转写线程只能干等。12 分钟视频切 4 片时，光切片就要十几秒——
+    这段时间里界面一个字都不会动。改成产出即返回后，
+    第 0 片转码完就能立刻送 ASR，切片与转写真正并行。
+
+    first_seconds：首片单独指定的较短长度（秒）。默认 0 = 与其他片一样。
+    首片短的意义在于**首句出现的等待时间**：ASR 耗时与音频长度近似成正比，
+    180 秒的片要等 30~60 秒才出第一句；首片压到 15 秒则约 3~6 秒。
+    代价是总片数变多，但切片与转写并行后总时长反而更短。
+
+    stream=False 时退化成一次性 list（等价于旧的 prepare_chunks）。
+    """
     check_ffmpeg()
     outdir.mkdir(parents=True, exist_ok=True)
     total = probe_duration(src)
     if total <= 0:
         raise AudioError("无法读取音频时长，文件可能已损坏。")
 
-    if total <= chunk_seconds:
+    # 短音频：一片搞定。
+    # 判断用 first * 1.5 而不是 first：20 秒音频配first=15 时若按
+    # `total <= first` 判断会走切片路径，把尾巴 5 秒切成一个 4.5 秒的
+    # 碎片——既多一次 ASR 调用，又让首句更慢（第一片只有 15 秒）。
+    # 余量留得比首片大一点，才能真正「一次说完」。
+    first = first_seconds if (first_seconds and first_seconds > 0) else chunk_seconds
+    if total <= first * 1.5:
         dst = outdir / "part_000.mp3"
         _transcode(src, dst)
-        return [{"path": str(dst), "offset": 0.0, "duration": probe_duration(dst)}]
+        yield {"path": str(dst), "offset": 0.0, "duration": probe_duration(dst)}
+        return
 
+    # 静音点检测要扫一遍全音频，是一次性的前置开销。
+    # 只在真需要多片时才做；首片单独定位，不依赖静音点，
+    # 这样「切首片」不必等「扫完全程」。
+    if stream:
+        # 首片：尽量落在静音点，找不到就按长度硬切。
+        # 只扫开头 first*2 秒 —— ffmpeg 的 silencedetect 是顺序扫描，
+        # 扫全文件要好几秒，而首片只需要开头一小段。
+        # ★不能把这个结果复用给后面的片：它们要的是文件后段的静音点，
+        # 而这里只拿到开头的，于是后面全部退化成硬切（会在句子中间断开）。
+        silences_head = _silence_points(src, total_limit=first * 2.0)
+        cut = _near_silence(silences_head, first)
+        if cut <= 5:
+            cut = min(float(first), total)
+        dst = outdir / "part_000.mp3"
+        _transcode(src, dst, 0.0, cut)
+        yield {"path": str(dst), "offset": 0.0, "duration": probe_duration(dst)}
+
+        # 余下部分：整体扫静音点，按 chunk_seconds 切
+        silences = _silence_points(src)
+        offset = cut
+        idx = 1
+        while offset + 0.5 < total:
+            remain = total - offset
+            size = min(float(chunk_seconds), remain)
+            cut2 = _near_silence(silences, offset + size, lo=offset + 5.0)
+            if cut2 <= offset + 5:
+                cut2 = offset + size
+            # ★不能写 total - 0.5：那样最后一片永远差0.5 秒，
+            # 每段末尾几个字会被切掉。这里允许切到音频真正末尾。
+            cut2 = min(cut2, total)
+            dst = outdir / f"part_{idx:03d}.mp3"
+            _transcode(src, dst, offset, cut2 - offset)
+            yield {"path": str(dst), "offset": offset,
+                   "duration": probe_duration(dst)}
+            offset = cut2
+            idx += 1
+        return
+
+    # ---- 旧的非流式路径：一次算好所有切点 ----
+    # 注意：这里同样用 yield 而不是 return out。
+    # 生成器函数里的 return值 只是 StopIteration.value，
+    # list() 拿不到——写成 `return out` 会让调用方收到空列表（静默失败）。
     silences = _silence_points(src)
     cuts = _split_points(total, float(chunk_seconds), silences)
     bounds = [0.0] + cuts + [total]
-    chunks: list[dict] = []
     for i in range(len(bounds) - 1):
         start, end = bounds[i], bounds[i + 1]
         dst = outdir / f"part_{i:03d}.mp3"
         _transcode(src, dst, start, end - start)
-        chunks.append({"path": str(dst), "offset": start, "duration": probe_duration(dst)})
-    return chunks
+        yield {"path": str(dst), "offset": start, "duration": probe_duration(dst)}
+
+
+def _near_silence(silences: list[float], target: float,
+                  lo: float = 0.0, window: float | None = None) -> float:
+    """在 target 附近挑最接近的静音点；没有就返回 0（调用方自行兜底）"""
+    win = window if window is not None else max(10.0, target * 0.15)
+    cand = [p for p in silences if lo <= p <= target + win]
+    if not cand:
+        return 0.0
+    return min(cand, key=lambda p: abs(p - target))
 
 
 def _transcode(src: Path, dst: Path, start: float | None = None, dur: float | None = None) -> None:

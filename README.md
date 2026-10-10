@@ -503,6 +503,7 @@ location /v2n/ {
 | **抖音解析报 `Executable doesn't exist`** | `python3 -m pip install playwright` 只装 Python 包，浏览器内核是另一套。执行 `python3 -m playwright install chromium`（容器里可能还需 `--with-deps`）。健康检查的 `playwright` 字段会真启动一次 Chromium，此项为 false 时 `playwright_msg` 直接给出该命令 |
 | **`playwright_msg` 报「启动即崩溃」** | 内核已装但 Chromium 一启动就退出（`Target page, context or browser has been closed`）。两个原因：内核与库版本不匹配 → `playwright install --force chromium`；系统库缺失 → `playwright install --with-deps chromium`。**命令里的解释器要用服务实际在用的那个**（`readlink -f /proc/<服务PID>/exe`），装到别的环境等于没装 |
 | 抖音报验证码 / 滑块拦截 | 服务器 IP 被抖音风控，**换 Cookie 无效**。按序尝试：设置页填代理 → 换网络（手机热点）→ 关闭本机代理软件 |
+| **转写时看不到文字陆续出现 / 首句很久才出** | ASR 接口是「整段上传、整段返回」，做不到字节级流式，所以「实时」的粒度就是一个分片。默认已把**首片压到 15 秒**且切片与转写并行（首句约几秒可见）。还想更快：设置页调小「首个分片的时长」；调大则省ASR 调用次数。调`chunk_seconds` 只影响后续分片，对首句速度无帮助 |
 | **设置面板是空的 / 少了某几项** | 多半是「前端新、后端旧」：`git pull` 只更新磁盘文件，运行中的 Python 进程不会重新加载，**必须重启服务**。先看设置面板顶部的自检条，它会直接说明是哪种情况；重启方式见下方「按部署方式重启」 |
 | **curl 输入框不显示** | 同上。自检条显示「后端未返回 resolver_curl」即属此类，重启后应变为「✅ 已就位」 |
 | 提示「无法连接后端 /api/settings」 | 若设置面板里其他字段能正常显示，说明后端其实是通的、只是没渲染出内容；空面板才可能是服务没起或反代拦了 `/api/*` |

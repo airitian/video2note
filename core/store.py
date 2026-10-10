@@ -42,6 +42,8 @@ class Task:
     options: dict = field(default_factory=dict)
     events: list[dict] = field(default_factory=list)
     _cancel: bool = False
+    # 上次发布文字稿的单调时刻，用于 _publish_segments 的最小间隔节流
+    _pub_at: float = 0.0
 
     def log(self, level: str, text: str) -> None:
         if self.events and self.events[-1]["text"] == text and self.events[-1]["level"] == level:

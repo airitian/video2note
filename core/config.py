@@ -58,6 +58,10 @@ DEFAULTS: dict[str, str] = {
     "llm_temperature": "0.3",
     # ---- 工程参数 ----
     "chunk_seconds": "180",
+    # 首片单独取短，让第一句话尽快出现（秒）。ASR 耗时与音频长度近似成正比，
+    # 180 秒的片要等 30~60 秒才出第一句；15 秒则约 3~6 秒。
+    # 调大 = 首句慢一点但省调用次数；调小 = 首句更快但分片更多。
+    "first_chunk_seconds": "15",
     "max_concurrency": "4",
     "cookie_text": "",                       # 抖音 Cookie 文本，自动落盘成 cookies.txt
     "cookie_text_bili": "",                  # B站 Cookie 文本，落盘成 cookies_bili.txt
@@ -113,6 +117,8 @@ HELP: dict[str, str] = {
     "llm_temperature": "生成温度 0-1",
     # ---- 性能 ----
     "chunk_seconds": "长音频切片时长（秒），短视频无需调整",
+    "first_chunk_seconds": "首个分片的时长（秒）。越小，第一句话出现得越快；"
+                           "越大越省 ASR 调用次数。默认 15",
     "max_concurrency": "转写并发数",
     # ---- 其他 ----
     "cookie_browser": "【方式2】从浏览器读取 —— 只填浏览器名，不要粘贴任何 Cookie 内容。"
@@ -132,7 +138,7 @@ HELP: dict[str, str] = {
 SETTINGS_GROUPS: list[tuple[str, list[str]]] = [
     ("平台登录态", ["cookie_text", "cookie_text_bili", "resolver_curl"]),
     ("模型与生成", ["asr_language", "llm_max_tokens", "llm_temperature"]),
-    ("性能", ["chunk_seconds", "max_concurrency"]),
+    ("性能", ["first_chunk_seconds", "chunk_seconds", "max_concurrency"]),
 ]
 
 
