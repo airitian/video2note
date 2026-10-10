@@ -15,7 +15,7 @@ VERIFIER = ROOT / "scripts" / "verify_dockerfile.py"
 
 # (用例名, 对原文的替换, 是否应被拦截)
 CASES: list[tuple[str, list[tuple[str, str]], bool]] = [
-    ("EXPOSE 改成 8080", [("EXPOSE 7860", "EXPOSE 8080")], True),
+    ("EXPOSE 端口与默认不一致", [("EXPOSE 8765", "EXPOSE 9000")], True),
     (
         "SERVER_HOST 绑成 127.0.0.1",
         [("    SERVER_HOST=0.0.0.0 \\", "    SERVER_HOST=127.0.0.1 \\")],
@@ -23,7 +23,8 @@ CASES: list[tuple[str, list[tuple[str, str]], bool]] = [
     ),
     (
         "SERVER_PORT 改成 8000",
-        [("    SERVER_PORT=7860 \\", "    SERVER_PORT=8000 \\")],
+        # 注意：SERVER_PORT 是 ENV 续行块的最后一行，行尾没有反斜杠
+        [("    SERVER_PORT=8765", "    SERVER_PORT=8000")],
         True,
     ),
     (
@@ -33,10 +34,10 @@ CASES: list[tuple[str, list[tuple[str, str]], bool]] = [
     ),
     ("COPY 源文件不存在", [("COPY requirements.txt .", "COPY nope.txt .")], True),
     ("COPY 引用不存在的阶段", [("--from=builder", "--from=nope")], True),
-    ("硬编码 API Key", [("EXPOSE 7860", "EXPOSE 7860\nENV V2N_LLM_API_KEY=sk-abcdef0123456789abcdef")], True),
+    ("硬编码 API Key", [("EXPOSE 8765", "EXPOSE 8765\nENV V2N_LLM_API_KEY=sk-abcdef0123456789abcdef")], True),
     ("首条指令不是 FROM", [("FROM python:3.11-slim-bookworm AS builder", "RUN echo hi\nFROM python:3.11-slim-bookworm AS builder")], True),
-    ("拼错指令名", [("EXPOSE 7860", "EXPSOE 7860")], True),
-    ("CMD 指向不存在的文件", [("exec python -u app.py", "exec python -u nope.py")], True),
+    ("拼错指令名", [("EXPOSE 8765", "EXPSOE 8765")], True),
+    ("CMD 指向不存在的文件", [("exec python -u run.py", "exec python -u nope.py")], True),
     # 真实线上事故：COPY --from=builder /opt/venv 写在装 Chromium 的 RUN 之后，
     # 构建报 "/opt/venv/bin/python: not found"。校验器必须靠「阶段隔离 + 先收集后检查」抓出来。
     (

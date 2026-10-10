@@ -239,6 +239,47 @@ async def upload_task(
     return {"id": t.id}
 
 
+@app.post("/api/tasks/upload-raw")
+async def upload_task_raw(
+    request: Request,
+    style: str = "general",
+    language: str = "auto",
+    model: str = "",
+    name: str = "upload.bin",
+):
+    """原始字节流直传（不走 multipart）。
+
+    Starlette 的 multipart 解析是纯 Python，实测 158MB 要几分钟；
+    裸流直传就是内核拷贝速度。前端已切到这个端点，
+    旧的 multipart 端点保留兼容，两个入口最后落同一个处理逻辑。
+    """
+    # 文件名只取 basename，剥掉任何路径成分，防止怪名字写出目录
+    name = Path(name.replace("\\", "/")).name.strip() or "upload.bin"
+    t = store.create(name, "local", _task_options(style, language, model))
+    suffix = Path(name).suffix.lower() or ".bin"
+    dest = MEDIA_DIR / t.id / f"source{suffix}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    size = 0
+    try:
+        with dest.open("wb") as out:
+            async for chunk in request.stream():
+                out.write(chunk)
+                size += len(chunk)
+    except BaseException:
+        store.remove(t.id)
+        shutil.rmtree(MEDIA_DIR / t.id, ignore_errors=True)
+        raise
+    if size == 0:
+        store.remove(t.id)
+        shutil.rmtree(MEDIA_DIR / t.id, ignore_errors=True)
+        raise HTTPException(400, "上传的文件是空的")
+    t.options["source_file"] = str(dest)
+    t.log("info", f"已接收文件：{name}（{size / 1048576:.1f} MB）")
+    store.save(t)
+    submit(t)
+    return {"id": t.id}
+
+
 class PolishIn(BaseModel):
     style: str = "general"
     force: bool = False      # 忽略幂等缓存，强制重新整理
@@ -312,11 +353,19 @@ async def task_events(tid: str):
         # 记录上次推过的句数，只有新增分片才推 partial，
         # 否则 0.8 秒一次心跳会把同一份全文反复推一遍
         sent_segs = -1
+        # meta 里带着 video_path，下载一落盘就推给前端，
+        # 预览区不必等到整个任务跑完才出现
+        sent_vp = ""
         while True:
             t = store.get(tid)
             if not t:
                 yield 'data: {"type":"eof"}\n\n'
                 break
+            vp = (t.meta or {}).get("video_path") or ""
+            if vp and vp != sent_vp:
+                sent_vp = vp
+                yield "data: " + json.dumps({"type": "meta", "meta": t.meta},
+                                            ensure_ascii=False) + "\n\n"
             while last < len(t.events):
                 e = t.events[last]
                 last += 1

@@ -9,7 +9,7 @@
   let pickedFile = null;
   let uploadPct = null;
   let settingsCache = { values: {}, help: {} };
-  const ws = { videoTask: null, videoEl: null, videoKey: null, linesTask: null, lineEls: [], segs: [], active: -1, follow: true, noteKey: null };
+  const ws = { videoTask: null, videoEl: null, videoKey: null, linesTask: null, lineEls: [], segs: [], active: -1, follow: true, noteKey: null, logCount: -1 };
 
   const ORDER = ["upload", "downloading", "extracting", "slicing", "transcribing", "polishing"];
   const STATUS_TEXT = { pending: "排队中", running: "处理中", transcribed: "转写完成", done: "已完成", failed: "失败", canceled: "已取消" };
@@ -19,6 +19,9 @@
   let curStyle = "general";
   // 已生成过文稿的风格集合（当前任务），用于提示与按钮文案
   let generatedStyles = new Set();
+  // 每个任务上次「查看」的风格：点回历史项时回到你上次看的那份稿，
+  // 而不是被 note_info.style（最后一次生成的）强行覆盖
+  const viewStyle = new Map();
 
   function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 
@@ -99,15 +102,21 @@
 
   function uploadFile(file, style) {
     return new Promise((resolve, reject) => {
-      const fd = new FormData();
-      fd.append("file", file);
-      fd.append("style", style);
+      // 裸流直传，不走 multipart：后者在服务端是纯 Python 解析，
+      // 大文件要几分钟；裸流是内核拷贝速度。参数全走 query。
+      const q = "?style=" + encodeURIComponent(style)
+        + "&name=" + encodeURIComponent(file.name);
       const xhr = new XMLHttpRequest();
-      xhr.open("POST", "/api/tasks/upload");
+      xhr.open("POST", "/api/tasks/upload-raw" + q);
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      // 大文件的 progress 事件一秒能来几十上百次，每次都全量重绘
+      // 会把上传本身拖到零点几 MB/s（实测踩过）。节流到 ~10Hz 足够流畅。
+      let lastPaint = 0;
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable) {
           uploadPct = Math.round((e.loaded / e.total) * 100);
-          render();
+          const now = Date.now();
+          if (now - lastPaint > 120) { lastPaint = now; render(); }
         }
       };
       xhr.onload = () => {
@@ -115,13 +124,30 @@
         catch (e) { reject(new Error("上传失败 " + xhr.status)); }
       };
       xhr.onerror = () => reject(new Error("网络错误，上传失败"));
-      xhr.send(fd);
+      xhr.send(file);
     });
   }
 
   // ---------- 渲染 ----------
+  // 任务当前处在哪个阶段（换算成 ORDER 里的下标）。
+  // queued 还没开始 -> -1（一行都不显示）；transcribed/done 这类终态要映射回对应行，
+  // 否则 indexOf 拿不到下标会让已经做完的行反而被隐藏。
+  function stageIdx(t) {
+    if (!t) return -1;
+    const s = t.stage;
+    if (!s || s === "queued") return -1;
+    if (s === "done") return ORDER.length - 1;
+    if (s === "transcribed") return ORDER.indexOf("transcribing");
+    if (s === "failed" || s === "canceled") {
+      const i = ORDER.indexOf(t.failed_stage || s);
+      return i < 0 ? -1 : i;
+    }
+    return ORDER.indexOf(s);
+  }
+
   function rowPct(t, key) {
-    if (key === "upload") return uploadPct == null ? (t ? 100 : 0) : uploadPct;
+    // 没上传过就显示 0%，别凭空显示 100%
+    if (key === "upload") return uploadPct != null ? uploadPct : ((t && t.isUpload) ? 100 : 0);
     if (!t) return 0;
     if (t.status === "done") return 100;
     if (t.stage === "transcribed") return key === "transcribing" ? 100 : (key === "polishing" ? 0 : (ORDER.indexOf(key) < ORDER.indexOf("transcribing") ? 100 : 0));
@@ -155,8 +181,20 @@
 
   function renderWorkspace() {
     const t = tasks.get(currentId);
+    const cur = stageIdx(t);
+    // 只有任务正在执行（或正在上传）时才露出进度行；
+    // 转写完成 / 已完成 / 失败 / 取消等非执行状态一律隐藏，不挂 100% 尾巴
+    const running = !!t && (t.status === "pending" || t.status === "running" || uploadPct != null);
     $$(".prow").forEach((row) => {
       const key = row.dataset.stage;
+      let show = false;
+      if (running) {
+        show = key === "upload"
+          ? (uploadPct != null || !!(t && t.isUpload))
+          : (cur >= 0 && ORDER.indexOf(key) <= cur);
+      }
+      row.classList.toggle("hidden", !show);
+      if (!show) return;
       const pct = rowPct(t, key);
       row.querySelector(".pbar i").style.width = pct + "%";
       row.querySelector(".ppct").textContent = Math.round(pct) + "%";
@@ -183,9 +221,15 @@
       rbtn.classList.toggle("hidden", !can);
       rbtn.textContent = (t.failed_stage === "polishing" && t.transcript) ? "↻ 重试 AI 整理" : "↻ 重新转写";
     }
+    // 日志常驻右栏。只在条数变化时重建 DOM，避免每 0.8 秒心跳都重排一次
     const logs = $("#ws-logs");
-    if (!logs.classList.contains("hidden")) {
-      logs.innerHTML = (t.events || []).slice(-80).map((e) => '<div class="' + e.level + '">' + esc(e.text) + "</div>").join("");
+    const evs = (t && t.events) || [];
+    if (evs.length !== ws.logCount) {
+      ws.logCount = evs.length;
+      logs.innerHTML = evs.length
+        ? evs.slice(-120).map((e) => '<div class="' + e.level + '">' + esc(e.text) + "</div>").join("")
+        : '<div class="empty">暂无日志</div>';
+      logs.scrollTop = logs.scrollHeight;
     }
     ensureVideo(t);
     ensureLines(t);
@@ -224,7 +268,10 @@
     ws.videoTask = currentId;
     ws.videoEl = null;
     if (!vp) {
-      host.innerHTML = '<div class="empty">暂无视频</div>';
+      // 还没下载好时给个明确说法，别让预览区看起来像坏了
+      const busy = !!(t && (t.status === "running" || t.status === "pending"));
+      ws.videoKey = key + "|" + (busy ? "busy" : "none");
+      host.innerHTML = '<div class="empty">' + (busy ? "正在准备视频…" : "暂无视频") + "</div>";
       return;
     }
     // 必须用 meta 里记录的真实文件名，不能写死 video.mp4：
@@ -294,12 +341,24 @@
     if (box) ws.scrollTop = box.scrollTop;
   }
 
+  // 取某个风格下已生成的文稿，用于点历史记录后回显、以及切风格时切换内容
+  function noteForStyle(t, style) {
+    if (!t) return "";
+    const v = (t.variants || {})[style];
+    if (v && v.note) return v.note;
+    if (style && (t.note_info || {}).style === style && t.note) return t.note;
+    return "";
+  }
+
   function ensureNote(t) {
     const box = $("#note-body");
-    const key = currentId + "|" + ((t && t.note) ? t.note.length + "|" + t.note.slice(0, 40) : "none");
+    const text = noteForStyle(t, curStyle);
+    const key = currentId + "|" + curStyle + "|" +
+      (text ? text.length + "|" + text.slice(0, 40) : "none");
     if (ws.noteKey !== key) {
       ws.noteKey = key;
-      box.innerHTML = (t && t.note) ? renderMarkdown(t.note) : '<div class="empty">转写完成后点击上方按钮生成</div>';
+      box.innerHTML = text ? renderMarkdown(text)
+        : '<div class="empty">转写完成后，在上方选一种风格点「生成文稿」</div>';
     }
   }
 
@@ -363,6 +422,10 @@
           } else if (ev.type === "log") {
             t.events = t.events || [];
             if (!t.events.some((x) => x.t === ev.t && x.text === ev.text)) t.events.push(ev);
+          } else if (ev.type === "meta") {
+            // 下载一落盘就拿到了 video_path，预览区立刻可播，不用等全流程结束
+            t.meta = ev.meta || {};
+            ws.videoKey = null;
           } else if (ev.type === "eof") {
             await refreshOne(tid);
             render();
@@ -387,7 +450,7 @@
 
   function selectTask(id) {
     currentId = id;
-    ws.videoTask = null; ws.videoKey = null; ws.linesTask = null; ws.noteKey = null;
+    ws.videoTask = null; ws.videoKey = null; ws.linesTask = null; ws.noteKey = null; ws.logCount = -1;
     ws.videoEl = null; ws.segs = []; ws.lineEls = []; ws.active = -1; ws.scrollTop = 0;
     $("#video-host").innerHTML = '<div class="empty">加载中…</div>';
     $("#lines").innerHTML = '<div class="empty">加载中…</div>';
@@ -402,9 +465,9 @@
       if (currentId !== id) return;          // 期间切走了，丢弃这次结果
       tasks.set(id, Object.assign({}, tasks.get(id), d));
       const t = tasks.get(id);
-      // 沿用任务自身记录的风格，切换按钮的选中态
+      // 沿用上次查看的风格（没有才用任务最后生成的那份），并同步按钮选中态
       if (t && t.note_info && t.note_info.style && STYLE_TEXT[t.note_info.style]) {
-        curStyle = t.note_info.style;
+        curStyle = viewStyle.get(id) || t.note_info.style;
         syncStyleChips();
       }
       generatedStyles = new Set(
@@ -431,11 +494,12 @@
         pickedFile = null;
         $("#file").value = "";
         $("#drop-text").textContent = "将文件拖放到此处";
-        afterCreate(r.id);
+        afterCreate(r.id, true);
       } catch (e) {
         toast(e.message, true);
       } finally {
-        uploadPct = null;
+        // 传完固定停在 100%，不要回落到 null（那会让进度行直接消失）
+        uploadPct = 100;
         render();
       }
       return;
@@ -443,16 +507,17 @@
     const url = $("#url").value.trim();
     if (!url) { toast("请先上传文件或粘贴链接", true); return; }
     try {
+      uploadPct = null;                 // 链接任务没有上传这一步
       const r = await api("/api/tasks", { method: "POST", body: JSON.stringify({ url: url, style: curStyle }) });
       $("#url").value = "";
-      afterCreate(r.id);
+      afterCreate(r.id, false);
     } catch (e) {
       toast(e.message, true);
     }
   }
 
-  function afterCreate(id) {
-    tasks.set(id, { id: id, url: "", platform: "", status: "pending", stage: "queued", percent: 0, spercent: 0, meta: {}, segments: [], events: [], created_at: Date.now() / 1000 });
+  function afterCreate(id, isUpload) {
+    tasks.set(id, { id: id, url: "", platform: "", status: "pending", stage: "queued", percent: 0, spercent: 0, meta: {}, segments: [], events: [], created_at: Date.now() / 1000, isUpload: !!isUpload });
     selectTask(id);
     follow(id);
   }
@@ -640,13 +705,16 @@
     const del = e.target.closest("[data-del]");
     if (del) { e.stopPropagation(); removeTask(del.dataset.del); return; }
     const hitem = e.target.closest(".hitem");
-    if (hitem) { selectTask(hitem.dataset.id); $("#history-panel").classList.add("hidden"); return; }
+    if (hitem) { selectTask(hitem.dataset.id); return; }
 
     const chip = e.target.closest(".style-chip");
     if (chip) {
       curStyle = chip.dataset.style;
+      viewStyle.set(currentId, curStyle);
       syncStyleChips();
-      renderPolishBar(tasks.get(currentId));
+      const t = tasks.get(currentId);
+      ensureNote(t);              // 已生成过的风格直接回显，不重复消耗额度
+      renderPolishBar(t);
       return;
     }
 
@@ -664,12 +732,11 @@
     if (e.target.id === "btn-start") start();
     else if (e.target.id === "btn-polish") polish();
     else if (e.target.id === "btn-retry") retryTask();
-    else if (e.target.id === "btn-history") $("#history-panel").classList.toggle("hidden");
-    else if (e.target.id === "btn-history-close") $("#history-panel").classList.add("hidden");
+    else if (e.target.id === "btn-history") { $("#side-left").classList.toggle("folded"); syncSideBtns(); }
+    else if (e.target.id === "btn-logs") { $("#side-right").classList.toggle("folded"); syncSideBtns(); }
     else if (e.target.id === "btn-settings") openSettings();
     else if (e.target.id === "btn-close-settings" || e.target.id === "btn-cancel-settings") $("#settings-modal").classList.add("hidden");
     else if (e.target.id === "btn-save-settings") saveSettings();
-    else if (e.target.id === "btn-logs") $("#ws-logs").classList.toggle("hidden");
     else if (e.target.id === "pick") $("#file").click();
   });
 
@@ -694,14 +761,28 @@
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) start();
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { $("#history-panel").classList.add("hidden"); $("#settings-modal").classList.add("hidden"); }
+    if (e.key === "Escape") { $("#settings-modal").classList.add("hidden"); }
   });
 
   // ---------- 启动 ----------
   // 记住文字区滚动位置：转写增量会重建 DOM，重建后要还原回去
   $("#lines").addEventListener("scroll", saveScroll, { passive: true });
 
+  // 顶栏按钮反映两侧栏的折叠状态（默认都展开）
+  function syncSideBtns() {
+    const pairs = [["#btn-history", "#side-left", "🕘 历史记录", "左侧历史记录"],
+                   ["#btn-logs", "#side-right", "📋 处理日志", "右侧处理日志"]];
+    pairs.forEach(([b, s, label, name]) => {
+      const folded = $(s).classList.contains("folded");
+      const btn = $(b);
+      btn.classList.toggle("on", !folded);
+      btn.textContent = label;
+      btn.title = (folded ? "展开" : "折叠") + name;
+    });
+  }
+
   async function boot() {
+    syncSideBtns();
     try {
       const list = await api("/api/tasks");
       list.forEach((t) => tasks.set(t.id, t));

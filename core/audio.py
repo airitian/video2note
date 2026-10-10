@@ -66,20 +66,32 @@ def extract_audio(src: Path, dst: Path) -> Path:
 
 
 def mux(video: Path, audio: Path, out: Path) -> Path:
-    """合并视频轨与音频轨为可直接在浏览器播放的 mp4"""
+    """合并视频轨与音频轨为可直接在浏览器播放的 mp4
+
+    优先「音视频都直接复制」。实测同一条 12 分钟 B站视频：
+    全 copy 只要 3 秒，而把音轨重编码成 AAC 要 28 秒
+    —— 重编码是整条链路最大的一笔浪费，能省则省。
+    只有复制出来的音轨浏览器放不出（如 opus/flac 塞进 mp4）时才退回重编码。
+    """
     check_ffmpeg()
     out.parent.mkdir(parents=True, exist_ok=True)
     ff = ff_bin("ffmpeg")
     common = ["-map", "0:v:0", "-map", "1:a:0", "-shortest", "-movflags", "+faststart"]
     attempts = [
+        ["-c", "copy"],
         ["-c:v", "copy", "-c:a", "aac", "-b:a", "128k"],
         ["-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-c:a", "aac", "-b:a", "128k"],
     ]
     last = ""
-    for enc in attempts:
+    for i, enc in enumerate(attempts):
         r = _run([ff, "-hide_banner", "-y", "-i", str(video), "-i", str(audio)] + enc + common + [str(out)])
         last = (r.stderr or "")[-400:]
         if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            c = audio_codec(out)
+            playable = (not c) or any(c.startswith(b) for b in BROWSER_AUDIO_CODECS)
+            # 复制成功但音轨浏览器放不出，且还有备用方案时，继续尝试重编码
+            if i < len(attempts) - 1 and not playable:
+                continue
             return out
     raise AudioError(f"视频合并失败：{last}")
 
@@ -90,6 +102,18 @@ def video_codec(path: Path) -> str:
     txt = r.stderr or ""
     m = re.search(r"Stream #\d+:\d+.*?:\s*Video:\s*([a-z0-9_]+)", txt)
     return (m.group(1).lower() if m else "")
+
+
+def audio_codec(path: Path) -> str:
+    """探测音频轨编码名（aac / mp3 / opus / ...），没有音频轨时返回 ''"""
+    r = _run([ff_bin("ffmpeg"), "-hide_banner", "-i", str(path)])
+    txt = r.stderr or ""
+    m = re.search(r"Stream #\d+:\d+.*?:\s*Audio:\s*([a-z0-9_]+)", txt)
+    return (m.group(1).lower() if m else "")
+
+
+# 塞进 mp4 后浏览器仍能放出声音的音频编码
+BROWSER_AUDIO_CODECS = ("aac", "mp3", "mp4a", "alac")
 
 
 # 浏览器（Chrome/Edge/Firefox）普遍放不出画面、只剩声音的编码
@@ -113,6 +137,32 @@ def to_h264(src: Path, dst: Path, crf: int = 26) -> Path:
     if r.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
         raise AudioError(f"转码为 H.264 失败：{(r.stderr or '')[-400:]}")
     return dst
+
+
+def ensure_playable(src: Path, max_height: int | None = None) -> Path:
+    """确保浏览器能播放，返回可用的文件路径（多数情况就是原文件本身）
+
+    抖音 / B站拿到的流绝大多数已经是 H.264，直接原样返回；
+    只有 HEVC 这类「有声音没画面」的编码才转码。
+    max_height 保留参数位但**不用于降分辨率**：为预览去重新编码
+    既慢又损画质（实测 12 分钟视频重编码要几十秒），不值得。
+    """
+    if not needs_transcode(src):
+        return src
+    tmp = src.with_name(src.stem + "_h264.mp4")
+    try:
+        to_h264(src, tmp)
+        if src.exists():
+            src.unlink()
+        tmp.replace(src)
+        return src
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        raise
 
 
 def _silence_points(path: Path, noise: str = "-35dB", min_dur: float = 0.6) -> list[float]:

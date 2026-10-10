@@ -2,8 +2,8 @@
 
 检查项：
   1. 指令拼写与顺序（FROM 必须在最前，CMD 收尾）
-  2. 平台硬性要求：EXPOSE 7860、不出现 8080
-  3. 关键环境变量：监听 0.0.0.0:7860、数据落 /mnt/workspace
+  2. 端口一致性：EXPOSE / SERVER_PORT / HEALTHCHECK 必须与 run.py 默认端口对得上
+  3. 关键环境变量：监听 0.0.0.0、数据落 V2N_DATA_DIR
   4. COPY 的源文件是否真实存在（不存在会在构建时直接失败）
   5. .dockerignore 是否覆盖了 data/ 等运行期产物
 
@@ -27,9 +27,8 @@ KNOWN = {
     "VOLUME", "USER", "WORKDIR", "ARG", "ONBUILD", "STOPSIGNAL", "HEALTHCHECK",
     "SHELL", "ARG", "STOPSIGNAL",
 }
-# ModelScope 平台约束
-FORBIDDEN_PORTS = {"8080"}
-REQUIRED_PORT = 7860
+# 通用部署约束：端口与 run.py 默认值保持一致
+REQUIRED_PORT = 8765
 VALID_INSTRUCTIONS = sorted(KNOWN)
 
 
@@ -113,13 +112,18 @@ def main() -> int:
                 if tok.isdigit():
                     exposes.append(int(tok))
     if REQUIRED_PORT not in exposes:
-        errors.append(f"必须 EXPOSE {REQUIRED_PORT}（平台硬性要求），当前: {exposes or '无'}")
-    bad = sorted(set(exposes) & FORBIDDEN_PORTS)
-    if bad:
-        errors.append(f"EXPOSE 了平台占用端口 {bad}，会导致启动失败")
+        errors.append(f"必须 EXPOSE {REQUIRED_PORT}（与 run.py 默认端口一致），当前: {exposes or '无'}")
+    # HEALTHCHECK 打到的端口必须与 EXPOSE 一致，否则健康检查永远失败
+    hc_ports = set(int(m) for m in re.findall(r"127\.0\.0\.1:(\d+)", text))
+    if hc_ports and hc_ports != {REQUIRED_PORT}:
+        warns.append(f"HEALTHCHECK 探测端口 {sorted(hc_ports)} 与 EXPOSE {REQUIRED_PORT} 不一致")
     for lineno, instr, args in items:
-        if instr in ("ENV", "CMD", "ENTRYPOINT") and "8080" in args:
-            warns.append(f"L{lineno}: 出现 8080，确认不是要把服务端口设成它")
+        if instr in ("ENV", "CMD", "ENTRYPOINT") and str(REQUIRED_PORT) not in args:
+            if instr == "ENV" and "SERVER_PORT" not in args:
+                continue
+            if instr != "ENV" and "SERVER_PORT" not in args:
+                continue
+            warns.append(f"L{lineno}: SERVER_PORT 与默认 {REQUIRED_PORT} 不一致，确认是否有意为之")
 
     # ---- 4. 关键环境变量 ----
     # ENV 可以写成 "A=1 B=2" 一行，也可以多行反斜杠续行，这里统一抽成键值对
@@ -143,12 +147,16 @@ def main() -> int:
 
     if _val("SERVER_HOST") != "0.0.0.0":
         errors.append(
-            f"SERVER_HOST 必须是 0.0.0.0（平台反代后无法访问 127.0.0.1），当前: {_val('SERVER_HOST')!r}"
+            f"SERVER_HOST 必须是 0.0.0.0（容器外无法访问 127.0.0.1），当前: {_val('SERVER_HOST')!r}"
         )
-    if _val("SERVER_PORT") != "7860":
-        errors.append(f"SERVER_PORT 必须是 7860，当前: {_val('SERVER_PORT')!r}")
-    if "/mnt/workspace" not in text:
-        warns.append("未出现 /mnt/workspace，数据将无法跨重启保留（core/config.py 依赖该路径）")
+    if _val("SERVER_PORT") != str(REQUIRED_PORT):
+        errors.append(f"SERVER_PORT 必须是 {REQUIRED_PORT}，当前: {_val('SERVER_PORT')!r}")
+    data_dir = _val("V2N_DATA_DIR")
+    if not data_dir:
+        warns.append("未设置 V2N_DATA_DIR，数据目录将退化为项目内的 data/，容器重建即丢")
+    elif "VOLUME" not in {i[1] for i in items}:
+        # 只是提示：挂卷也可以在 docker run -v 时做，不强制写进镜像
+        warns.append(f"数据目录 {data_dir} 未声明 VOLUME，docker run 时记得用 -v 挂出来")
 
     # ---- 5. COPY 源存在性 + 阶段别名 ----
     for lineno, instr, args in items:

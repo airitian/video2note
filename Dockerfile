@@ -1,14 +1,12 @@
 # ==============================================================================
-# ModelScope 创空间 —— Docker 类型
+# 通用部署镜像（Docker / docker compose / 任意云主机）
 #
-# 平台硬性要求（见 https://modelscope.cn/docs/studios/docker）：
-#   1. 仓库根目录必须有本文件；
-#   2. 服务必须监听 0.0.0.0:7860（schema 里 port 只能填 7860，8080 被平台占用）；
-#   3. 响应头不得携带 Authorization / X-modelscope-* / X-studio-*；
-#   4. 数据落在 /mnt/workspace 才会跨重启保留。
-#
-# 可选开关：
-#   docker build --build-arg INSTALL_PLAYWRIGHT=0 .   # 不装 Chromium，镜像小 ~1.3GB
+# 设计取舍：
+#   1. 服务监听 0.0.0.0:8765（与 run.py 默认值一致）。要换端口改 SERVER_PORT。
+#   2. 数据默认落在 /data；用 -v 挂到宿主机即可跨重建保留任务与媒体。
+#      镜像内不依赖任何平台专属目录。
+#   3. Chromium 用于抖音解析（过 Cloudflare 挑战）。不解析抖音可
+#      --build-arg INSTALL_PLAYWRIGHT=0 瘦身约 400MB。
 # ==============================================================================
 
 # ---------- 构建阶段：只装 Python 依赖，便于分层缓存 ----------
@@ -30,25 +28,21 @@ FROM python:3.11-slim-bookworm
 
 ARG INSTALL_PLAYWRIGHT=1
 
-# 数据与临时文件都放持久化目录，重启不丢；
-# SERVER_HOST/SERVER_PORT 固定为平台要求的 0.0.0.0:7860，不要改。
+# V2N_DATA_DIR 指定数据根目录；PLAYWRIGHT_BROWSERS_PATH 让内核随镜像走。
 # 注意：ENV 的反斜杠续行块里不能放注释，Docker 会把 # 之后当变量值。
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
     PLAYWRIGHT_BROWSERS_PATH=/opt/playwright \
-    V2N_DATA_DIR=/mnt/workspace/video2note \
-    GRADIO_TEMP_DIR=/mnt/workspace/video2note/tmp \
+    V2N_DATA_DIR=/data \
     SERVER_HOST=0.0.0.0 \
-    SERVER_PORT=7860 \
-    DEBUG_MODE=false \
-    APP_ENTRY=app
+    SERVER_PORT=8765
 
 # venv 必须先落地：下面装 Chromium 的 RUN 要用 /opt/venv/bin/python
 COPY --from=builder /opt/venv /opt/venv
 
 # ffmpeg/ffprobe：合并音视频、抽音频、探测时长都依赖它（core/audio.py）
-# ca-certificates：访问模力方舟 / LLM / B站等 HTTPS 接口
+# ca-certificates：访问 ASR / LLM / B站等 HTTPS 接口
 # curl：给 HEALTHCHECK 与排障用；tzdata：日志时间戳
 RUN apt-get update && apt-get install --no-install-recommends -y \
         ffmpeg \
@@ -57,7 +51,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Chromium 仅供 pyktok 抖音签名使用，yt-dlp 主链路不需要。
+# Chromium 仅供抖音解析使用（过 Cloudflare 挑战），B站链路不需要。
 # 想瘦身镜像就构建时传 --build-arg INSTALL_PLAYWRIGHT=0。
 RUN if [ "$INSTALL_PLAYWRIGHT" = "1" ]; then \
         apt-get update && apt-get install --no-install-recommends -y \
@@ -72,15 +66,11 @@ RUN if [ "$INSTALL_PLAYWRIGHT" = "1" ]; then \
 WORKDIR /app
 COPY . /app
 
-# 创空间持久化目录：首次构建时平台不会预建
-RUN mkdir -p /mnt/workspace/video2note
+RUN mkdir -p /data
 
-EXPOSE 7860
+EXPOSE 8765
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:7860/ >/dev/null || exit 1
+    CMD curl -fsS http://127.0.0.1:8765/api/health >/dev/null || exit 1
 
-# 同一份代码两种 UI，切换只改环境变量：
-#   APP_ENTRY=app → Gradio 版（默认，与原创空间行为一致）
-#   APP_ENTRY=run → FastAPI + static/ 本地版（端口同样是 7860）
-CMD ["sh", "-c", "if [ \"$APP_ENTRY\" = \"run\" ]; then exec python -u run.py --host 0.0.0.0 --port 7860; else exec python -u app.py; fi"]
+CMD ["sh", "-c", "exec python -u run.py --host \"${SERVER_HOST}\" --port \"${SERVER_PORT}\""]

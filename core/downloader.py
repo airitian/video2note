@@ -1,13 +1,17 @@
 """下载层：抖音优先走 dlpanda 解析接口，其余平台走 yt-dlp
 
-策略（三级）
+策略（两级）
 ------------
-1. **抖音 -> dlpanda 接口优先**。抖音对服务器 IP 风控极严，yt-dlp 必失败
+1. **抖音 -> dlpanda 接口优先**。抖音对服务器 IP 风控极严，yt-dlp 基本必失败
    （分享页返回 `_$jsvmprt` 挑战脚本；补 uifid 后变成 "Signature Not Found"，
    伪造签名被判`Sign Invalid`）。与其在本地硬啃 a_bogus，不如走已解决该问题的
    通道：解析由 dlpanda 完成，我们只拿它返回的无水印 CDN 直链。
-2. **其余平台 -> yt-dlp**。B站等yt-dlp 稳定且覆盖面广。
-3. **抖音兜底 -> pyktok 自签**，dlpanda 与 yt-dlp 都失败时才启用。
+2. **其余平台 -> yt-dlp**。B站等 yt-dlp 稳定且覆盖面广。
+
+★ 已移除的通道：pyktok（原第 3 级抖音兜底）。
+  移除原因：PyPI 上 `pyktok` 这个名字实际指向**海外版 TikTokApi 7.x**，
+  其 `create_sessions` 硬编码 tiktok.com，对抖音完全无效。
+  抖音解析现在只依赖 dlpanda；失败时报错会直接给出风控原因与代理建议。
 
 刻意不让 yt-dlp 执行任何 ffmpeg 后处理：它对 ffprobe 有硬依赖，
 本机可能只装了 ffmpeg（如 imageio-ffmpeg）。合并与抽音频全部由 audio.py 完成。
@@ -84,7 +88,7 @@ class DownloadError(RuntimeError):
 # ========== B站风控（HTTP 412）相关 ==========
 # 412 Precondition Failed 不是「链接不对」，而是 B站的反爬机器人拦截：
 # 请求缺少 buvid3 这个设备标识就直接拒。yt-dlp 自己会去拿 buvid，
-# 但创空间是云服务器 IP，那一步请求本身就被拦，于是永远拿不到 buvid → 死循环在 412。
+# 但云服务器 IP 上那一步请求本身就被拦，于是永远拿不到 buvid → 死循环在 412。
 # 解决办法：用浏览器 UA 直接调公开的 spi 接口取 buvid3 / buvid4（无需登录），塞进请求头。
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -343,7 +347,7 @@ def download_media(url: str, workdir: Path, max_height: int = 1080,
                    prefer_api: bool = True) -> dict:
     """下载完整视频（含音轨），并抽出 ASR 用的音频。返回元数据 + 文件路径
 
-    优先级：抖音时 dlpanda 接口 -> yt-dlp -> （仅抖音）pyktok 兜底。
+    优先级：抖音时 dlpanda 接口 -> yt-dlp（抖音与B站共用）。
     ``prefer_api=False`` 可强制跳过接口通道，用于对比排查。
     """
     url = extract_url(url)
@@ -379,20 +383,8 @@ def download_media(url: str, workdir: Path, max_height: int = 1080,
     except Exception as e:                     # 兜底，避免非预期异常直接穿透
         first_err = DownloadError(_humanize_error(e))
 
-    if platform != "douyin":
-        raise first_err
-
-    # ---- 第 3 级：抖音兜底（pyktok 自签 a_bogus）----
     tail = f"解析接口也失败：{_short(api_err)}；" if api_err else ""
-    if progress:
-        progress(3.0, f"{tail}yt-dlp 也未能解析，改用 pyktok 重试")
-    try:
-        from . import douyin
-
-        return douyin.download(url, workdir, progress)
-    except Exception as e:
-        raise DownloadError(
-            f"{tail}yt-dlp 失败：{first_err}；pyktok 也失败：{_humanize_error(e)}")
+    raise DownloadError(f"{tail}yt-dlp 失败：{first_err}")
 
 
 def _short(e: Exception, limit: int = 60) -> str:
@@ -544,7 +536,7 @@ def _humanize_error(e: Exception) -> str:
     # yt-dlp 对未登录的抖音固定抛这句，且措辞会让人以为"随便来点新鲜 Cookie 就行"。
     # 实测：无 Cookie 时抖音返回的是 JS 挑战页，必须登录态 Cookie 才有数据。
     if "fresh cookies" in low:
-        from .douyin import cookie_hint
+        from .config import cookie_hint
 
         return cookie_hint()
     if "unsupported url" in low or "no video formats" in low or "not a valid url" in low:

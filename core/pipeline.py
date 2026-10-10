@@ -1,15 +1,14 @@
 """流水线编排：下载/接收文件 -> 抽音频 -> 切片 -> ASR 转写 ->（按需触发）LLM 整理
 
-对外暴露两种驱动方式，共用同一套业务逻辑与状态机：
-- submit() / submit_polish()：线程池异步版，给 FastAPI 用（SSE 轮询状态）
-- transcribe_sync() / polish_sync()：同步版 + emit 回调，给 Gradio 用（实时流式更新）
+对外暴露的驱动方式：
+- submit() / submit_polish()：线程池异步版，给 FastAPI 用（SSE 推送状态与日志）
 """
 from __future__ import annotations
 
 import hashlib
 import shutil
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -62,6 +61,7 @@ def _publish_segments(t: store.Task, segments: list[dict]) -> None:
     segs = sorted((s for s in segments if s), key=lambda x: x.get("start", 0))
     t.segments = segs
     t.transcript = asr.segments_to_text(segs)
+    store.save(t)          # 落盘，刷新页面也能看到已转出的部分
 
 
 def _check_cancel(t: store.Task) -> None:
@@ -138,9 +138,9 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
 
     _set(t, "slicing", 0.0, "音频标准化与切片", emit=emit)
     try:
-        chunk_seconds = int(s.get("chunk_seconds") or 600)
+        chunk_seconds = int(s.get("chunk_seconds") or 180)
     except ValueError:
-        chunk_seconds = 600
+        chunk_seconds = 180
     chunks = audio.prepare_chunks(Path(meta["audio_path"]), workdir / "chunks", chunk_seconds)
     t.log("info", f"音频处理完成，共 {len(chunks)} 个分片")
 
@@ -164,8 +164,10 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
         done = 0
         lock = threading.Lock()
         with ThreadPoolExecutor(max_workers=max(maxw, 1)) as ex:
+            # 必须按「谁先完成」取结果：若按提交顺序等，第 1 片卡住时
+            # 后面先跑完的分片没法提前推送，界面就一直空着
             futs = [ex.submit(do_chunk, i) for i in range(len(chunks))]
-            for f in futs:
+            for f in as_completed(futs):
                 segs = f.result()
                 with lock:
                     done += 1
@@ -459,48 +461,6 @@ def _existing_media(t: store.Task) -> dict | None:
         meta = dict(meta)
         meta["video_path"] = ""   # 视频已被清理，仅复用音频
     return meta
-
-
-def transcribe_sync(t: store.Task, emit: EmitFn = None) -> bool:
-    """同步跑完『获取媒体 → 转写』，emit(stage, pct, msg) 用于实时回传进度"""
-    t.status = "running"
-    store.save(t)
-    return _run_and_catch(t, lambda: _transcribe_body(t, emit))
-
-
-def polish_sync(t: store.Task, style: str, emit: EmitFn = None,
-                force: bool = False) -> bool:
-    """同步跑完 AI 整理，失败时回退到「已转写」状态。
-
-    同一任务加锁串行：连点两次时，第二次会等第一次结束后命中幂等直接复用。
-    """
-    with _task_lock(t.id):
-        need, reason = polish_needed(t, style, force)
-        if not need:
-            _mark_idempotent_hit(t, reason)
-            return True
-        t.status = "running"
-        t.error = ""
-        store.save(t)
-        try:
-            _polish_body(t, style, emit, force=True)
-            return True
-        except InterruptedError as e:
-            t.status = "canceled"
-            t.error = str(e)
-            t.log("warn", str(e))
-            store.save(t)
-            return False
-        except Exception as e:
-            t.status = "transcribed"
-            t.stage = "transcribed"
-            t.spercent = 100
-            t.percent = RANGES["transcribing"][1]
-            t.error = str(e)
-            t.message = "AI 整理失败，可重试"
-            t.log("error", str(e))
-            store.save(t)
-            return False
 
 
 def _meta_from_file(src: Path, workdir: Path) -> dict:

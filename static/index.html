@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>抖音 / B站 视频转文字</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=20261011g">
 </head>
 <body>
 <header class="topbar">
@@ -17,15 +17,19 @@
   </div>
   <div class="topbar-right">
     <span id="health" class="health"></span>
-    <button id="btn-history" class="btn ghost">🕘 历史记录 ▾</button>
+    <button id="btn-history" class="btn ghost">🕘 历史记录</button>
+    <button id="btn-logs" class="btn ghost">📋 处理日志</button>
     <button id="btn-settings" class="btn ghost">设置</button>
   </div>
 </header>
 
-<div id="history-panel" class="history hidden">
-  <div class="history-head">历史记录 <button id="btn-history-close" class="icon">×</button></div>
-  <div id="history-list" class="history-list"></div>
-</div>
+<div class="layout">
+<aside id="side-left" class="side">
+  <div class="card side-card">
+    <div class="pane-head">历史记录</div>
+    <div id="history-list" class="history-list"></div>
+  </div>
+</aside>
 
 <main>
   <section class="card composer">
@@ -41,12 +45,12 @@
       </div>
       <div class="input-col">
         <div class="tab-head">或粘贴抖音 / B站分享链接</div>
-        <textarea id="url" rows="5" placeholder="粘贴 https://v.douyin.com/... 、https://www.bilibili.com/video/BV... 或 https://b23.tv/... 分享链接（可连同标题一起粘贴）"></textarea>
+        <div class="url-row">
+          <textarea id="url" rows="4" placeholder="粘贴 https://v.douyin.com/... 、https://www.bilibili.com/video/BV... 或 https://b23.tv/... 分享链接（可连同标题一起粘贴）"></textarea>
+          <button id="btn-start" class="btn primary big">开始转写</button>
+        </div>
+        <span class="opts-hint">支持抖音 / B站链接，可连同分享文案一起粘贴；也支持直接拖入本地音视频</span>
       </div>
-    </div>
-    <div class="opts-row">
-      <button id="btn-start" class="btn primary big">开始转写</button>
-      <span class="opts-hint">支持抖音 / B站链接，可连同分享文案一起粘贴；也支持直接拖入本地音视频</span>
     </div>
   </section>
 
@@ -62,11 +66,9 @@
     <div class="prow" data-stage="transcribing"><span class="plabel">语音转写</span><div class="pbar"><i></i></div><span class="ppct">0%</span></div>
     <div class="prow" data-stage="polishing"><span class="plabel">AI 整理</span><div class="pbar"><i></i></div><span class="ppct">0%</span></div>
     <div id="ws-error" class="wserr hidden"></div>
-    <div id="ws-logs" class="logs hidden"></div>
     <div class="pfoot">
       <span id="ws-msg" class="footmsg"></span>
       <span class="spacer"></span>
-      <button class="btn small" id="btn-logs">日志</button>
       <button class="btn small retry hidden" id="btn-retry">↻ 重试</button>
     </div>
   </section>
@@ -104,6 +106,14 @@
   </section>
 </main>
 
+<aside id="side-right" class="side">
+  <div class="card side-card">
+    <div class="pane-head">处理日志</div>
+    <div id="ws-logs" class="logs"><div class="empty">暂无日志</div></div>
+  </div>
+</aside>
+</div>
+
 <div id="settings-modal" class="modal hidden">
   <div class="modal-body">
     <div class="modal-head">
@@ -122,6 +132,6 @@
 
 <div id="toast" class="toast hidden"></div>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=20261011g"></script>
 </body>
 </html>

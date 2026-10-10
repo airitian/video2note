@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def _resolve_data_dir() -> Path:
     """数据目录优先级：
     1. 环境变量 V2N_DATA_DIR（本地开发 / 自定义挂载）
-    2. ModelScope 持久化目录 /mnt/workspace（创空间重启可保留数据）
+    2. /mnt/workspace（若存在且可写，用于容器持久化，重启可保留数据）
     3. 项目内 data/（兜底）
     """
     custom = (os.getenv("V2N_DATA_DIR") or "").strip()
@@ -57,7 +57,7 @@ DEFAULTS: dict[str, str] = {
     "llm_max_tokens": "16384",   # 推理模型会先输出 thinking，额度太小会导致正文被截断
     "llm_temperature": "0.3",
     # ---- 工程参数 ----
-    "chunk_seconds": "600",
+    "chunk_seconds": "180",
     "max_concurrency": "4",
     "cookie_text": "",                       # 抖音 Cookie 文本，自动落盘成 cookies.txt
     "cookie_text_bili": "",                  # B站 Cookie 文本，落盘成 cookies_bili.txt
@@ -217,7 +217,7 @@ def _env_names(key: str) -> tuple[str, ...]:
     密钥类额外兼容常见的 Token 变量名。"""
     base = "V2N_" + key.upper()
     alias = {
-        "asr_api_key": ("MOARK_API_TOKEN", "GITEE_AI_API_TOKEN", "ASR_API_KEY", "MODELSCOPE_API_TOKEN"),
+        "asr_api_key": ("MOARK_API_TOKEN", "GITEE_AI_API_TOKEN", "ASR_API_KEY"),
         "llm_api_key": ("PATEWAY_API_KEY", "ANTHROPIC_API_KEY", "LLM_API_KEY"),
         "llm_protocol": ("LLM_PROTOCOL",),
     }
@@ -480,6 +480,123 @@ def public_settings() -> dict:
     # 密钥落盘位置，页面据此提示用户去哪里改
     out["_secrets_file"] = str(SECRETS_FILE)
     return out
+
+
+# ============================ 抖音失败原因提示 ============================
+# 原本随 core/douyin.py 一起维护，该文件已随 pyktok 兜底通道移除；
+# 这两段文案是实测踩坑的结论，对用户排障有用，因此保留在此。
+DOUYIN_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+
+# 抖音的失败原因有两种，解法完全不同，不能混为一谈：
+#
+#   missing  没配 Cookie   -> 去设置页粘贴 Cookie
+#   blocked  IP 被风控     -> 配代理或换网络（换 Cookie 没用！）
+#
+# ★ 踩过的坑：曾经用 `aweme/v1/web/user/profile/self` 的 status_code=8
+#   当作「登录态作废」的判据 —— **这个判据是错的**，已被对照实验推翻：
+#   无 Cookie / 伪造 sessionid / 随机垃圾串 打这个接口，返回值**完全相同**
+#   都是 status_code=8。说明 8 只表示「这个接口需要签名参数」，与登录态无关。
+#   后来用真实 Chromium 验证，Cookie 登录态完全有效，
+#   真正卡住的是 IP 被风控（滑块验证码）。
+#
+# 所以这里**不猜测 Cookie 是否过期**，只如实区分「没配 Cookie」和「被风控」。
+# 后者靠页面特征判定（验证码中间页 / JS 挑战页），不靠接口返回码。
+COOKIE_MISSING_HINT = (
+    "未配置抖音 Cookie，无法解析。\n\n"
+    "实测确认：未配置 Cookie 时，抖音分享页返回的是一段 JS 虚拟机挑战脚本"
+    "（`_$jsvmprt`），里面没有任何作品数据，yt-dlp 也会报"
+    "\"Fresh cookies (not necessarily logged in) are needed\"（这句措辞有误导，"
+    "并不是\"放久了的 Cookie\"问题）。\n\n"
+    "解决办法：在「⚙️ 设置」页的「抖音 Cookie 文本」框粘贴浏览器里的抖音 Cookie，"
+    "保存后立即生效（F12 → Network → 任意 douyin.com 请求 → "
+    "Request Headers → 复制整段 Cookie）。\n\n"
+    "注意：抖音与B站 Cookie 必须分开填，混填会因域名不匹配全部失效。"
+)
+
+COOKIE_BLOCKED_HINT = (
+    "请求被抖音风控拦截（IP 层面），**不是 Cookie 的问题**。\n\n"
+    "实测现象：用真实 Chromium 加载已登录的 Cookie 打开作品页，"
+    "停在「验证码中间页」，要求拖动滑块完成验证。\n\n"
+    "关键点：这种情况**重新获取 Cookie 也解决不了** —— "
+    "拦在前面的是 IP 风险识别，与登录态无关。\n\n"
+    "解决办法（按推荐顺序）：\n"
+    "1. 在「⚙️ 设置」页的**代理**栏填一个可用代理（最直接）\n"
+    "2. 换网络环境（如手机热点）\n"
+    "3. 关掉可能劫持流量的代理软件后重试\n\n"
+    "抖音对云服务器 IP 的风控尤其严格，家用宽带一般不触发。"
+)
+
+# 兼容旧引用
+DOUYIN_COOKIE_HINT = COOKIE_MISSING_HINT
+
+# 抖音风控拦截的页面特征
+_DOUYIN_BLOCK_MARKERS = ("验证码中间页", "请完成下列验证后继续",
+                         "captcha", "_$jsvmprt", "__ac_signature")
+
+
+def cookie_header() -> str:
+    """把配置里的 cookie_text 拼成请求头用的 Cookie 串
+
+    Cookie 里常混有中文（如 `SEARCH_RESULT_LIST_TYPE={"keyword":"搜索词"}`），
+    而 HTTP 头只能按 latin-1 编码，直接发送会抛
+    `'latin-1' codec can't encode characters in position N`。
+    这里对名/值统一做 ASCII 化处理，与落盘逻辑保持一致。
+    """
+    s = load_settings()
+    text = (s.get("cookie_text") or "").strip()
+    if not text:
+        return ""
+    # 去掉我们为落盘而加的 `# domain=xxx` 提示行
+    text = re.sub(r"^#\s*domain\s*=\s*\S+[ \t]*\n?", "", text, flags=re.I | re.M)
+    parts = []
+    for chunk in re.split(r"[;\n]", text):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        k, _, v = chunk.partition("=")
+        k = _sanitize_cookie_component(k.strip())
+        if not k:
+            continue
+        parts.append(f"{k}={_sanitize_cookie_component(v.strip())}")
+    return "; ".join(parts)
+
+
+def cookie_state() -> str:
+    """探测抖音请求的受阻原因：ok / missing / blocked / unknown
+
+    只区分「没配 Cookie」与「被风控」，**不猜测 Cookie 是否过期**——
+    公开接口在缺签名参数时一律返回 status_code=8，无论 Cookie 是否有效
+    （已用对照实验验证），拿它判断登录态必然误报。
+    """
+    ck = cookie_header()
+    if not ck:
+        return "missing"
+    try:
+        import requests
+
+        r = requests.get(
+            "https://www.iesdouyin.com/share/video/1/",
+            headers={"User-Agent": DOUYIN_UA, "Cookie": ck,
+                     "Referer": "https://www.iesdouyin.com/"},
+            timeout=(8, 20),
+        )
+        html = r.text or ""
+    except Exception:
+        return "unknown"
+    low = html.lower()
+    if any(m in low or m in html for m in _DOUYIN_BLOCK_MARKERS):
+        return "blocked"
+    return "ok"
+
+
+def cookie_hint() -> str:
+    """按实际受阻原因返回提示
+
+    两种情况解法相反：missing 要去填 Cookie，blocked 要换 IP 或加代理。
+    弄反会让用户白折腾 —— 之前就发生过「明明配了 Cookie 却被告知没配」。
+    """
+    return COOKIE_BLOCKED_HINT if cookie_state() == "blocked" else COOKIE_MISSING_HINT
 
 
 def ff_bin(name: str) -> str:

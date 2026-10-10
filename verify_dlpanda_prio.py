@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""download_media 三级优先级的真实调度验证（不实际下载大文件）"""
+"""download_media 两级优先级的真实调度验证（不实际下载大文件）
+
+pyktok 第三级兜底移除后，本脚本同步为两级：dlpanda 接口 -> yt-dlp。
+"""
 import sys
 from pathlib import Path
 
@@ -30,12 +33,6 @@ print("=" * 64)
 
 orig_api = dlpanda.download_video
 orig_ydl = downloader._ytdlp_download
-orig_dy = None
-try:
-    from core import douyin as dy_mod
-    orig_dy = dy_mod.download
-except Exception:
-    dy_mod = None
 
 DONE = {"video_path": str(WORK / "s.mp4"), "audio_path": str(WORK / "a.mp3"),
         "title": "T", "extractor": "dlpanda"}
@@ -53,20 +50,12 @@ def fake_ydl(*a, **k):
     return dict(DONE)
 
 
-def fake_dy(*a, **k):
-    CALLS.append("pyktok")
-    return dict(DONE)
-
-
 dlpanda.download_video = fake_api
 downloader._ytdlp_download = fake_ydl
-if dy_mod:
-    dy_mod.download = fake_dy
 
 r = downloader.download_media("https://v.douyin.com/abc/", WORK)
 ck("接口被调用", "api" in CALLS, CALLS)
 ck("yt-dlp 未被调用", "ytdlp" not in CALLS, CALLS)
-ck("pyktok 未被调用", "pyktok" not in CALLS, CALLS)
 ck("返回结果原样透传", r.get("extractor") == "dlpanda")
 
 print()
@@ -86,11 +75,10 @@ dlpanda.download_video = fail_api
 r = downloader.download_media("https://v.douyin.com/abc/", WORK)
 ck("接口被调用", "api" in CALLS, CALLS)
 ck("降级到 yt-dlp", "ytdlp" in CALLS, CALLS)
-ck("接口失败时不进 pyktok", "pyktok" not in CALLS, CALLS)
 
 print()
 print("=" * 64)
-print("三、接口与 yt-dlp 都失败 -> pyktok 兜底，且错误含接口原因")
+print("三、接口与 yt-dlp 都失败 -> 直接抛错，且错误同时含两者原因")
 print("=" * 64)
 
 CALLS.clear()
@@ -102,33 +90,24 @@ def boom_ydl(*a, **k):
 
 
 downloader._ytdlp_download = boom_ydl
-def fail_pyktok(*a, **k):
-    CALLS.append("pyktok")
-    raise RuntimeError("pyktok 签名失败：Cookie 缺失")
-
-
-if dy_mod:
-    dy_mod.download = fail_pyktok
 
 try:
     downloader.download_media("https://v.douyin.com/abc/", WORK)
     ck("应抛错", False)
 except downloader.DownloadError as e:
     msg = str(e)
-    ck("接口被调用", CALLS[0] == "api", CALLS)
+    ck("接口被调用", CALLS and CALLS[0] == "api", CALLS)
     ck("接口失败后调用 yt-dlp", "ytdlp" in CALLS, CALLS)
     ck("错误含接口失败原因", "Cloudflare" in msg, msg[:120])
     ck("错误含 yt-dlp 原因", "Fresh cookies" in msg)
-    if dy_mod:
-        ck("pyktok 兜底被调用", "pyktok" in CALLS, CALLS)
-        ck("错误含 pyktok 原因", "pyktok 也失败" in msg)
+    ck("仅两级调用，不再有第三通道", CALLS == ["api", "ytdlp"], CALLS)
 
 print()
 print("=" * 64)
 print("四、B站 -> 不走抖音接口，仍用 yt-dlp")
 print("=" * 64)
 
-# 前一节故意让 yt-dlp 持续失败，这里必须恢复正常实现，
+# 上一节故意让 yt-dlp 持续失败，这里必须恢复正常实现，
 # 否则后面的用例会一直撞上同一个假异常（测试自身状态泄漏）。
 downloader._ytdlp_download = fake_ydl
 CALLS.clear()
@@ -173,8 +152,6 @@ except Exception as e:
 # 还原
 dlpanda.download_video = orig_api
 downloader._ytdlp_download = orig_ydl
-if dy_mod and orig_dy:
-    dy_mod.download = orig_dy
 
 print()
 print("=" * 64)

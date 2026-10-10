@@ -3,31 +3,9 @@
 粘贴抖音 / B站链接或直接上传音视频，自动完成：**下载完整视频 → 语音转写 → AI 去口语化 / 纠错 / 排版**，输出带时间轴的转写稿与可直接使用的 Markdown 笔记。
 
 ```
-URL / 文件 → yt-dlp(视频轨+音频轨) → ffmpeg(合并 mp4 / 抽 16k 音频 / 静音点切片)
+URL / 文件 → 解析下载(视频轨+音频轨) → ffmpeg(合并 mp4 / 抽 16k 音频 / 静音点切片)
     → 在线 ASR(带时间戳) → LLM(map-reduce 整理) → 视频预览 + 笔记 + 导出 md/srt
 ```
-
-## 两个版本怎么区分
-
-仓库里有**两个前端**，业务内核（`core/`）完全共用，只换 UI 层：
-
-| |🖥️ 本地版（FastAPI + 自绘前端） | ☁️ Gradio 版（创空间默认） |
-|---|---|---|
-| 入口文件 | **`run.py`** | **`app.py`** |
-| 启动命令 | `python run.py --port 8765` | `python app.py`（默认 `0.0.0.0:7860`） |
-| 技术栈 | FastAPI + 原生 HTML/CSS/JS（`static/`） | Gradio 组件库 |
-| 界面外观 | 自绘，深色卡片式布局 | Gradio 默认外观 |
-| 端口 | 8765（可改） | **7860 固定**（ModelScope 硬性要求） |
-| 默认地址 | http://127.0.0.1:8765 | http://127.0.0.1:7860 |
-| 适合场景 | 本机日常使用，界面更清爽 | 部署到创空间 / 分享给他人 |
-| 前端文件 | `static/index.html`、`app.js`、`style.css` | 无独立前端文件，全部写在 `app.py` |
-| 创空间部署 | Docker 可用（`APP_ENTRY=run`） | Docker 默认入口（`APP_ENTRY=app`） |
-
-**判别口诀**：看到 `run.py` → 本地版；看到 `app.py` → Gradio 版。
-两者可同时运行，互不冲突（端口不同），共用同一个 `data/` 目录与配置。
-部署到创空间时用 `Dockerfile`，镜像内通过 `APP_ENTRY` 环境变量决定启动哪一套。
-
-> 想只用其中一个？删掉另一个入口文件即可，`core/` 不受影响。
 
 ## 快速开始
 
@@ -35,18 +13,16 @@ URL / 文件 → yt-dlp(视频轨+音频轨) → ffmpeg(合并 mp4 / 抽 16k 音
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2A. 本地版（自绘界面，推荐日常使用）
-python run.py --port 8765        # 打开 http://127.0.0.1:8765
+# 2. 装浏览器内核（抖音解析需要，只跑 B站可跳过）
+python -m playwright install --with-deps chromium
 
-# 2B. Gradio 版（部署到 ModelScope 创空间时用这个）
-python app.py                    # 打开 http://127.0.0.1:7860
+# 3. 启动服务
+python run.py --port 8765          # 打开 http://127.0.0.1:8765
 
-# 3. 在页面右上角「设置」中填入 API Token，回到「转写工作台」粘贴链接即可
+# 4. 在页面右上角「设置」中填入 API Token，回到「转写工作台」粘贴链接即可
 ```
 
-> 两个版本功能一致（转写、换风格重写、历史回显、多风格缓存都支持）。
-> ModelScope 创空间的 **Docker 类型**里两套都能跑，默认用 Gradio 版；
-> 想换成自绘界面，在环境变量里设 `APP_ENTRY=run` 即可，见[部署章节](#部署到modelscope-创空间)。
+> 对外提供服务时加 `--host 0.0.0.0`；在反代后面再加 `--root-path /xxx`。
 
 ## 前置条件
 
@@ -100,7 +76,7 @@ Anthropic 协议要点（已实现）：
 ## 配置方式（三选一，优先级从低到高）
 
 ```bash
-# 方式一：环境变量（推荐用于 ModelScope Secrets）
+# 方式一：环境变量（推荐用于服务器 / CI，容器平台 Secrets 同样适用）
 export V2N_ASR_API_KEY=你的Token          # 别名 MOARK_API_TOKEN 亦可
 export V2N_ASR_BASE_URL=https://api.moark.com/v1
 export V2N_ASR_MODEL=SenseVoiceSmall
@@ -120,9 +96,9 @@ cp .env.example .env
 ## 功能
 
 - 双入口：**粘贴链接**（支持整段分享文案，自动抠出 URL）/ **上传本地音视频**
-- **两个前端共用同一套内核**：🖥️ 本地版 `run.py`（FastAPI + 自绘界面，8765）与 ☁️ Gradio 版 `app.py`（创空间，7860）
 - **下载完整视频**（最高 1080P）并在页面内直接播放
-- 长音频自动按**静音点**切片并并发转写（默认 10 分钟一片），避免句子被硬切
+- 长音频自动按**静音点**切片并**并发**转写（默认 180 秒一片），避免句子被硬切；
+  各片完成即增量推送，文字稿**边转边出**，不用等全部跑完
 - ASR 不返回时间戳时按句长比例估算时间轴，保证字幕可用
 - LLM 三种风格：结构化笔记 / 公众号文章 / 仅清洗润色；长文本走 **map-reduce**
   （先抽专有名词表 → 分块并行清洗 → 合并结构化）
@@ -135,26 +111,17 @@ cp .env.example .env
 
 ## 界面结构
 
-两个版本的主界面结构一致（工作台 + 历史记录 + 设置）。
-
-☁️ Gradio 版页签：
-
-| 页签 | 内容 |
-|---|---|
-| 🎧 转写工作台 | 输入来源（链接/上传）、成稿风格；右侧视频预览与状态日志；下方转写文字稿 + AI 整理稿 |
-| 🗂 历史记录 | 任务表格（选中行 → 载入）、删除、刷新 |
-| ⚙️ 设置 | 环境自检、密钥与模型、切片与并发、Cookie、磁盘维护 |
-
-🖥️ 本地版（自绘界面）：
+三栏布局：左侧历史记录 / 中间主工作区 / 右侧处理日志。
 
 | 区域 | 内容 |
 |---|---|
-| 输入区 | 链接拖拽/粘贴 + 文件上传 + 成稿风格按钮组 |
+| 输入区 | 链接输入框（右侧「开始转写」按钮）+ 文件上传 + 成稿风格按钮组 |
 | 工作区 | 左侧视频预览、右侧转写文字稿（播放时自动高亮滚动） |
 | 文稿区 | AI 整理稿 + 风格切换按钮（多风格缓存，已生成的风格不再重复调用模型） |
-| 右侧栏 | 历史记录（点击直接回显全部内容）+ 日志 |
+| 左栏 | 历史记录，点击直接回显视频 / 文字稿 / AI 整理稿 |
+| 右栏 | 处理日志，自动滚到底 |
 
-> 两个版本都已按精简需求隐藏参数设置与导出下载入口（后端接口仍保留）。
+> 参数设置与导出下载入口已按精简需求隐藏（后端接口仍保留）。
 
 ## 平台注意事项
 
@@ -165,9 +132,12 @@ cp .env.example .env
 下载优先级：
 
 ```
-抖音：dlpanda 接口 → yt-dlp → pyktok 兜底
+抖音：dlpanda 接口 → yt-dlp
 B站：yt-dlp
 ```
+
+> 原第三级 pyktok 兜底已移除 —— PyPI 上的 `pyktok` 实为海外版 TikTokApi
+> （硬编码 tiktok.com），对抖音无效，属死代码。
 
 ### 为什么抖音要改用接口
 
@@ -270,21 +240,13 @@ yt-dlp 在**发出请求之前**就会抛这个错。
 且不会对已有的 `%XX` 二次编码）。若仍看到此报错，说明 `data/cookies.txt` 是旧版本生成的，
 删掉它后在设置页重新保存一次 Cookie 即可重建。
 
-**`No module named 'pyktok'`**
+**`请求被抖音风控拦截` / `Signature Not Found`**
 
-pyktok 是可选依赖，服务器上默认不装。此时程序会自动跳过签名、
-改走移动端分享页抓取；若抖音仍解析失败，按上面的命令补装即可：
+这是 **IP 层面的风控**，与登录态无关，换 Cookie 解决不了。按顺序试：
 
-```bash
-pip install pyktok
-python -m playwright install --with-deps chromium
-```
-
-排查要点：
-
-1. 确认 Cookie 里含 `s_v_web_id`、`ttwid`、`sessionid`
-2. 确认内核已装：`python -c "import os,playwright; print(os.path.exists(playwright.sync_api.sync_playwright().start().chromium.executable_path))"`
-3. 注意 `pyktok` 内部默认导航 `tiktok.com`（国内不可达），代码里已用 `starting_url` 指向抖音
+1. 在「⚙️ 设置」页的**代理**栏填一个可用代理（最直接）
+2. 换网络环境（例如手机热点）
+3. 确认解析接口可用：健康检查里 `douyin_api` 与 `playwright` 都应为 `true`
 
 ### Cookie 配置（抖音基本必填）
 
@@ -328,325 +290,117 @@ python -m playwright install --with-deps chromium
 
 ```
 video2note/
-├── app.py                  # ☁️【Gradio 版入口】创空间默认，固定 7860
-├── run.py                  # 🖥️ 【本地版入口】FastAPI + static/ 自绘界面，默认 8765
+├── run.py                  # 启动入口：FastAPI + static/ 自绘界面，默认 127.0.0.1:8765
 ├── requirements.txt        # ⭐ 依赖列表
-├── Dockerfile              # ⭐ ModelScope 创空间 Docker 类型镜像（0.0.0.0:7860）
-├── ms_deploy.json          # ⭐ 创空间部署配置（sdk_type=docker, port=7860）
-├── .dockerignore           # ⭐ 排除 data/媒体/缓存，减小构建上下文
+├── Dockerfile              # 通用部署镜像（监听 0.0.0.0:8765）
+├── .dockerignore           # 排除 data/ 媒体/缓存，减小构建上下文
 ├── README.md
-├── .env.example            # 本地环境变量样例
+├── .env.example            # 环境变量样例
 ├── .gitignore
-├── .gitattributes          # 强制仓库内一律 LF（CRLF 会触发平台回滚）
-├── core/                   # 业务内核（两个版本共用，与入口解耦）
+├── .gitattributes          # 强制仓库内一律 LF
+├── core/                   # 业务内核
 │   ├── config.py           配置：默认值 <- 环境变量 V2N_* <- settings.json
-│   ├── downloader.py       yt-dlp 优先取流下载，抖音失败回退 pyktok、文案中提取 URL
-│   ├── douyin.py           抖音专用兜底：pyktok 生成 a_bogus 签名后请求 aweme/detail
+│   ├── downloader.py       下载调度：抖音走 dlpanda 接口，其余走 yt-dlp
+│   ├── dlpanda.py          抖音解析通道：浏览器过 CF + CDN 直链下载
+│   ├── curlparse.py        解析「粘贴 curl」得到自定义请求模板
 │   ├── audio.py            ffmpeg 合并/抽音频/转码、静音点切片、时长探测
 │   ├── asr.py              在线语音识别（/v1/audio/transcriptions）+ 事件标记清洗
 │   ├── llm.py              LLM 整理：anthropic/openai 双协议、map-reduce、按风格缓存
 │   ├── store.py            任务存储（内存索引 + data/tasks/*.json）
-│   ├── exporters.py        导出 md / txt / srt / raw / json（两个版本已隐藏入口）
-│   ├── pipeline.py         流水线编排，同时提供线程池版与同步回调版
-│   └── main.py             FastAPI 接口（🖥️ 仅本地版使用，含 SSE 实时进度）
-├── static/                 # 🖥️ 仅本地版使用的前端：index.html / app.js / style.css
+│   ├── exporters.py        导出 md / txt / srt / raw / json（入口已隐藏）
+│   ├── pipeline.py         流水线编排（线程池异步版）
+│   └── main.py             FastAPI 接口，含 SSE 实时进度与日志
+├── static/                 前端：index.html / app.js / style.css
+├── verify_*.py             回归脚本（改完代码跑一遍）：
+│   verify_dlpanda_prio.py    两级下载调度：接口优先、失败降级、错误文案
+│   verify_dy_state.py        Cookie 状态判定与提示分流
+│   verify_mux.py              ffmpeg 合并（-c copy 优先，必要时转 AAC）
+│   verify_realtime.py        转写结果是否增量推送
+│   verify_ui.py               端到端 UI 冒烟
 ├── scripts/
-│   ├── sync_to_studio.sh            # 一键同步到创空间（含 Dockerfile/密钥/体积校验）
-│   ├── verify_dockerfile.py         # Dockerfile 静态校验（无需 Docker 环境）
-│   └── verify_dockerfile.selftest.py  # 校验器自测（故意改坏确认能拦住）
+│   ├── deploy_debian.sh              # Debian/Ubuntu 一键部署
+│   ├── verify_dockerfile.py          # Dockerfile 静态校验（无需 Docker 环境）
+│   └── verify_dockerfile.selftest.py # 校验器自测（故意改坏确认能拦住）
 └── data/                   运行时生成：tasks / media / export / settings.json / secrets.json
 ```
 
-## 部署到 ModelScope 创空间
+> 校验类脚本用托管虚拟环境的解释器跑（依赖装在
+> `C:\Users\24838\.workbuddy\binaries\python\envs\default`）。
 
-本项目提供 **Docker** 类型的 `Dockerfile`（详见 <https://modelscope.cn/docs/studios/docker>），
-`app.py`（☁️ Gradio 版）与 `run.py`（🖥️ FastAPI 版）都能在同一镜像里跑。
+## 部署
 
-### 平台硬性要求（Docker 类型）
-
-官方 schema（`https://modelscope.cn/api/v1/studios/deploy_schema.json`）里对 Docker 类型的规定：
-
-| 要求 | 说明 | 本项目如何满足 |
-|---|---|---|
-| 仓库根目录必须有 `Dockerfile` | 缺了就无法构建 | 已提供 |
-| 服务监听 `0.0.0.0:7860` | `port` 只能填 7860，**8080 被平台占用** | `ENV SERVER_HOST/SERVER_PORT` 固定 |
-| 不使用 `Authorization`/`X-modelscope-*`/`X-studio-*` 响应头 | 平台代理保留头 | 代码未设置这些头 |
-| 超过 100MB 的文件必须走 Git LFS | 否则平台拒绝 | 仓库无大文件，同步脚本会校验 |
-| 默认分支 `master`，不要 force push | 平台按master 触发构建 | 同步脚本走普通 push |
-| 密钥禁止硬编码 | 必须用环境变量 / Secrets | 同步脚本与 CI 双重扫描 |
-| 数据持久化目录 `/mnt/workspace` | 重启会丢数据 | `V2N_DATA_DIR=/mnt/workspace/video2note` |
-
-> ⚠️ **Docker 类型需要先在魔搭完成阿里云账号绑定与实名认证**，
-> 否则无法创建/切换，见 <https://modelscope.cn/docs/studios/docker>。
-
-### 1. 首次部署 / 从 Gradio 切换到 Docker
-
-创空间类型选 **Docker**。仓库已带`ms_deploy.json`，通过「快速创建」上传本目录即可自动识别：
-
-```json
-{
-  "sdk_type": "docker",
-  "resource_configuration": "platform/2v-cpu-16g-mem",
-  "port": 7860
-}
-```
-
-- `platform/2v-cpu-16g-mem`：2 vCPU + 16GB 内存，免费额度，够用；
-- `xgpu/*`：需要加入 xGPU 组织并申请审批，本项目用不到（ASR 与 LLM 都走远程 API，不需要本地 GPU）。
-
-**已存在的创空间切换类型**：在创空间「设置 → 运行时」里把 SDK 从 Gradio 改成 Docker 并保存，
-再推送一次代码触发构建。切换会重建环境，**已有 `/mnt/workspace` 下的数据会保留**，但保险起见先备份设置。
-
-### 2. 镜像里装了什么
-
-```
-builder 阶段：python:3.11-slim + venv 装 requirements.txt
-运行阶段：
-  ├─ ffmpeg / ffprobe        合并音视频、抽音频、探测时长（core/audio.py 硬依赖）
-  ├─ ca-certificates         访问模力方舟 / LLM / B站 HTTPS 接口
-  ├─ curl + tzdata           健康检查与时区
-  └─ Chromium (可选)         仅供 pyktok抖音签名，yt-dlp 主链路不需要
-```
-
-Chromium 由构建参数控制，想要小镜像就关掉：
+### 方式一：直接跑（最简单）
 
 ```bash
-docker build --build-arg INSTALL_PLAYWRIGHT=0 -t video2note .
+pip install -r requirements.txt
+python -m playwright install --with-deps chromium   # 抖音解析需要，只跑 B站可跳过
+
+python run.py --host 0.0.0.0 --port 8765
 ```
 
-### 3. 本地验证镜像（可选，但推荐）
+无 systemd 的容器环境用 `nohup` 常驻：
 
 ```bash
-# 静态校验：不用 Docker 也能跑，检查端口/指令顺序/COPY 源/密钥硬编码
-python scripts/verify_dockerfile.py
+nohup python -u run.py --host 0.0.0.0 --port 8765 > server.log 2>&1 &
+```
 
-# 校验器自测：故意改坏 Dockerfile，确认能被拦住
-python scripts/verify_dockerfile.selftest.py
+### 方式二：Docker
 
-# 真实构建 + 启动
+```bash
 docker build -t video2note .
-docker run --rm -p 7860:7860 \
-  -e V2N_ASR_API_KEY=xxx -e V2N_LLM_API_KEY=xxx \
-  -v video2note-data:/mnt/workspace \
-  video2note
-# 浏览器打开 http://127.0.0.1:7860
+docker run -d --name v2n -p 8765:8765 -v /srv/video2note:/data video2note
 ```
 
-> 静态校验器重点检查**指令顺序**：多阶段构建里，
-> `COPY --from=builder /opt/venv` 必须排在所有用`/opt/venv/bin/python` 的 `RUN` 之前，
-> 否则构建会报 `/opt/venv/bin/python: not found`。
-> 本项目踩过这个坑，校验器现在会自动拦截（见 `selftest` 里的回归用例）。
+- 数据目录：`V2N_DATA_DIR`（镜像内默认 `/data`），挂卷后跨重建保留任务与媒体
+- 端口：`SERVER_HOST` / `SERVER_PORT`（默认 `0.0.0.0` / `8765`）
+- 不解析抖音可瘦身：`docker build --build-arg INSTALL_PLAYWRIGHT=0 .`
 
-> 改了 Dockerfile 后，光`git push` 不一定触发重建，
-> 需要在创空间页面点「重新部署」或调用 deploy 接口。
+Debian / Ubuntu 主机也可用 `bash scripts/deploy_debian.sh`。
 
-### 4. 切换用哪套UI
+### 密钥配置
 
-同一镜像通过 `APP_ENTRY` 切换，端口都固定 7860：
+**推荐用环境变量**（页面上的密钥框会自动变为只读，不回显内容）：
 
-| `APP_ENTRY` | 入口 | 界面 |
-|---|---|---|
-| `app`（默认） | `app.py` | Gradio 版，控件多、适合创空间 |
-| `run` | `run.py --host 0.0.0.0 --port 7860` | FastAPI + static/ 自绘界面 |
-
-在创空间环境变量里加 `APP_ENTRY=run` 即可切换，不需要改代码。
-
-### 5. 反代前缀（root_path）
-
-创空间把容器放在网关后面，如果页面能开但 JS/CSS 404，需要给 Gradio 传前缀：
-
-```bash
-GRADIO_ROOT_PATH=/你的前缀     # app.py：留空或 "/" 视为根路径
-ROOT_PATH=/你的前缀# run.py：FastAPI 版同理
-```
-
-不设置时 Gradio 会自己读 `X-Forwarded-Prefix`，大多数情况无需手动配置。
-
-### 密钥托管：优先用环境变量，不要在页面上填
-
-**推荐做法**：在创空间「设置 → Secrets」里配好环境变量，页面上的密钥框会自动变为**只读**，
-不会回显密钥内容，也不用担心有人误改或误存。
-
-配置优先级：**内置默认值 < `data/settings.json` < `data/secrets.json` < 环境变量**（环境变量最高）。
-
-这条顺序很重要——即使某个文件里残留了旧密钥，也会被更高优先级来源覆盖，
-不会出现「换了 Secret 但线上还在用旧密钥」的情况。
-
-### 密钥存放在哪里
-
-Token 和 Cookie **不放**在 `settings.json` 里，而是单独存到 `data/secrets.json`，
-写入时自动收紧为 `600`（仅属主可读写，Windows 上忽略）。
-
-这样做有三个原因：
-
-1. **不会被接口读回浏览器。** 页面「设置」只显示「✅ 已配置 / 未配置」，
-   连打码片段都不给——早前返回过 `sk-1***...***abcd` 这种形式，
-   但 44 位密钥泄露 8 位、且 F12 一开就全看见，等于没脱敏。
-2. **权限能单独收紧。** 普通配置保持常规权限，密钥文件 600。
-3. **迁移/备份更干净。** 复制配置到服务器时不会顺手把密钥带走。
-
-用 `V2N_SECRETS_FILE` 可以把密钥文件放到数据目录之外，
-例如 `/etc/video2note.secrets.json`（配合 `chmod 600` 与 systemd `EnvironmentFile`）。
-
-页面上的 Token 输入框已隐藏，Cookie 框也不回显内容。要改密钥直接编辑该文件：
-
-```json
-{
-  "asr_api_key": "填你的模力方舟 Token",
-  "llm_api_key": "留空则复用 ASR 的 Key",
-  "cookie_text": "抖音 Cookie 整段",
-  "cookie_text_bili": "B站 Cookie 整段"
-}
-```
-
-从旧版本升级时无需手动操作：程序启动会自动把 `settings.json` 里的密钥
-搬进 `secrets.json` 并从原文件删除，重复执行是幂等的。
-
-| 配置项 | 环境变量名（推荐） | 说明 |
+| 配置项 | 环境变量名 | 说明 |
 |---|---|---|
 | ASR 密钥 | `V2N_ASR_API_KEY`（别名 `MOARK_API_TOKEN`） | 模力方舟语音识别 |
 | LLM 密钥 | `V2N_LLM_API_KEY`（留空则复用 ASR） | 大模型整理 |
-| 语音识别语言 | `V2N_ASR_LANGUAGE` | 默认 `zh` |
-| 抖音 Cookie | `V2N_COOKIE_TEXT` 或页面「抖音 Cookie 文本」 | 抖音解析需要 |
-| B站 Cookie | `V2N_COOKIE_TEXT_BILI` 或页面「B站 Cookie 文本」 | 含登录态凭证，缓解 412 |
-| UI 入口 | `APP_ENTRY` | `app`=Gradio（默认）/ `run`=FastAPI |
+| 抖音 Cookie | `V2N_COOKIE_TEXT` | 抖音解析需要 |
+| B站 Cookie | `V2N_COOKIE_TEXT_BILI` | 含登录态凭证，缓解 412 |
 
-> `V2N_COOKIE_FILE` 仍可用于指定一个已有的 Netscape cookies.txt 绝对路径，但优先级低于上面两项，
-> 仅在需要共用同一份 Cookie 文件时才用。
+优先级：**内置默认值 < `data/settings.json` < `data/secrets.json` < 环境变量**（环境变量最高）。
 
-页面上的密钥框在检测到环境变量后会显示「已由环境变量 XXX 托管，页面不可修改」。
+Token 和 Cookie 单独存在 `data/secrets.json`（写入时自动 `chmod 600`，Windows 上忽略），
+不在 `settings.json` 里，接口也只回「已配置 / 未配置」。
+用 `V2N_SECRETS_FILE` 可把它放到数据目录之外。
 
-### 跨平台说明（本地 Windows / 线上 Linux）
+### nginx 反代示例
 
-项目代码本身**不含 Windows 专用代码**，`core/` 全目录扫描无 `winreg`、`os.startfile`、
-`ctypes.windll`，ffmpeg 通过 `shutil.which()` 走 `PATH`，两套系统通用。
-Dockerfile 全部基于 `python:3.11-slim-bookworm`，构建产物与本地一致。
-
-两处需要注意的系统差异：
-
-| 项 | Windows 本地 | 创空间 Linux |
-|---|---|---|
-| 数据目录 | `项目/data/` | `/mnt/workspace/video2note`（自动识别，可持久化） |
-| ffmpeg | 需本机安装 | 镜像内已装，无需额外操作 |
-| Playwright 内核 | 本机已装 | 镜像默认已装（`INSTALL_PLAYWRIGHT=0` 可关） |
-
-关于抖音：主链路是 **yt-dlp**（带 Cookie 时 B站与抖音都能解析），**pyktok 只是兜底**。
-镜像里已默认装好 Chromium，兜底可直接用；2 核 16G 容器跑Chromium 内存偏紧，
-若只想用 yt-dlp，构建时传 `--build-arg INSTALL_PLAYWRIGHT=0` 即可去掉。
-
-### 推送到 GitHub
-
-```bash
-git init
-git add .
-git commit -m "feat: 视频转笔记初版，双入口（本地版 run.py + Gradio 版 app.py）"
-git branch -M main
-git remote add origin https://github.com/<你的用户名>/video2note.git
-git push -u origin main
+```nginx
+location /v2n/ {
+    proxy_pass http://127.0.0.1:8765/;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;          # SSE 必须关缓冲，否则进度不动
+}
 ```
 
-`data/`（含 tasks / media / cookies.txt / settings.json / secrets.json）与 `*.log` 已在 `.gitignore` 中排除，
-`secrets.json` 也单独列了规则，不会把密钥和 Cookie 提交上去。
-首次推送需要在 GitHub 上创建一个空仓库（不要勾选 README）。
+此时启动加 `--root-path /v2n`。
 
-### 手动同步到创空间
-
-创空间仓库：`https://modelscope.cn/studios/viva25/video_txt.git`，
-访问令牌用 [ModelScope 访问令牌](https://modelscope.cn/my/myaccesstoken)。
-
-**方式一：一键脚本（推荐）**
-
-```bash
-#令牌优先级：环境变量 MODELSCOPE_TOKEN >项目根目录 .env 里的 V2N_STUDIO_TOKEN
-MODELSCOPE_TOKEN=<你的访问令牌> bash scripts/sync_to_studio.sh
-```
-
-脚本会做三件事：从 **Git 索引**（不是工作区）取文件内容以保证纯 LF、
-校验 Dockerfile 是否 `EXPOSE 7860`、扫描是否夹带密钥/超大文件，然后推送到创空间。
-
-> Docker 类型首次构建约 3~5 分钟，装Chromium 时可能到 8~12 分钟。
-> 在创空间「日志」页看进度。
-
-**方式二：命令行手动推送**
-
-```bash
-# 1. 先拉取创空间仓库
-git clone https://oauth2:<你的访问令牌>@modelscope.cn/studios/viva25/video_txt.git ms_studio
-cd ms_studio
-
-# 2. 把本地项目文件复制进来（排除运行数据与 Git 配置）
-#    Windows PowerShell：
-#    robocopy ..\video2note . /E /XD .git data .github
-#    macOS / Linux：
-#    rsync -av --exclude='.git' --exclude='data' --exclude='__pycache__' ../video2note/ ./
-
-# 3. 提交并推送
-git add -A
-git commit -m "sync: 更新为 GitHub 版本" || echo "无变化"
-git push
-```
-
-> 令牌直接写在 clone URL 里最省事，但会留在 shell 历史中。
-> 更稳妥的做法是先 clone 不带令牌，再执行 `git remote set-url origin https://oauth2:<令牌>@...`，
-> 推送完把 remote 改回不带令牌的地址。
->
-> ⚠️ 手动 `cp` 复制时注意**行尾必须是 LF**。历史上曾因 CRLF 触发平台敏感扫描导致自动回滚，
-> `.gitattributes` 已强制 `eol=lf`，但手动复制绕过 Git 时仍要留意。
-
-**方式二：网页上传**
-
-到创空间「代码 → 上传文件」，或直接把 GitHub 仓库里的文件拖进去覆盖。
-
-> 关键点：创空间的默认分支是 **`master`**，而 GitHub 仓库用的是 `main`。
-> 推送时无需合并历史，直接把文件覆盖后 `git add -A && git commit && git push` 即可。
-
-推送后 ModelScope 会**自动重建**（实测约 3~8 分钟），不需要额外触发部署。
-可在创空间「日志」页查看启动输出。
-
-### 自动部署（GitHub Actions）
-
-仓库里带了 `.github/workflows/deploy-modelscope.yml`：向 GitHub 的 `main` 分支推送后，
-自动把代码同步到创空间并触发重建。也可以在 Actions 页手动点「Run workflow」。
-
-**一次性配置**：GitHub 仓库 → Settings → Secrets and variables → Actions → New repository secret
-
-| Secret | 值 |
-|---|---|
-| `MODELSCOPE_API_KEY` | ModelScope 访问令牌（[获取](https://modelscope.cn/my/myaccesstoken)） |
-
-workflow 里的目标创空间在文件顶部的 `env`（`STUDIO_OWNER` / `STUDIO_NAME` / `MODELSCOPE_HOST`）改。
-
-几个设计上的取舍：
-
-- **推送前先校验**：缺 `app.py` / `requirements.txt` 直接中止；若仓库里出现被跟踪的
-  `data/`、`.env`、`cookies.txt`、`*.log`，也会中止，防止密钥被推到创空间。
-- **不做 merge，用 orphan 分支强推**：创空间是部署目标而非代码源，
-  合并历史只会在文件冲突时卡死；以本地为准覆盖更可靠。
-- **内容一致就跳过推送**：与创空间 `master` 对比无差异时直接结束，省掉一次无意义的重建。
-- **令牌脱敏**：所有 git/curl 命令的输出都会把 `oauth2:xxx@` 替换成 `oauth2:***@`。
-
-> 也可以用本地脚本手动同步（不依赖 Actions）：
-> `export MODELSCOPE_TOKEN=你的令牌 && bash scripts/sync_to_studio.sh`
-> 两条路都可用，互不干扰。
-
-数据落地优先级：`V2N_DATA_DIR` → `/mnt/workspace/video2note`（创空间持久化目录）→ `项目/data`。
-创空间重启会保留 `/mnt/workspace`，但迁移或重命名会丢失，重要产物请及时导出。
-
-## 接口（FastAPI 版）
+## 接口
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/api/tasks` | 创建任务 `{url, style}` |
-| POST | `/api/tasks/upload` | 上传本地文件 |
+| POST | `/api/tasks/upload-raw` | 上传本地文件（裸流直传） |
 | GET | `/api/tasks` | 任务列表 |
 | GET | `/api/tasks/{id}` | 任务详情 |
 | GET | `/api/tasks/{id}/events` | SSE 实时进度与日志 |
 | POST | `/api/tasks/{id}/polish` | 触发 AI 整理 |
+| POST | `/api/tasks/{id}/retry` | 从失败处重试 |
 | GET | `/api/media/{id}/video.mp4` | 视频流（支持 Range） |
 | GET | `/api/tasks/{id}/export?fmt=md\|txt\|srt\|raw\|json` | 导出 |
-| GET | `/api/health` | ffmpeg / yt-dlp 就绪检查 |
-
-Gradio 版同名能力由 `app.py` 内的 9 个端点提供（见 `/gradio_api/info`）。
+| GET | `/api/health` | ffmpeg / yt-dlp / 抖音通道 / 浏览器内核就绪检查 |
 
 ## 成本参考（1 小时视频）
 
@@ -656,18 +410,16 @@ Gradio 版同名能力由 `app.py` 内的 9 个端点提供（见 `/gradio_api/i
 
 | 问题 | 处理 |
 |---|---|
-| `Address already in use` | 7860 被占用：换 `SERVER_PORT`，或结束占用进程 |
-| `ModuleNotFoundError: No module named 'core'` | 在项目根目录执行 `python app.py`，不要直接 `python core/...` |
-| 页面无法访问 | 确认监听 `0.0.0.0`（`SERVER_HOST` 默认已是） |
-| 视频很慢/显存不足 | 减小 `chunk_seconds`、调低并发，或提高创空间资源规格 |
+| `Address already in use` | 8765 被占用：换 `--port`，或结束占用进程 |
+| `ModuleNotFoundError: No module named 'core'` | 在项目根目录执行 `python run.py`，不要直接 `python core/...` |
+| 页面无法访问 | 确认监听 `0.0.0.0`（用 `--host 0.0.0.0`） |
+| 视频很慢/内存不足 | 减小 `chunk_seconds`、调低并发，或提高机器资源规格 |
 | 中文乱码 | 代码统一 UTF-8 读写，导出时用 Chrome/Edge 打开 .md |
-| 创空间构建失败 / 一直排队 | Docker 类型首次构建 3~5 分钟，装Chromium 时可能 8~12 分钟；看创空间「日志」页 |
-| 构建报 `EXPOSE 7860` 相关错误 | 平台强制 7860，8080 被占用；跑 `python scripts/verify_dockerfile.py` 本地自查 |
-| 页面能开但样式/接口 404 | 反代前缀问题：设 `GRADIO_ROOT_PATH`（app.py）或 `ROOT_PATH`（run.py） |
-| 推送后线上代码回退 | 多为 CRLF 触发平台扫描；用 `scripts/sync_to_studio.sh`（从 Git 索引取内容，保证 LF） |
-| 重启后历史记录没了 | 数据要落在 `/mnt/workspace`；Dockerfile 已设 `V2N_DATA_DIR`，别改 |
+| 页面能开但样式/接口 404 | 反代前缀问题：启动时加 `--root-path /你的前缀` |
+| 重启后历史记录没了 | 数据目录被清理；用 `V2N_DATA_DIR` 指定持久化路径，并挂卷 |
+| 抖音一直解析失败 | IP 风控（与 Cookie 无关）：在设置页填代理，或换网络环境 |
 
 ## 合规提示
 
 - 仅用于个人学习与研究，请勿分发下载的原始音视频
-- Cookie 与 API Key 属敏感信息，只保存在本地/创空间 Secrets，不要提交到版本库
+- Cookie 与 API Key 属敏感信息，只保存在 `data/secrets.json` 或环境变量，不要提交到版本库

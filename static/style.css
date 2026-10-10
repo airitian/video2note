@@ -29,13 +29,34 @@ code, pre, .mono { font-family: var(--wb-font-mono); }
 .logo::after { content: ""; position: absolute; left: 11px; top: 9px; width: 0; height: 0; border-left: 11px solid #fff; border-top: 7px solid transparent; border-bottom: 7px solid transparent; }
 .topbar h1 { margin: 0; font-size: 16px; font-weight: 600; }
 .topbar p { margin: 2px 0 0; font-size: 12px; color: var(--text-3); }
-.topbar-right { display: flex; align-items: center; gap: 10px; }
+.topbar-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .health { font-size: 12px; color: var(--text-2); }
 .health .bad { color: var(--err); }
 
-.history { position: absolute; right: 20px; top: 62px; width: 400px; max-width: calc(100vw - 32px); background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 8px 30px rgba(16,20,26,.10); z-index: 40; overflow: hidden; }
-.history-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; font-weight: 600; border-bottom: 1px solid var(--border); }
-.history-list { max-height: 420px; overflow: auto; }
+/* 三栏布局：左=历史记录，中=主工作区，右=处理日志 */
+.layout { display: grid; grid-template-columns: 272px minmax(0, 1fr) 300px; gap: 16px; align-items: start; max-width: 1600px; margin: 0 auto; padding: 16px 24px 48px; }
+.side { position: sticky; top: 78px; }
+.side-card { display: flex; flex-direction: column; max-height: calc(100vh - 100px); padding: 14px 12px; }
+.side.folded { display: none; }
+/* grid item 默认 min-width:auto，内容一多就把列撑宽导致横向滚动 */
+.layout > * { min-width: 0; }
+/* 中等宽度：先收窄两侧栏 + 中间改单列，死保三栏结构 */
+@media (max-width: 1240px) {
+  .layout { grid-template-columns: 214px minmax(0, 1fr) 246px; gap: 12px; padding: 16px 14px 48px; }
+  .composer .input-grid, .ws-grid { grid-template-columns: 1fr; }
+}
+/* 再窄一档：两侧栏压到最小，仍然保持三栏 */
+@media (max-width: 960px) {
+  .layout { grid-template-columns: 168px minmax(0, 1fr) 196px; gap: 10px; padding: 14px 10px 40px; }
+}
+/* 只有极窄屏（<720px，手机竖屏）才允许堆叠 */
+@media (max-width: 720px) {
+  .layout { grid-template-columns: minmax(0, 1fr); }
+  .side { position: static; }
+  .side-card { max-height: 300px; }
+}
+
+.history-list { overflow: auto; flex: 1; min-height: 120px; }
 .hitem { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; }
 .hitem:last-child { border-bottom: none; }
 .hitem:hover, .hitem.on { background: var(--primary-soft); }
@@ -48,37 +69,40 @@ code, pre, .mono { font-family: var(--wb-font-mono); }
 .hstatus.running { background: var(--primary-soft); color: var(--primary); }
 .hdel { flex: none; }
 
-main { max-width: 1100px; margin: 0 auto; padding: 20px 24px 48px; }
-.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; }
+main { min-width: 0; padding: 0; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 13px 15px; }
 
-.composer .input-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-.tab-head { font-size: 12px; font-weight: 600; color: var(--text-2); margin-bottom: 8px; }
-.drop { border: 1.5px dashed var(--border-strong); border-radius: 10px; min-height: 130px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; text-align: center; cursor: pointer; padding: 14px; transition: border-color .15s, background .15s; }
+.composer .input-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.tab-head { font-size: 12px; font-weight: 600; color: var(--text-2); margin-bottom: 6px; }
+.drop { border: 1.5px dashed var(--border-strong); border-radius: 10px; min-height: 108px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; text-align: center; cursor: pointer; padding: 12px; transition: border-color .15s, background .15s; }
 .drop:hover, .drop.over { border-color: var(--primary); background: var(--primary-soft); }
-.up-ico { font-size: 22px; color: var(--primary); line-height: 1; }
-.up-t1 { font-size: 14px; }
+.up-ico { font-size: 20px; color: var(--primary); line-height: 1; }
+.up-t1 { font-size: 13.5px; }
 .up-t2 { font-size: 12px; color: var(--text-3); }
 .up-t2 a { color: var(--primary); text-decoration: none; }
-textarea#url { width: 100%; min-height: 130px; resize: vertical; padding: 10px 12px; border: 1px solid var(--border-strong); border-radius: 10px; font: 13px/1.6 inherit; color: var(--text); outline: none; }
+textarea#url { width: 100%; min-height: 108px; resize: vertical; padding: 10px 12px; border: 1px solid var(--border-strong); border-radius: 10px; font: 13px/1.6 inherit; color: var(--text); outline: none; }
 textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
 
-.opts-row { display: flex; gap: 14px; align-items: flex-end; margin-top: 16px; flex-wrap: wrap; }
+/* 「开始转写」贴在链接输入框右侧同一行，说明文案单独放下一行 */
+.url-row { display: flex; align-items: stretch; gap: 10px; }
+.url-row .btn.big { flex: none; width: 104px; height: auto; padding: 0 14px; }
 .field { display: flex; flex-direction: column; gap: 5px; }
 .field label { font-size: 12px; color: var(--text-2); }
-.field select { height: 40px; min-width: 210px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 9px; background: #fff; color: var(--text); font-size: 13px; }
-.btn { height: 40px; padding: 0 18px; border-radius: 9px; border: 1px solid var(--border-strong); background: #fff; color: var(--text); font-size: 14px; cursor: pointer; }
+.field select { height: 36px; min-width: 210px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 9px; background: #fff; color: var(--text); font-size: 13px; }
+.btn { height: 36px; padding: 0 16px; border-radius: 9px; border: 1px solid var(--border-strong); background: #fff; color: var(--text); font-size: 14px; cursor: pointer; }
 .btn:hover:not(:disabled) { background: #f2f4f7; }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
 .btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
 .btn.primary:hover:not(:disabled) { background: #6d28d9; }
-.btn.big { height: 40px; padding: 0 26px; font-size: 14px; font-weight: 600; }
-.btn.ai { flex: 1; height: 46px; background: var(--primary); border-color: var(--primary); color: #fff; font-size: 15px; font-weight: 600; border-radius: 10px; }
+.btn.big { height: 36px; padding: 0 22px; font-size: 14px; font-weight: 600; }
+.btn.ai { flex: 1; height: 40px; background: var(--primary); border-color: var(--primary); color: #fff; font-size: 15px; font-weight: 600; border-radius: 10px; }
 .btn.ai:hover:not(:disabled) { background: #6d28d9; }
 .btn.small { height: 28px; padding: 0 12px; font-size: 12px; border-radius: 7px; }
 .btn.ghost { background: #fff; }
+.btn.ghost.on { background: var(--primary-soft); color: var(--primary); border-color: transparent; }
 .icon { border: none; background: none; font-size: 20px; line-height: 1; color: var(--text-3); cursor: pointer; }
 
-.progress-panel { margin-top: 16px; }
+.progress-panel { margin-top: 12px; }
 .phead { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
 .phead b { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .status { font-size: 12px; font-weight: 600; flex: none; }
@@ -96,14 +120,14 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 .pfoot { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
 .footmsg { font-size: 12px; color: var(--text-2); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .spacer { flex: 1; }
-.logs { max-height: 150px; overflow: auto; margin-top: 10px; padding: 8px 10px; background: #fbfcfd; border: 1px solid var(--border); border-radius: 8px; font-size: 12px; color: var(--text-2); }
+.logs { flex: 1; min-height: 140px; overflow: auto; padding: 8px 10px; background: #fbfcfd; border: 1px solid var(--border); border-radius: 8px; font-size: 12px; color: var(--text-2); }
 .logs div { padding: 1px 0; }
 .logs .error { color: var(--err); }
 .logs .warn { color: var(--warn); }
 
 /* 对照区：视频与文字稿同一行，左列吸顶，滚动右侧文字稿时视频始终可见 */
-.ws-grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 5fr); gap: 16px; margin-top: 16px; align-items: start; }
-.pane { padding: 14px 16px; }
+.ws-grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 5fr); gap: 12px; margin-top: 12px; align-items: start; }
+.pane { padding: 12px 14px; }
 .pane.sticky-pane { position: sticky; top: 12px; }
 .pane-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 12px; font-weight: 600; color: var(--text-3); letter-spacing: .04em; margin-bottom: 10px; }
 .pane-head .tools { display: flex; gap: 6px; }
@@ -123,7 +147,7 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 .ai-row .chk { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-2); white-space: nowrap; }
 .ai-row .chk input { width: 15px; height: 15px; }
 .ai-tip { margin: -6px 0 16px; font-size: 12px; color: var(--text-3); }
-.opts-hint { font-size: 12px; color: var(--text-3); }
+.opts-hint { display: block; margin-top: 8px; font-size: 12px; color: var(--text-3); line-height: 1.5; }
 
 /* 风格切换：按钮组比下拉框更快看清当前选了哪个 */
 .style-pick { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -164,7 +188,11 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 @media (max-width: 860px) {
   .composer .input-grid, .ws-grid { grid-template-columns: 1fr; }
   .pane.sticky-pane { position: static; }
-  .opts-row { align-items: stretch; }
+}
+/* 手机窄屏才让按钮换到输入框下面（再窄横向就放不下了） */
+@media (max-width: 560px) {
+  .url-row { flex-direction: column; }
+  .url-row .btn.big { width: 100%; height: 36px; }
   .field select { width: 100%; }
   .btn.big { width: 100%; }
   .ai-row { flex-direction: column; }

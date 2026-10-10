@@ -29,8 +29,7 @@ V2N_SECRETS_FILE
 # 密钥文件示例（只有键名、无值）可以提交
 !secrets.example.json
 
-# Gradio / App runtime
-.gradio/
+# 运行时产物
 *.session
 tmp/
 

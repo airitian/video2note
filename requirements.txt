@@ -1,7 +1,5 @@
-# ========== 核心框架（ModelScope 创空间 Gradio 类型）==========
-gradio>=4.0.0
-
-# ========== Web 服务（可选：FastAPI 版入口 run.py）==========
+# ========== 核心框架 ==========
+# 仅需 FastAPI 版入口（run.py）。原 Gradio 版入口 app.py 已移除。
 fastapi>=0.110
 uvicorn[standard]>=0.27
 python-multipart>=0.0.9
@@ -14,7 +12,6 @@ python-multipart>=0.0.9
 curl_cffi>=0.16.0
 playwright>=1.40
 yt-dlp>=2025.1.1          # B站主力；抖音在无 Cookie 时会被风控拦截（已由 dlpanda 通道前置解决）
-pyktok>=0.0.31            # 抖音兜底（可选）：仅前两条通道都失败时才用
 requests>=2.31            # ASR 接口 + Anthropic 协议 LLM 调用
 openai>=1.30              # 仅当 llm_protocol=openai 时需要
 
@@ -25,12 +22,7 @@ openai>=1.30              # 仅当 llm_protocol=openai 时需要
 #   PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
 #     python -m playwright install chromium
 
-# ---- 抖音兜底（可选）----
-# pyktok 需要 Playwright 浏览器内核才能签名。缺失时 core/douyin.py 会自动跳过并给出提示。
-#   pip install pyktok
-#   python -m playwright install --with-deps chromium
-
 # ========== 工具库 ==========
 python-dotenv>=1.0        # 本地 .env 支持
-# 本机若无 ffmpeg：安装工程后自带一个 ffmpeg 二进制作为兜底
-# imageio-ffmpeg>=0.4.9
+pydantic>=2.0             # FastAPI 接口模型（此前仅靠间接依赖，现显式声明）
+imageio-ffmpeg>=0.4.9     # 本机无系统 ffmpeg 时，用其自带二进制兜底（core/config.py:ff_bin）
