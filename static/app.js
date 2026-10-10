@@ -27,6 +27,17 @@
 
   function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 
+  // 字数统计：中文按「不计空格」计，和 Word/WPS 的字符数口径一致。
+  // 直接用 length() 会被换行与缩进灌水——转写稿是逐句拼出来的，空白占比很高。
+  function charCount(s) {
+    return String(s == null ? "" : s).replace(/\s+/g, "").length;
+  }
+
+  // 千分位分隔，五位以上的字数一眼可读
+  function fmtNum(n) {
+    return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  }
+
   function inline(s) {
     s = esc(s);
     s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
@@ -239,9 +250,9 @@
     renderPolishBar(t);
   }
 
-  // 「生成文稿」按钮的可用状态与文案，以及成稿元信息
+  // 「生成文稿」按钮的可用状态与文案，以及两处字数统计
   function renderPolishBar(t) {
-    const btn = $("#btn-polish"), meta = $("#note-meta");
+    const btn = $("#btn-polish"), meta = $("#note-meta"), lmeta = $("#lines-meta");
     const hasText = !!(t && t.transcript && t.transcript.length);
     const canRun = hasText && (t.status === "transcribed" || t.status === "done");
     btn.disabled = !canRun;
@@ -252,10 +263,26 @@
     } else {
       btn.textContent = "✨ 生成「" + (STYLE_TEXT[curStyle] || curStyle) + "」";
     }
-    const info = (t && t.note_info) || {};
-    if (info.style) {
-      meta.textContent = (STYLE_TEXT[info.style] || info.style) + " · " +
-        (info.chars || 0) + " 字 · " + (info.at || "");
+
+    // 文字稿字数：转写中随增量实时上涨，让用户看到进度
+    const tc = hasText ? charCount(t.transcript) : 0;
+    if (lmeta) {
+      const live = !!(t && t.status === "running" && t.stage === "transcribing");
+      lmeta.textContent = tc
+        ? fmtNum(tc) + " 字" + (live ? " · 识别中…" : "")
+        : "";
+    }
+
+    // 成稿字数：取当前正在展示的那份，而不是 note_info（它只记最后生成的风格，
+    // 切到别的风格时会显示成另一篇的字数）
+    const text = noteForStyle(t, curStyle);
+    if (text) {
+      const info = (t && t.note_info) || {};
+      const sameStyle = info.style === curStyle;
+      meta.textContent = (STYLE_TEXT[curStyle] || curStyle) + " · " +
+        fmtNum(charCount(text)) + " 字" +
+        (tc ? "（原文 " + fmtNum(tc) + " 字）" : "") +
+        (sameStyle && info.at ? " · " + info.at : "");
     } else {
       meta.textContent = "";
     }

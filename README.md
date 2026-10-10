@@ -106,6 +106,9 @@ cp .env.example .env
   正中间才出现的术语也能抽到；分块清洗按批推进，批内并行、批间把上一批的
   清洗结果尾部带进下一批，解决「他刚才提到的那个方案」这类指代断裂
 - 转写完成后可**多次重跑 AI 整理、随时换风格**，不必重新转写
+- **字数实时可见**：文字稿面板标题行显示当前字数（转写中随增量上涨），
+  AI 文稿标题行显示该风格成稿字数并附原文字数对照；换风格时字数跟着切换，
+  不会串到别的风格上。字数按不计空格口径统计，与 Word 字符数一致
 - 转写失败后重跑会**复用已下载的媒体文件**，不再重复下载
 - 历史任务里记录的模型若已下线，会自动回退到当前配置里的默认模型
 - 历史记录回读：视频、稿件、导出随时找回
@@ -323,6 +326,10 @@ video2note/
 │   verify_llm_context.py      术语抽样与块间上文摘要（mock LLM，不花钱）
 │   verify_llm_real.py         同上，真实调用 LLM 验证成稿质量
 │   verify_realtime.py         转写结果是否增量推送
+│   verify_wordcount.py        文字稿/成稿字数展示与多风格不串号
+│   verify_settings_curl.py    设置面板分组顺序与 curl 输入框可用性
+│   verify_cloud_settings.py   设置接口失败时是否显式报错而非空白
+│   verify_history_note.py     历史记录回显成稿
 │   verify_ui.py               端到端 UI 冒烟
 ├── scripts/
 │   ├── deploy_debian.sh              # Debian/Ubuntu 一键部署

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>抖音 / B站 视频转文字</title>
-<link rel="stylesheet" href="/static/style.css?v=20261011k">
+<link rel="stylesheet" href="/static/style.css?v=20261011m">
 </head>
 <body>
 <header class="topbar">
@@ -79,7 +79,9 @@
       <div id="video-host" class="video-host"><div class="empty">暂无视频</div></div>
     </div>
     <div class="card pane">
-      <div class="pane-head">文字稿（带时间戳，点击跳转，播放时自动跟随高亮）</div>
+      <div class="pane-head">文字稿（带时间戳，点击跳转，播放时自动跟随高亮）
+        <span class="tools"><span id="lines-meta" class="count-meta"></span></span>
+      </div>
       <div id="lines" class="lines"><div class="empty">暂无转写结果</div></div>
     </div>
   </section>
@@ -98,7 +100,7 @@
   <section class="card" id="note-card">
     <div class="pane-head">AI 文稿
       <span class="tools">
-        <span id="note-meta" class="note-meta"></span>
+        <span id="note-meta" class="count-meta"></span>
         <button class="btn small" data-act="copy">复制</button>
       </span>
     </div>
@@ -130,6 +132,6 @@
 
 <div id="toast" class="toast hidden"></div>
 
-<script src="/static/app.js?v=20261011k"></script>
+<script src="/static/app.js?v=20261011m"></script>
 </body>
 </html>
