@@ -78,7 +78,9 @@ ck("长度一致", len(back) == len(REAL), f"{len(back)}/{len(REAL)}")
 try:
     p = curlparse.parse_curl(back)
     ck("重新解析成功", p["url"] == "https://dlpanda.com/zh-CN", p["url"])
-    ck("_token 保留在模板里", p["form"].get("_token", "").startswith("AMzdPs"))
+    # 不硬编码具体 token 值：样本来自本机 data/settings.json，每次都不一样
+    ck("_token 保留在模板里", bool(p["form"].get("_token")),
+       p["form"].get("_token"))
     ck("Cookie 保留在模板里", "cf_clearance" in p["cookies"])
 except Exception as e:
     ck("重新解析成功", False, str(e))

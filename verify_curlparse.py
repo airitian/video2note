@@ -32,19 +32,19 @@ REAL = r"""curl --url 'https://dlpanda.com/zh-CN' \
   -H 'sec-ch-ua: "Google Chrome";v="155", "Chromium";v="155", "Not(A:Brand";v="24"' \
   -H 'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36' \
   -H 'x-requested-with: XMLHttpRequest' \
-  --data-raw $'------WebKitFormBoundaryLDY4ut2moxK2sVD9\r\nContent-Disposition: form-data; name="_token"\r\n\r\nAMzdPsxbTsenpQaCdtb7o0wKba5uJ7bswt4SQgmw\r\n------WebKitFormBoundaryLDY4ut2moxK2sVD9\r\nContent-Disposition: form-data; name="url"\r\n\r\n0.02 NjC:/ :6pm e@O.kc 02/13 AI 编程接单变现 https://v.douyin.com/pzJ75VywBiQ/ 复制此链接\r\n------WebKitFormBoundaryLDY4ut2moxK2sVD9\r\nContent-Disposition: form-data; name="t0ken"\r\n\r\nb8b6c49aToTA\r\n------WebKitFormBoundaryLDY4ut2moxK2sVD9--\r\n'"""
+  --data-raw $'------WebKitFormBoundaryLDY4ut2moxK2sVD9\r\nContent-Disposition: form-data; name="_token"\r\n\r\nSAMPLE_CSRF_TOKEN_40_CHARS_LONG_0000000000\r\n------WebKitFormBoundaryLDY4ut2moxK2sVD9\r\nContent-Disposition: form-data; name="url"\r\n\r\n0.02 NjC:/ :6pm e@O.kc 02/13 AI 编程接单变现 https://v.douyin.com/EXAMPLE0000/ 复制此链接\r\n------WebKitFormBoundaryLDY4ut2moxK2sVD9\r\nContent-Disposition: form-data; name="t0ken"\r\n\r\nSAMPLE_TOKEN12\r\n------WebKitFormBoundaryLDY4ut2moxK2sVD9--\r\n'"""
 
 print("=" * 64)
-print("一、真实 curl（用户提供的原样）")
+print("一、脱敏后的真实抓包结构（原样保留，仅凭据替换为占位符）")
 print("=" * 64)
 
 p = curlparse.parse_curl(REAL)
 ck("URL 正确", p["url"] == "https://dlpanda.com/zh-CN", p["url"])
 ck("方法为 POST", p["method"] == "POST", p["method"])
-ck("_token 已提取", p["form"].get("_token") == "AMzdPsxbTsenpQaCdtb7o0wKba5uJ7bswt4SQgmw",
+ck("_token 已提取", p["form"].get("_token") == "SAMPLE_CSRF_TOKEN_40_CHARS_LONG_0000000000",
    p["form"].get("_token"))
-ck("t0ken 已提取", p["form"].get("t0ken") == "b8b6c49aToTA", p["form"].get("t0ken"))
-ck("url 字段已提取", "v.douyin.com/pzJ75VywBiQ" in p["form"].get("url", ""),
+ck("t0ken 已提取", p["form"].get("t0ken") == "SAMPLE_TOKEN12", p["form"].get("t0ken"))
+ck("url 字段已提取", "v.douyin.com/EXAMPLE0000" in p["form"].get("url", ""),
    p["form"].get("url", "")[:60])
 ck("Cookie 已提取到独立字段", "cf_clearance" in p["cookies"],
    f'{p["cookies"][:40]}...')
