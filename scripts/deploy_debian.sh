@@ -141,18 +141,37 @@ if [ -n "$HEALTH" ]; then
   esac
   case "$HEALTH" in
     *'"yt_dlp":true'*) ok "yt-dlp 就绪" ;;
-    *)                 warn "yt-dlp 未安装 —— 下载全部失败：$HEALTH" ;;
+    *)                 warn "yt-dlp 未安装 —— B站下载会失败：$HEALTH" ;;
   esac
 else
   warn "健康检查未通过（服务可能仍在启动），请看 $LOG"
 fi
 
-# 抖音兜底（pyktok）需要浏览器内核；没有也不影响 yt-dlp 主链路
+# 抖音首选通道 = dlpanda 解析接口，解析那一步必须有浏览器内核
+#（Cloudflare 挑战只有真实浏览器能过，curl_cffi 带 cf_clearance 也会被 403）
 if "$VPY" -c "from playwright.sync_api import sync_playwright" >/dev/null 2>&1; then
-  ok "Playwright 可用，抖音兜底已启用"
+  ok "Playwright 就绪"
 else
-  warn "未装 Playwright 内核：抖音仅走 yt-dlp，失败时无兜底"
-  warn "  如需兜底：$VPY -m playwright install --with-deps chromium"
+  warn "未装浏览器内核 —— 抖音将降级到 yt-dlp（服务器 IP 上大概率失败）"
+  warn "  安装：$VPY -m playwright install --with-deps chromium"
+  warn "  国内镜像：PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \\"
+  warn "            $VPY -m playwright install chromium"
+fi
+if "$VPY" -c "import curl_cffi" >/dev/null 2>&1; then
+  ok "curl_cffi 就绪（CDN 直链下载）"
+else
+  warn "未装 curl_cffi —— 抖音通道不可用：$VPY -m pip install curl_cffi"
+fi
+# 校验内核真的落盘了：库在但内核缺失是服务器上最常见的坑
+if "$VPY" - <<'PY' >/dev/null 2>&1
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    assert p.chromium.executable_path
+PY
+then
+  ok "Chromium 内核已就位，抖音解析通道可用"
+else
+  warn "Chromium 内核缺失或不可执行 —— 抖音解析通道不可用，请重装内核"
 fi
 
 # 密钥是否填了（不显示内容，只看非空）

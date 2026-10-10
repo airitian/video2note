@@ -7,19 +7,28 @@ uvicorn[standard]>=0.27
 python-multipart>=0.0.9
 
 # ========== 业务依赖 ==========
-yt-dlp>=2025.1.1          # 下载主力：B站与抖音（带 Cookie 时）实测均可解析
-pyktok>=0.0.31            # 抖音兜底（可选）：仅 yt-dlp 失败时才用，需另装浏览器内核
-requests>=2.31            # ASR 接口 + Anthropic 协议 LLM 调用 + 抖音直链下载
+# 抖音首选通道：dlpanda 解析接口（core/dlpanda.py）
+#   curl_cffi  做 TLS 指纹伪装 + 下载 CDN 直链
+#   playwright 仅用于解析那一步（Cloudflare 挑战必须真实浏览器执行 JS）
+#   缺失时自动降级到 yt-dlp，不影响 B站
+curl_cffi>=0.16.0
+playwright>=1.40
+yt-dlp>=2025.1.1          # B站主力；抖音在无 Cookie 时会被风控拦截（已由 dlpanda 通道前置解决）
+pyktok>=0.0.31            # 抖音兜底（可选）：仅前两条通道都失败时才用
+requests>=2.31            # ASR 接口 + Anthropic 协议 LLM 调用
 openai>=1.30              # 仅当 llm_protocol=openai 时需要
 
-# ---- 抖音兜底（可选）----
-# pyktok 需要 Playwright 浏览器内核才能签名。缺失时 core/douyin.py 会自动跳过并给出提示，
-# 不影响 yt-dlp 主链路。部署到服务器时若需启用：
-#   pip install pyktok
+# ---- 抖音解析通道（core/dlpanda.py，必需）----
+# 该通道靠浏览器通过 Cloudflare 挑战，服务器上必须装浏览器内核：
 #   python -m playwright install --with-deps chromium
 # 国内网络慢可用镜像：
 #   PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
 #     python -m playwright install chromium
+
+# ---- 抖音兜底（可选）----
+# pyktok 需要 Playwright 浏览器内核才能签名。缺失时 core/douyin.py 会自动跳过并给出提示。
+#   pip install pyktok
+#   python -m playwright install --with-deps chromium
 
 # ========== 工具库 ==========
 python-dotenv>=1.0        # 本地 .env 支持

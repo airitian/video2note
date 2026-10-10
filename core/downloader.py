@@ -1,7 +1,13 @@
-"""下载层：默认走 yt-dlp，抖音失败时回退 pyktok -> 合并/转码为可播放 mp4
+"""下载层：抖音优先走 dlpanda 解析接口，其余平台走 yt-dlp
 
-策略：yt-dlp 优先（覆盖面广、B站稳定）。只有当链接是抖音、且 yt-dlp 明确失败时，
-才交给 core/douyin.py（pyktok + Playwright 自签 a_bogus）再试一次。
+策略（三级）
+------------
+1. **抖音 -> dlpanda 接口优先**。抖音对服务器 IP 风控极严，yt-dlp 必失败
+   （分享页返回 `_$jsvmprt` 挑战脚本；补 uifid 后变成 "Signature Not Found"，
+   伪造签名被判`Sign Invalid`）。与其在本地硬啃 a_bogus，不如走已解决该问题的
+   通道：解析由 dlpanda 完成，我们只拿它返回的无水印 CDN 直链。
+2. **其余平台 -> yt-dlp**。B站等yt-dlp 稳定且覆盖面广。
+3. **抖音兜底 -> pyktok 自签**，dlpanda 与 yt-dlp 都失败时才启用。
 
 刻意不让 yt-dlp 执行任何 ffmpeg 后处理：它对 ffprobe 有硬依赖，
 本机可能只装了 ffmpeg（如 imageio-ffmpeg）。合并与抽音频全部由 audio.py 完成。
@@ -333,17 +339,39 @@ def _download_one(url: str, workdir: Path, fmt_id: str, prefix: str,
 
 
 def download_media(url: str, workdir: Path, max_height: int = 1080,
-                   progress: Callable[[float, str], None] | None = None) -> dict:
+                   progress: Callable[[float, str], None] | None = None,
+                   prefer_api: bool = True) -> dict:
     """下载完整视频（含音轨），并抽出 ASR 用的音频。返回元数据 + 文件路径
 
-    优先级：yt-dlp -> （仅抖音）pyktok 兜底 -> 汇总错误。
+    优先级：抖音时 dlpanda 接口 -> yt-dlp -> （仅抖音）pyktok 兜底。
+    ``prefer_api=False`` 可强制跳过接口通道，用于对比排查。
     """
     url = extract_url(url)
     if not url.startswith("http"):
         raise InvalidURLError(f"未能从输入中识别出有效链接：{url[:80]}")
 
     workdir.mkdir(parents=True, exist_ok=True)
+    platform = detect_platform(url)
 
+    # ---- 第 1 级：抖音优先走解析接口 ----
+    # 这是目前唯一在云服务器 IP 上实测能拿到抖音视频的路径
+    if platform == "douyin" and prefer_api:
+        api_err = None
+        try:
+            from . import dlpanda
+
+            if dlpanda.available():
+                if progress:
+                    progress(2.0, "通过解析接口获取抖音视频…")
+                return dlpanda.download_video(url, workdir, max_height, progress)
+        except Exception as e:
+            api_err = e
+            if progress:
+                progress(3.0, f"解析接口未能取得视频（{_short(e)}），改用 yt-dlp")
+    else:
+        api_err = None
+
+    # ---- 第 2 级：yt-dlp ----
     try:
         return _ytdlp_download(url, workdir, max_height, progress)
     except DownloadError as e:
@@ -351,19 +379,28 @@ def download_media(url: str, workdir: Path, max_height: int = 1080,
     except Exception as e:                     # 兜底，避免非预期异常直接穿透
         first_err = DownloadError(_humanize_error(e))
 
-    if detect_platform(url) != "douyin":
+    if platform != "douyin":
         raise first_err
 
-    # yt-dlp 拿不下抖音（a_bogus 动态签名风控）时，再用 pyktok 自签重试
+    # ---- 第 3 级：抖音兜底（pyktok 自签 a_bogus）----
+    tail = f"解析接口也失败：{_short(api_err)}；" if api_err else ""
     if progress:
-        progress(3.0, f"yt-dlp 未能解析（{first_err}），改用 pyktok 重试")
+        progress(3.0, f"{tail}yt-dlp 也未能解析，改用 pyktok 重试")
     try:
         from . import douyin
 
         return douyin.download(url, workdir, progress)
     except Exception as e:
         raise DownloadError(
-            f"yt-dlp 失败：{first_err}；pyktok 也失败：{_humanize_error(e)}")
+            f"{tail}yt-dlp 失败：{first_err}；pyktok 也失败：{_humanize_error(e)}")
+
+
+def _short(e: Exception, limit: int = 60) -> str:
+    """把异常压成一行短文案，用于进度提示（完整信息由最终错误承载）"""
+    s = " ".join(str(e).split())
+    if not s:
+        return type(e).__name__
+    return s[:limit] + ("…" if len(s) > limit else "")
 
 
 def _ytdlp_download(url: str, workdir: Path, max_height: int,

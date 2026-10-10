@@ -140,7 +140,21 @@ def health():
         yt = True
     except ImportError:
         yt = False
-    return {"ffmpeg": ff, "ffmpeg_msg": ffmsg, "yt_dlp": yt}
+    # 抖音首选通道（dlpanda）。分开报两项：装了库但没装浏览器内核
+    # 是服务器上最常见的坑，光看available() 分辨不出来。
+    try:
+        import playwright  # noqa
+        pw = True
+    except ImportError:
+        pw = False
+    try:
+        from .dlpanda import available as _dlp_ok
+
+        dy = bool(_dlp_ok())
+    except Exception:
+        dy = False
+    return {"ffmpeg": ff, "ffmpeg_msg": ffmsg, "yt_dlp": yt,
+            "douyin_api": dy, "playwright": pw}
 
 
 @app.get("/api/tasks")

@@ -160,32 +160,76 @@ cp .env.example .env
 
 **B站**：支持良好。1080P 以上清晰度需要登录，在设置里填 Cookie。
 
-**抖音**：默认仍然走 yt-dlp（带 Cookie 时实测可正常解析与下载），**失败才回退 pyktok**。
+**抖音**：**优先走解析接口（dlpanda）**，这是目前唯一在云服务器 IP 上实测能拿到视频的路径。
 
 下载优先级：
 
 ```
-yt-dlp  →（仅当链接是抖音且 yt-dlp 报错时）→ pyktok 兜底
+抖音：dlpanda 接口 → yt-dlp → pyktok 兜底
+B站：yt-dlp
 ```
 
-只有 yt-dlp 抛错且平台判定为抖音时，才会启动 `core/douyin.py`：Playwright 起 Chromium 打开抖音首页
-并注入 Cookie，由 pyktok 的 `generate_x_bogus()` 在页面上下文里算出 `a_bogus` / `X-Bogus` 签名，
-再由本进程请求 `aweme/detail` 拿播放直链；其内部还会回退到移动端分享页抓取（`_scrape_mobile`）。
-两者都失败时，错误信息会同时列出 yt-dlp 与 pyktok 的失败原因。
+### 为什么抖音要改用接口
 
-因此**正常使用不需要装 Playwright 内核**；只有 yt-dlp 抓不到抖音时才需要：
+抖音对**服务器 IP** 的风控比家用宽带严得多，实测四层都被挡：
+
+| 尝试 | 结果 |
+|---|---|
+| yt-dlp 直接抓分享页 | 返回 `_$jsvmprt` JS 虚拟机挑战脚本，报 `Fresh cookies are needed` |
+| curl_cffi 伪装 TLS 指纹（7 种） | 全部返回一模一样的 72914 字节挑战页 |
+| 真实浏览器 + 有效登录 Cookie | 停在「验证码中间页」，业务代码根本没加载 |
+| 补 `uifid` 参数 | 报错从 `Uifid Not Found` 变成 `Signature Not Found` |
+| 伪造 `a_bogus` 签名 | 被判 `Sign Invalid` |
+
+关键在最后两步：`uifid` 补上后错误精确变成「只差签名」，而服务端**确实在校验签名的真实性**。
+抖音的 `a_bogus` 必须由它自己的 JS 代码产出，而风控拦在业务代码执行之前 —— 拿不到代码就产不出签名。
+
+所以本地硬啃签名这条路走不通，正确做法是**把解析交给已经解决该问题的一方**，
+我们只负责拿它返回的 CDN 直链并下载。
+
+### dlpanda 通道的工作方式
+
+协议为实测所得（`core/dlpanda.py` 里有完整说明）：
+
+1. 抖音走**独立路由** `/zh-CN/douyin`，不是首页
+2. POST multipart：`_token`（CSRF）+ `url` + `t0ken`（固定值）
+3. 响应是 **HTML**（不是 JSON），地址在 `data-download-url` 属性里
+4. 结果状态看 `data-state`：`success` / `unsupported` / `private` / `rate_limited` / …
+
+架构上有个**必须遵守的分工**：
+
+- **解析**必须走真实浏览器。实测纯 HTTP（curl_cffi 带完整浏览器指纹 + 含 `cf_clearance`
+  的全套 Cookie）依然被 Cloudflare 403 —— CF 的 clearance 与浏览器指纹绑定，脚本伪造不了。
+- **下载**不需要浏览器。返回的是抖音官方 CDN（`*.zjcdn.com`），
+  带 `access-control-allow-origin: *` 且支持 Range（实测返回 206），普通 HTTP 直接下。
+
+> 不要把几十 MB 的视频塞进浏览器上下文下载 —— 实测这样会因默认 30 秒超时直接失败。
+> 程序只让浏览器负责解析那一步（秒级），下载全程轻量 HTTP，并支持断点续传。
+
+依赖：
 
 ```bash
-pip install pyktok
-python -m playwright install chromium
+# 必需：解析（浏览器过 CF）+ 下载（TLS 指纹）
+pip install curl_cffi playwright
+python -m playwright install --with-deps chromium
 
 # 国内网络慢，用镜像
 PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
   python -m playwright install chromium
 ```
 
-> 没装 pyktok 也不会出问题：程序会跳过签名步骤，直接回退到移动端分享页抓取
-> （`_scrape_mobile`），并在最终失败时提示如何补装。
+健康检查接口会分别报告两项，服务器上排查很方便：
+
+```bash
+curl -s http://127.0.0.1:8765/api/health
+# {"ffmpeg":true,"yt_dlp":true,"douyin_api":true,"playwright":true}
+#                  ↑ 抖音通道    ↑ 浏览器内核
+```
+
+`douyin_api:false` 而 `playwright:true` 说明库在但内核没装，跑 `playwright install chromium` 即可。
+缺任何一项都会**自动降级**到 yt-dlp，不影响 B站。
+
+> 想对比排查接口通道，可用 `downloader.download_media(..., prefer_api=False)` 强制跳过。
 
 ### 常见报错
 
