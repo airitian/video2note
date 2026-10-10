@@ -28,6 +28,30 @@ import shutil
 import subprocess
 import sys
 
+# Chromium 依赖的共享库 -> Debian/Ubuntu 包名。
+# 缺这些库时浏览器会以 exitCode=127 静默退出，playwright 只报
+# 「Target ... has been closed」，用户看不出是缺库。直接给出包名省去查证。
+_LIB_TO_PKG = {
+    "libnspr4.so": "libnspr4",
+    "libnss3.so": "libnss3",
+    "libnssutil3.so": "libnss3",
+    "libsmime3.so": "libnss3",
+    "libatk-1.0.so.0": "libatk1.0-0",
+    "libatk-bridge-2.0.so.0": "libatk-bridge2.0-0",
+    "libcups.so.2": "libcups2",
+    "libXcomposite.so.1": "libxcomposite1",
+    "libXdamage.so.1": "libxdamage1",
+    "libXfixes.so.3": "libxfixes3",
+    "libXrandr.so.2": "libxrandr2",
+    "libgbm.so.1": "libgbm1",
+    "libxkbcommon.so.0": "libxkbcommon0",
+    "libpango-1.0.so.0": "libpango-1.0-0",
+    "libcairo.so.2": "libcairo2",
+    "libasound.so.2": "libasound2",
+    "libatspi.so.0": "libatspi2.0-0",
+    "libdrm.so.2": "libdrm2",
+}
+
 
 def _exe() -> str:
     return sys.executable or "python3"
@@ -74,13 +98,19 @@ def _kernels() -> list[tuple[str, list[str]]]:
     """
     base = _browsers_path()
     out = []
+    # 可执行文件名随平台/版本变化，必须都覆盖：
+    #   chrome（完整版，Linux/macOS/Windows）
+    #   chrome.exe
+    #   chrome-headless-shell  ← headless 模式下 playwright 实际启动的就是它
+    #   headless_shell（旧版本命名）
+    # 漏掉 chrome-headless-shell 会把「装好了」误判成「目录在但没有可执行文件」。
+    names = ("chrome", "chrome.exe", "chrome-headless-shell",
+             "chrome-headless-shell.exe", "headless_shell")
     for d in sorted(glob.glob(os.path.join(base, "chromium*"))):
-        exe = (glob.glob(os.path.join(d, "**", "chrome"), recursive=True)
-               + glob.glob(os.path.join(d, "**", "headless_shell"),
-                           recursive=True)
-               + glob.glob(os.path.join(d, "**", "chrome.exe"),
-                           recursive=True))
-        out.append((os.path.basename(d), exe))
+        exe = []
+        for n in names:
+            exe += glob.glob(os.path.join(d, "**", n), recursive=True)
+        out.append((os.path.basename(d), sorted(set(exe))))
     return out
 
 
@@ -116,6 +146,24 @@ def _expected_revision() -> str | None:
     return None
 
 
+def _launch_target() -> str | None:
+    """headless 模式下 playwright 实际启动的那个可执行文件路径。
+
+    必须查这个而不是完整版 chromium：playwright 1.49+ 在 headless 下
+    默认走 `chromium_headless_shell-XXXX`，两者的依赖不完全相同。
+    只查完整版可能漏报——「完整版依赖齐全，但 shell 起不来」。
+    """
+    for name, exes in _kernels():
+        if not exes:
+            continue
+        if "headless_shell" in name:
+            return exes[0]        #优先 headless shell
+    for _name, exes in _kernels():
+        if exes:
+            return exes[0]
+    return None
+
+
 def _missing_libs() -> list[str]:
     """用 ldd 找出缺失的共享库——Linux 上「启动即崩」最常见的原因。
 
@@ -123,16 +171,15 @@ def _missing_libs() -> list[str]:
     """
     if not shutil.which("ldd"):
         return []
-    for _name, exe in _kernels():
-        if not exe:
-            continue
-        try:
-            r = subprocess.run(["ldd", exe[0]], capture_output=True,
-                               text=True, timeout=30)
-            return [l.strip() for l in r.stdout.splitlines() if "not found" in l]
-        except Exception:
-            return []
-    return []
+    target = _launch_target()
+    if not target:
+        return []
+    try:
+        r = subprocess.run(["ldd", target], capture_output=True,
+                           text=True, timeout=30)
+        return [l.strip() for l in r.stdout.splitlines() if "not found" in l]
+    except Exception:
+        return []
 
 
 def main() -> int:
@@ -156,12 +203,19 @@ def main() -> int:
     print("--- 2. 缺失的共享库（ldd）---")
     missing = _missing_libs()
     if missing:
-        print("  ❌ 缺以下库，浏览器必定启动失败：")
+        print(f"  ❌ 缺以下库，浏览器必定启动失败（检查的是 {_launch_target()}）：")
         for m in missing:
             print(f"     {m}")
         print()
-        print(f"  修复：{_exe()} -m playwright install --with-deps chromium")
-        print("  （若已装过，可能是 --with-deps 装到了别的解释器/环境里）")
+        # 把 so 名映射成 apt 包名，用户可直接复制安装，不必自己查
+        pkgs = sorted({_LIB_TO_PKG.get(m.split("=>")[0].strip(), "")
+                       for m in missing} - {""})
+        if pkgs:
+            print("  对应的软件包（Debian/Ubuntu，可直接执行）：")
+            print(f"    apt-get update && apt-get install -y {' '.join(pkgs)}")
+            print()
+        print(f"  或让 playwright 自己装依赖："
+              f"{_exe()} -m playwright install --with-deps chromium")
         print()
     else:
         print("  ✅ 无缺失库")

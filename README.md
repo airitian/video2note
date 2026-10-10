@@ -276,6 +276,35 @@ curl -s http://127.0.0.1:8765/api/health
 
 ### 常见报错
 
+**`BrowserType.launch: Target page, context or browser has been closed`**
+
+这句报错是**结果，不是原因**。playwright 把「缺系统库」「内核与库版本不匹配」
+「内存不足」全汇总成这一句，真正原因在浏览器进程的 stderr 里，而它默认不打印。
+
+直接跑诊断脚本看真因（务必用**跑服务那个解释器**）：
+
+```bash
+readlink -f /proc/$(pgrep -f 'run[.]py' | head -1)/exe   # 查解释器
+/usr/bin/python3.11 verify_chromium.py                   # 再用它跑
+```
+
+它会依次报告：已落盘的内核、`ldd` 缺失的共享库（**并给出对应的 apt 包名**）、
+内核 revision 与库是否匹配、以及带完整 stderr 的真实启动结果。
+
+最常见是**缺系统库**——`pip install playwright` 只装 Python 包，浏览器依赖的
+共享库属于操作系统。脚本会直接给出可复制的命令：
+
+```bash
+apt-get update && apt-get install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+    libcups2 libxcomposite1 libxdamage1 libatspi2.0-0
+# 或让 playwright 自己装：
+python3 -m playwright install --with-deps chromium
+```
+
+> 云服务器尤其容易踩：容器镜像通常不带桌面依赖，而
+> `scripts/deploy_debian.sh` 与本仓库的 Dockerfile 已预装这些包——
+> 手工起的容器往往没走那条路径。
+
 **`'latin-1' codec can't encode characters in position N: ordinal not in range(256)`**
 
 Cookie 里混进了非 ASCII 字符（最常见是中文搜索词，比如
