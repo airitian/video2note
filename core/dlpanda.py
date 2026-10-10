@@ -563,8 +563,15 @@ def browser_ready() -> tuple[bool, str]:
     except Exception as e:
         first = str(e).strip().splitlines()[0]
         if "Executable doesn't exist" in first or "playwright install" in first:
-            return False, ("已装 playwright 库但缺 Chromium 内核，"
-                           "执行：python -m playwright install chromium")
+            # 不能写死 "python"：容器里通常只有 python3，写死等于
+            # 给出一条必然 command not found 的建议。用当前解释器，
+            # 确保命令指向的正是跑服务的那个环境。
+            import sys
+            exe = sys.executable or "python3"
+            return False, ("已装 playwright 库但缺 Chromium 内核，执行："
+                           f"{exe} -m playwright install chromium"
+                           "（内核与 Python 包是两套独立的东西，"
+                           "必须装到跑服务的这个解释器里）")
         return False, f"Chromium 启动失败：{first}"
 
 

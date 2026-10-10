@@ -10,17 +10,31 @@ URL / 文件 → 解析下载(视频轨+音频轨) → ffmpeg(合并 mp4 / 抽 1
 ## 快速开始
 
 ```bash
+# 0. 确认解释器名。容器/多数 Linux 上只有 python3，没有 python，
+#    写 python 会直接 command not found。下文统一用 python3。
+command -v python3 || command -v python
+
 # 1. 安装依赖
-pip install -r requirements.txt
+python3 -m python3 -m pip install -r requirements.txt
 
 # 2. 装浏览器内核（抖音解析需要，只跑 B站可跳过）
-python -m playwright install --with-deps chromium
+python3 -m playwright install --with-deps chromium
 
 # 3. 启动服务
-python run.py --port 8765          # 打开 http://127.0.0.1:8765
+python3 run.py --port 8765         # 打开 http://127.0.0.1:8765
 
 # 4. 在页面右上角「设置」中填入 API Token，回到「转写工作台」粘贴链接即可
 ```
+
+> 若用虚拟环境（`.venv`），把上面的 `python3` 换成 `.venv/bin/python`。
+> **关键是所有命令都得用同一个解释器**——用另一个 python 装内核，
+> 服务照样报 `Executable doesn't exist`。
+>
+> 不确定跑服务的是哪个解释器？先查出来再装：
+>
+> ```bash
+> ps -eo pid,args | grep '[r]un\.py'   # 第一个字段就是解释器绝对路径
+> ```
 
 > 对外提供服务时加 `--host 0.0.0.0`；在反代后面再加 `--root-path /xxx`。
 
@@ -29,7 +43,7 @@ python run.py --port 8765          # 打开 http://127.0.0.1:8765
 | 依赖 | 说明 |
 |---|---|
 | Python 3.10+ | 必需 |
-| ffmpeg / ffprobe | 必需。缺失时执行 `pip install imageio-ffmpeg` 兜底；也可在设置里填完整路径 |
+| ffmpeg / ffprobe | 必需。缺失时执行 `python3 -m pip install imageio-ffmpeg` 兜底；也可在设置里填完整路径 |
 | yt-dlp | 必需，平台改版频繁，遇到解析失败先升级 |
 | API Token | ASR 用模力方舟 Token；LLM 用各自的 Key（留空自动复用 ASR 的） |
 
@@ -188,12 +202,12 @@ B站：yt-dlp
 
 ```bash
 # 必需：解析（浏览器过 CF）+ 下载（TLS 指纹）
-pip install curl_cffi playwright
-python -m playwright install --with-deps chromium
+python3 -m pip install curl_cffi playwright
+python3 -m playwright install --with-deps chromium
 
 # 国内网络慢，用镜像
 PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
-  python -m playwright install chromium
+  python3 -m playwright install chromium
 ```
 
 健康检查接口会分别报告两项，服务器上排查很方便：
@@ -351,16 +365,16 @@ video2note/
 ### 方式一：直接跑（最简单）
 
 ```bash
-pip install -r requirements.txt
-python -m playwright install --with-deps chromium   # 抖音解析需要，只跑 B站可跳过
+python3 -m pip install -r requirements.txt
+python3 -m playwright install --with-deps chromium   # 抖音解析需要，只跑 B站可跳过
 
-python run.py --host 0.0.0.0 --port 8765
+python3 run.py --host 0.0.0.0 --port 8765
 ```
 
 无 systemd 的容器环境用 `nohup` 常驻：
 
 ```bash
-nohup python -u run.py --host 0.0.0.0 --port 8765 > server.log 2>&1 &
+nohup python3 -u run.py --host 0.0.0.0 --port 8765 > server.log 2>&1 &
 ```
 
 ### 方式二：Docker
@@ -430,14 +444,14 @@ location /v2n/ {
 | 问题 | 处理 |
 |---|---|
 | `Address already in use` | 8765 被占用：换 `--port`，或结束占用进程 |
-| `ModuleNotFoundError: No module named 'core'` | 在项目根目录执行 `python run.py`，不要直接 `python core/...` |
+| `ModuleNotFoundError: No module named 'core'` | 在项目根目录执行 `python3 run.py`，不要直接 `python3 core/...` |
 | 页面无法访问 | 确认监听 `0.0.0.0`（用 `--host 0.0.0.0`） |
 | 视频很慢/内存不足 | 减小 `chunk_seconds`、调低并发，或提高机器资源规格 |
 | 中文乱码 | 代码统一 UTF-8 读写，导出时用 Chrome/Edge 打开 .md |
 | 页面能开但样式/接口 404 | 反代前缀问题：启动时加 `--root-path /你的前缀` |
 | 重启后历史记录没了 | 数据目录被清理；用 `V2N_DATA_DIR` 指定持久化路径，并挂卷 |
 | 抖音一直解析失败 | IP 风控（与 Cookie 无关）：在设置页填代理，或换网络环境 |
-| **抖音解析报 `Executable doesn't exist`** | `pip install playwright` 只装 Python 包，浏览器内核是另一套。执行 `python -m playwright install chromium`（容器里可能还需 `--with-deps`）。健康检查的 `playwright` 字段会真启动一次 Chromium，此项为 false 时 `playwright_msg` 直接给出该命令 |
+| **抖音解析报 `Executable doesn't exist`** | `python3 -m pip install playwright` 只装 Python 包，浏览器内核是另一套。执行 `python3 -m playwright install chromium`（容器里可能还需 `--with-deps`）。健康检查的 `playwright` 字段会真启动一次 Chromium，此项为 false 时 `playwright_msg` 直接给出该命令 |
 | 抖音报验证码 / 滑块拦截 | 服务器 IP 被抖音风控，**换 Cookie 无效**。按序尝试：设置页填代理 → 换网络（手机热点）→ 关闭本机代理软件 |
 | **设置面板是空的 / 少了某几项** | 多半是「前端新、后端旧」：`git pull` 只更新磁盘文件，运行中的 Python 进程不会重新加载，**必须重启服务**。先看设置面板顶部的自检条，它会直接说明是哪种情况；重启方式见下方「按部署方式重启」 |
 | **curl 输入框不显示** | 同上。自检条显示「后端未返回 resolver_curl」即属此类，重启后应变为「✅ 已就位」 |
@@ -468,7 +482,7 @@ sudo systemctl restart video2note
 
 ```bash
 pkill -f "run.py"
-nohup python -u run.py --host 0.0.0.0 --port 8765 > server.log 2>&1 &
+nohup python3 -u run.py --host 0.0.0.0 --port 8765 > server.log 2>&1 &
 ```
 
 **Docker：**
