@@ -104,6 +104,24 @@ class DlpandaError(RuntimeError):
     """解析失败。message 已可直接展示给用户。"""
 
 
+class SlowCDNError(DlpandaError):
+    """下载速度过低，应切换更快的源（备用地址 / 重新解析拿新边缘）。
+
+    不是「下载失败」——连接是通的、能拿到数据，只是边缘在限速。
+    交由 download_video 做回退，而不是当成硬错误抛给用户。
+    """
+
+
+# 慢 CDN 自动回退阈值：下载开头探一段，若实测吞吐低于此值就中断并换源。
+# 抖音快边缘实测 24 MB/s、慢边缘 0.5 MB/s，2 MB/s 留足余量仍能拦住慢边缘。
+SLOW_CDN_THRESHOLD_MBPS = 2.0
+# 探速窗口：至少下这么多字节、且耗时超过这么久，才开始判断，避免抖动误判。
+SLOW_CDN_MIN_PROBE_BYTES = 2 << 20      # 2 MB
+SLOW_CDN_MIN_PROBE_SECONDS = 1.5        # 1.5 s
+# 回退总次数上限（video -> audio -> 重新解析×N），防止边缘全慢时无限重试。
+SLOW_CDN_MAX_FALLBACKS = 3
+
+
 @dataclass
 class ParseResult:
     """一次解析的结果。video_url 为 None 表示只有音频（图文作品）。"""
@@ -403,13 +421,20 @@ def pick_media(video_url: str | None, audio_url: str | None,
 
 
 def download(url: str, dest: Path, referer: str = "https://www.douyin.com/",
-             progress=None, chunk: int = 1 << 18) -> Path:
+             progress=None, chunk: int = 1 << 18,
+             slow_threshold_mbps: float = SLOW_CDN_THRESHOLD_MBPS,
+             min_probe_bytes: int = SLOW_CDN_MIN_PROBE_BYTES,
+             min_probe_seconds: float = SLOW_CDN_MIN_PROBE_SECONDS) -> Path:
     """下载 CDN 直链到本地。
 
     这一步不需要浏览器：抖音 CDN 带 `access-control-allow-origin: *`
     且支持 Range（实测返回 206），普通 HTTP 即可。
 
     做了断点续传：抖音视频常有几十 MB，中断后重跑不用从头下。
+
+    慢 CDN 探测：开头探一段（min_probe_bytes / min_probe_seconds），
+    若实测吞吐低于 slow_threshold_mbps，删除本次残片并抛 SlowCDNError，
+    交由 download_video 切换更快的源（抖音边缘限速是随机的，换源常能翻盘）。
     """
     if not url:
         raise DlpandaError("没有可下载的视频地址")
@@ -456,6 +481,10 @@ def download(url: str, dest: Path, referer: str = "https://www.douyin.com/",
         mode = "ab" if resuming else "wb"
         got = have
         last_pct = -5.0
+        t0 = time.perf_counter()
+        probed = False
+        slow_hit = False
+        slow_msg = ""
         with open(tmp, mode) as f:
             for part in resp.iter_content(chunk):
                 if not part:
@@ -468,6 +497,25 @@ def download(url: str, dest: Path, referer: str = "https://www.douyin.com/",
                         last_pct = pct
                         progress(20.0 + pct * 0.75,
                                  f"下载中 {got / 1048576:.1f}/{total / 1048576:.1f} MB")
+                # 慢 CDN 探速：探窗满足后才判断一次，避免开头抖动误杀快边缘
+                if not probed and got >= min_probe_bytes \
+                        and (time.perf_counter() - t0) >= min_probe_seconds:
+                    probed = True
+                    speed = got / (time.perf_counter() - t0) / 1e6
+                    if speed < slow_threshold_mbps:
+                        # 先退出 with 关掉文件句柄，再删残片——
+                        # Windows 下不能删除仍被本进程打开的文件，否则会抛
+                        # WinError 32 而非 SlowCDNError，回退链就接不住了。
+                        # 残片属于当前被限速的边缘，换源后无法续传，必须清掉。
+                        slow_hit = True
+                        slow_msg = (f"下载速度过慢 {speed:.2f} MB/s（阈值 "
+                                    f"{slow_threshold_mbps:.1f}），切换更快源")
+                        break
+        if slow_hit:
+            tmp.unlink(missing_ok=True)
+            raise SlowCDNError(slow_msg)
+    except SlowCDNError:
+        raise
     except Exception as e:
         raise DlpandaError(f"下载失败：{e}") from e
 
@@ -491,6 +539,12 @@ def download_video(url: str, workdir: Path, max_height: int = 1080,
     """解析 + 下载 + 抽音频，返回与 _ytdlp_download 一致的 meta dict。
 
     这样上层 pipeline 无需关心视频是从哪条通道拿到的。
+
+    下载阶段带慢 CDN 自动回退：抖音边缘限速是随机的（同一条链接实测
+    快边缘 24 MB/s、慢边缘 0.5 MB/s），抽中慢边缘会让 24MB 下 48 秒。
+    download() 开头探速，过慢就抛 SlowCDNError，这里按
+    「video_url -> audio_url -> 重新解析拿新边缘」依次回退，
+    最多 SLOW_CDN_MAX_FALLBACKS 次，仍全慢才当硬错误。
     """
     from . import audio
 
@@ -500,20 +554,74 @@ def download_video(url: str, workdir: Path, max_height: int = 1080,
     if progress:
         progress(8.0, f"解析成功：{result.title[:40]}")
 
-    # 视频优先；不可用时自动退到音频 —— 图文作品、或视频地址失效
-    # （实测有地址会因缺 Referer 返回 403）都不该让整个任务失败。
-    kind, media_url, info = pick_media(result.video_url, result.audio_url)
-    if progress:
-        label = "视频" if kind == "VIDEO" else "音频"
-        progress(10.0, f"{label}可用：{info}")
-    if not media_url:
-        raise DlpandaError(f"没有可下载的媒体。{info}")
+    out = workdir / "source.mp4"
 
-    out = workdir / f"source{_ext_for(media_url)}"
-    download(media_url, out, progress=progress)
+    # 候选源：视频优先，audio_url 作为兜底（可能落在不同 CDN 边缘）。
+    # 全部慢时再走 re_resolve 拿 fresh URLs（新边缘）。每条都重新 pick_media
+    # 探测可用性，跳过 403/失效的地址。
+    def _candidates():
+        yield result.video_url, "VIDEO"
+        if result.audio_url:
+            yield result.audio_url, "AUDIO"
+        # 重新解析：同一条链接换解析时机可能落到更快边缘
+        for _ in range(SLOW_CDN_MAX_FALLBACKS):
+            try:
+                r2 = resolve(url, platform="douyin")
+            except Exception:
+                return
+            if r2.video_url:
+                yield r2.video_url, "VIDEO"
+            if r2.audio_url:
+                yield r2.audio_url, "AUDIO"
+
+    used_kind = None
+    used_url = None
+    last_err = None
+    attempts = 0
+    for cand_url, cand_kind in _candidates():
+        if not cand_url:
+            continue
+        attempts += 1
+        if attempts > SLOW_CDN_MAX_FALLBACKS:
+            break
+        # 切换源前清掉上一个被限速边缘留下的残片，避免 download 误判续传
+        out.with_suffix(out.suffix + ".part").unlink(missing_ok=True)
+        try:
+            # 视频/音频用各自探测（带 Referer 复测），不可用则跳过本候选
+            kind, media_url, info = pick_media(
+                cand_url if cand_kind == "VIDEO" else None,
+                cand_url if cand_kind == "AUDIO" else None)
+            if not media_url:
+                last_err = f"{cand_kind} 源不可用：{info}"
+                continue
+            used_kind = kind
+            used_url = media_url
+            if progress:
+                label = "视频" if kind == "VIDEO" else "音频"
+                tag = f"（回退第{attempts}次）" if attempts > 1 else ""
+                progress(10.0, f"{label}可用{tag}：{info}")
+            # 修正扩展名（不同候选可能是 .mp4 / .webm / .mov）
+            real_out = workdir / f"source{_ext_for(media_url)}"
+            if real_out != out:
+                out.with_suffix(out.suffix + ".part").unlink(missing_ok=True)
+                out = real_out
+            download(media_url, out, progress=progress)
+            last_err = None
+            break
+        except SlowCDNError as e:
+            last_err = str(e)
+            if progress:
+                progress(12.0, f"源过慢，切换更快地址（{attempts}/{SLOW_CDN_MAX_FALLBACKS}）")
+            continue
+        except DlpandaError as e:
+            last_err = str(e)
+            continue
+
+    if last_err is not None and used_url is None:
+        raise DlpandaError(f"没有可下载的媒体。{last_err}")
 
     audio_path = workdir / "audio.mp3"
-    if kind == "VIDEO":
+    if used_kind == "VIDEO":
         # 与 yt-dlp 路径保持一致：确保浏览器可预览，再抽音频给 ASR
         playable = audio.ensure_playable(out, max_height)
         try:
@@ -537,10 +645,10 @@ def download_video(url: str, workdir: Path, max_height: int = 1080,
         "id": result.aweme_id,
         "webpage_url": url,
         "extractor": "dlpanda",
-        "audio_only": "1" if kind == "AUDIO" else "",
-        "media_note": info,
-        "video_url": media_url,
-        "audio_url": result.audio_url or "",
+        "audio_only": "1" if used_kind == "AUDIO" else "",
+        "media_note": "",
+        "video_url": used_url if used_kind == "VIDEO" else "",
+        "audio_url": used_url if used_kind == "AUDIO" else "",
         "cover_url": result.cover_url or "",
         "video_codec": audio.video_codec(playable) or "",
         "video_path": str(playable),
