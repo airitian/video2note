@@ -31,6 +31,9 @@ code, pre, .mono { font-family: var(--wb-font-mono); }
 .topbar p { margin: 2px 0 0; font-size: 12px; color: var(--text-3); }
 .topbar-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .health { font-size: 12px; color: var(--text-2); }
+/* 可点击重新检测依赖；同时兼作「正在检测」的提示位 */
+.health.checking { color: var(--text-3); cursor: progress; }
+.health:not(.checking) { cursor: pointer; }
 .health .bad { color: var(--err); }
 .health .ok { color: var(--text-2); }
 

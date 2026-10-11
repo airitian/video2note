@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from pathlib import Path
 
 from .config import ff_bin
@@ -11,6 +12,11 @@ from .config import ff_bin
 
 class AudioError(RuntimeError):
     pass
+
+
+# check_ffmpeg 的探活结果：(时间戳, 是否正常, 失败原因)
+_ffmpeg_cache: tuple[float, bool, str] | None = None
+_FFMPEG_TTL = 60.0
 
 
 def _run(args: list[str]) -> subprocess.CompletedProcess:
@@ -22,12 +28,28 @@ def _run(args: list[str]) -> subprocess.CompletedProcess:
 
 
 def check_ffmpeg() -> None:
-    r = _run([ff_bin("ffmpeg"), "-version"])
-    if r.returncode != 0:
-        raise AudioError(
-            "未检测到 ffmpeg。请安装 ffmpeg 并加入 PATH，或在设置里填写 ffmpeg 完整路径，"
-            "也可执行 pip install imageio-ffmpeg 使用其自带二进制。"
-        )
+    # ffmpeg 装没装在进程生命周期内不会变，而 check_ffmpeg 在健康检查里
+    # 会被前端每次打开页面都调一次。不缓存的话每次都要 fork 一个
+    # ffmpeg 进程（几十毫秒起，冷启动或慢盘上更久），
+    # 叠加起来就是「打开页面肉眼可见地顿一下」。
+    # 用一个很短的 TTL 兜底，避免用户刚装完 ffmpeg 还要等很久才生效。
+    global _ffmpeg_cache
+    now = time.monotonic()
+    if _ffmpeg_cache is not None and now - _ffmpeg_cache[0] < _FFMPEG_TTL:
+        if _ffmpeg_cache[1]:
+            return
+        raise AudioError(_ffmpeg_cache[2])
+    try:
+        r = _run([ff_bin("ffmpeg"), "-version"])
+        if r.returncode != 0:
+            raise AudioError(
+                "未检测到 ffmpeg。请安装 ffmpeg 并加入 PATH，或在设置里填写 ffmpeg 完整路径，"
+                "也可执行 pip install imageio-ffmpeg 使用其自带二进制。"
+            )
+    except AudioError as e:
+        _ffmpeg_cache = (now, False, str(e))
+        raise
+    _ffmpeg_cache = (now, True, "")
 
 
 def probe_duration(path: Path) -> float:

@@ -1014,6 +1014,14 @@ if (rest.length) {
       }
       return;
     }
+    if (e.target.closest("#health")) {
+      const el = $("#health");
+      el.classList.add("checking");
+      el.innerHTML = "检测中…";
+      loadHealth(true);
+      return;
+    }
+
     if (e.target.id === "btn-start") start();
     else if (e.target.id === "btn-polish") polish();
     else if (e.target.id === "btn-retry") retryTask();
@@ -1066,22 +1074,11 @@ if (rest.length) {
     });
   }
 
-  async function boot() {
-    syncSideBtns();
+  // 渲染顶栏环境自述。独立成函数是为了能「不阻塞页面启动」地调用，
+  // 并且支持点击重新检测（refresh=1 强制重新探测，跳过后端缓存）。
+  async function loadHealth(refresh) {
     try {
-      const list = await api("/api/tasks");
-      list.forEach((t) => tasks.set(t.id, t));
-      const sorted = list.slice().sort((a, b) => b.created_at - a.created_at);
-      if (sorted.length) {
-        currentId = sorted[0].id;
-        sorted.forEach((t) => { if (t.status === "running" || t.status === "pending") follow(t.id); });
-      }
-      render();
-      // 默认选中最近一条，并拉详情回显视频/ 转写 / 文稿
-      if (currentId) loadDetail(currentId);
-    } catch (e) {}
-    try {
-      const h = await api("/api/health");
+      const h = await api("/api/health" + (refresh ? "?refresh=1" : ""));
       const bits = [];
       bits.push(h.ffmpeg ? "ffmpeg 就绪" : '<span class="bad">缺少 ffmpeg</span>');
       bits.push(h.yt_dlp ? "yt-dlp 就绪" : '<span class="bad">缺少 yt-dlp</span>');
@@ -1113,10 +1110,38 @@ if (rest.length) {
       if (v.has_groups === false) {
         bits.push('<span class="bad">后端版本过旧，请 git pull 后重启</span>');
       }
-      $("#health").innerHTML = bits.join(" · ");
+      const el = $("#health");
+      el.innerHTML = bits.join(" · ");
+      el.classList.remove("checking");
+      el.title = "点击重新检测依赖";
     } catch (e) {
-      $("#health").innerHTML = '<span class="bad">后端未连接</span>';
+      const el = $("#health");
+      el.classList.remove("checking");
+      el.innerHTML = '<span class="bad">后端未连接</span>';
     }
+  }
+
+  async function boot() {
+    syncSideBtns();
+    try {
+      const list = await api("/api/tasks");
+      list.forEach((t) => tasks.set(t.id, t));
+      const sorted = list.slice().sort((a, b) => b.created_at - a.created_at);
+      if (sorted.length) {
+        currentId = sorted[0].id;
+        sorted.forEach((t) => { if (t.status === "running" || t.status === "pending") follow(t.id); });
+      }
+      render();
+      // 默认选中最近一条，并拉详情回显视频/ 转写 / 文稿
+      if (currentId) loadDetail(currentId);
+    } catch (e) {}
+    // 健康检查**不 await**：它要探 ffmpeg 子进程与 Chromium 内核，
+    // 曾经把整个页面启动卡住（内核异常时更会等到超时）。
+    // 顶栏那一行文字晚几百毫秒出现无所谓的，绝不能挡住页面可用。
+    const healthEl = $("#health");
+    healthEl.classList.add("checking");
+    healthEl.innerHTML = "检测中…";
+    loadHealth(false);
     // 设置项加载失败不能静默：留一个标记，openSettings 据此给出明确提示。
     // 云机器上最常见的原因是代码没更新——接口存在但字段不同，或直接连不上。
     try {

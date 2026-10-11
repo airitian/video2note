@@ -5,7 +5,10 @@ import asyncio
 import json
 import re
 import shutil
+import threading
+import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -28,7 +31,39 @@ ensure_dirs()
 # 放在 ensure_dirs 之后：迁移要写文件，数据目录必须已存在。
 migrate_secrets()
 
-app = FastAPI(title="视频转笔记", version="1.1.0")
+def _warm_health_cache() -> None:
+    """后台预热依赖探活缓存。
+
+    健康检查的结论（ffmpeg / Chromium 内核）在进程生命周期内基本不变，
+    与其等用户第一次打开页面时再同步探测（页面白等 1~3 秒，
+    内核有问题时更久），不如服务一起来就在后台算好。
+    失败不影响服务启动，只是首次打开稍慢一点。
+    """
+    try:
+        audio.check_ffmpeg()
+    except Exception:
+        pass
+    try:
+        from .dlpanda import browser_ready
+
+        browser_ready()
+    except Exception:
+        pass
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """服务启动时在后台预热健康检查缓存。
+
+    不用 @app.on_event("startup")：它在 FastAPI 0.110+ 已废弃，
+    新版会刷 DeprecationWarning，未来还会移除。
+    """
+    threading.Thread(target=_warm_health_cache, daemon=True).start()
+    yield
+
+
+# lifespan 必须在构造 app 之前定义好，否则这里拿不到这个名字
+app = FastAPI(title="视频转笔记", version="1.1.0", lifespan=_lifespan)
 STATIC = ROOT / "static"
 
 STYLES = ("general", "note", "article", "clean")
@@ -187,7 +222,14 @@ def check_curl(body: SettingsIn):
 
 
 @app.get("/api/health")
-def health():
+def health(refresh: int = 0):
+    """环境自述。
+
+    refresh=1 强制重新探测（改了设置、或刚装完内核想立刻确认时用）。
+    默认走缓存：这个接口在前端的页面启动路径上，而它要探测
+    ffmpeg 子进程与 Chromium 内核——每次都真探测的话，「打开网页」
+    会被一个与网页无关的浏览器启动拖住，看起来就像网站慢。
+    """
     try:
         audio.check_ffmpeg()
         ff, ffmsg = True, ""
@@ -201,11 +243,12 @@ def health():
     # 抖音首选通道（dlpanda）。要真启动一次 Chromium 才知道内核在不在：
     # 「装了库没装内核」时 import 是成功的，光看 available() 会一路显示
     # 正常，直到用户真跑任务才炸出 Executable doesn't exist。
+    # 该探测自带缓存（见 dlpanda.browser_ready），不会每次请求都起浏览器。
     pw_msg = ""
     try:
         from .dlpanda import browser_ready
 
-        pw, pw_msg = browser_ready()
+        pw, pw_msg = browser_ready(max_age=0.0 if refresh else None)
     except Exception as e:
         pw, pw_msg = False, f"检测失败：{e}"
     try:
@@ -216,38 +259,80 @@ def health():
         dy = False
     return {"ffmpeg": ff, "ffmpeg_msg": ffmsg, "yt_dlp": yt,
             "douyin_api": dy, "playwright": pw,
-            "playwright_msg": pw_msg, **_build_info()}
+            "playwright_msg": pw_msg,
+            **_build_info(refresh=bool(refresh))}
 
 
-def _git_rev() -> str:
+_git_rev_cache: tuple[float, str] | None = None
+_GIT_REV_TTL = 30.0
+
+
+def _git_rev(max_age: float | None = None) -> str:
+    """当前 commit 短哈希。
+
+    这会 fork 一个 git 子进程（实测约 300ms），而它挂在 /api/health 上，
+    也就等于挂在页面启动路径上——每次打开网页都白白 fork 一次 git。
+    commit 在进程生命周期内不会变（除非有人在运行中切了分支，
+    那种情况 30 秒后自然跟上），所以缓存起来。
+    """
+    global _git_rev_cache
+    ttl = _GIT_REV_TTL if max_age is None else max_age
+    c = _git_rev_cache
+    if c is not None and ttl > 0 and (time.monotonic() - c[0]) < ttl:
+        return c[1]
     try:
         import subprocess
         out = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=str(ROOT), capture_output=True, text=True, timeout=3)
-        return (out.stdout or "").strip()
+        rev = (out.stdout or "").strip()
     except Exception:
-        return ""
+        rev = ""
+    _git_rev_cache = (time.monotonic(), rev)
+    return rev
 
 
-def _build_info() -> dict:
+_assets_cache: tuple[float, str] | None = None
+_ASSETS_TTL = 30.0
+
+
+def _assets_stamp(max_age: float | None = None) -> str:
+    """index.html 里的静态资源版本戳。
+
+    index.html 在磁盘上不会自己变，但每次健康检查都重读一遍没必要，
+    与 git commit 一起按同样的 TTL 缓存。
+    """
+    global _assets_cache
+    ttl = _ASSETS_TTL if max_age is None else max_age
+    c = _assets_cache
+    if c is not None and ttl > 0 and (time.monotonic() - c[0]) < ttl:
+        return c[1]
+    stamp = ""
+    try:
+        html = (STATIC / "index.html").read_text("utf-8")
+        m = re.search(r"v=(\d+[a-z]*)", html)
+        stamp = m.group(1) if m else ""
+    except Exception:
+        stamp = ""
+    _assets_cache = (time.monotonic(), stamp)
+    return stamp
+
+
+def _build_info(refresh: bool = False) -> dict:
     """版本与能力自述。
 
     「云机器上改了代码但页面没变」这类问题，光靠猜是猜不出来的——
     到底是没 git pull、pull 了没重启、还是浏览器缓存，得让人一眼看到。
     页面右下角会显示这个 commit，点「设置」也能看到接口返回了哪些字段。
+
+    refresh=True（/api/health?refresh=1）时跳过缓存重新读，
+    这样刚 git pull 完点一下顶栏就能看到新版本号。
     """
-    static = {}
-    try:
-        html = (STATIC / "index.html").read_text("utf-8")
-        m = re.search(r"v=(\d+[a-z]*)", html)
-        static["assets"] = m.group(1) if m else ""
-    except Exception:
-        static["assets"] = ""
+    max_age = 0.0 if refresh else None
     return {
         "version": {
-            "commit": _git_rev(),
-            "assets": static["assets"],
+            "commit": _git_rev(max_age=max_age),
+            "assets": _assets_stamp(max_age=max_age),
             # 关键能力位：前端据此判断后端是不是新版本
             "has_groups": bool(SETTINGS_GROUPS),
             "settings_keys": len(HELP),

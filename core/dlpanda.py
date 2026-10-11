@@ -40,7 +40,10 @@ CF 的 clearance 绑定了浏览器指纹细节，无法用脚本伪造。
 from __future__ import annotations
 
 import html as _html
+import os
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -555,32 +558,56 @@ def _ext_for(url: str) -> str:
     return ".mp4"
 
 
-def browser_ready() -> tuple[bool, str]:
-    """Chromium 内核是否真的装好了。
+def _chromium_exe() -> Path | None:
+    """定位 Chromium 内核文件（只查文件系统，不启动浏览器）。
 
-    为什么不能只看 import：`pip install playwright` 只装 Python 包，
-    浏览器二进制是另一套东西，默认落在 ~/.cache/ms-playwright/。
-    两者独立，服务器上「装了库没装内核」是最常见的坑，
-    表现为一启动就报
-        BrowserType.launch: Executable doesn't exist at ...
-        /root/.cache/ms-playwright/chromium-XXXX/chrome-linux/chrome
-    而`import playwright` 依然成功——不实际启动一次就分辨不出来。
-
-    这里真启动一个 headless 实例再关掉，多花不到一秒，
-    但能把「看着正常、一用就炸」提前暴露在健康检查里。
-
-    启动参数必须与业务侧chromium.launch 处保持一致，否则会出现
-    「健康检查说不可用、业务其实能用」的反向误报：服务器 /dev/shm
-    默认只有 64MB，缺 --disable-dev-shm-usage 时 Chromium 一启动就崩，
-    报的还是一句含糊的「Target page, context or browser has been closed」。
+    用来区分两类完全不同的故障：
+      · 内核根本没装  -> 路径不存在
+      · 内核装了但一启动就崩（/dev/shm 太小、版本不匹配、缺系统库）
+    路径存在性检查是纯 stat，微秒级；「能不能起来」才需要真启动。
     """
+    # Playwright 支持用环境变量改安装位置，优先按它的规则找
+    root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or os.path.expanduser(
+        "~/.cache/ms-playwright")
+    if not os.path.isabs(root):
+        root = os.path.join(os.getcwd(), root)
+    try:
+        entries = sorted(Path(root).glob("chromium*"))
+    except OSError:
+        return None
+    for d in entries:
+        for rel in ("chrome-linux/chrome",
+                    "chrome-linux64/chrome",
+                    "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+                    "chrome-win/chrome.exe",
+                    "chrome-win64/chrome.exe"):
+            p = d / rel
+            if p.exists():
+                return p
+    return None
+
+
+def _browser_ready_uncached() -> tuple[bool, str]:
+    """真启动一次 Chromium 确认内核可用。慢，只在缓存失效时调用。"""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         return False, f"未安装 playwright 库（{_exe()} -m pip install playwright）"
+
+    # 先用文件存在性做一次便宜的判断：内核压根没装时没必要启动，
+    # 直接把「Executable doesn't exist」翻译成可执行的修复命令。
+    if _chromium_exe() is None:
+        return False, ("未找到 Chromium 内核，执行："
+                       f"{_exe()} -m playwright install chromium"
+                       "（内核与 Python 包是两套独立的东西，"
+                       "必须装到跑服务的这个解释器里）")
+
     try:
+        # 显式给启动设上限：Playwright 默认等 30 秒。内核损坏时进程
+        # 可能既不报错也不退出，只能干等——健康检查绝不能被它拖住，
+        # 超时按失败处理即可（下面的异常分支会给出修复命令）。
         with sync_playwright() as p:
-            b = p.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+            b = p.chromium.launch(headless=True, args=_LAUNCH_ARGS, timeout=8000)
             b.close()
         return True, ""
     except Exception as e:
@@ -602,6 +629,47 @@ def browser_ready() -> tuple[bool, str]:
                            f"②系统库缺失，执行 "
                            f"{_exe()} -m playwright install --with-deps chromium")
         return False, f"Chromium 启动失败：{first}"
+
+
+# 探测结果缓存：Chromium 内核装没装、能不能起来，在进程生命周期内
+# 几乎不变。每次请求都真启动一次浏览器是最贵的做法——健康检查被前端
+# 放在页面启动路径上，于是「打开页面」直接变成「等 Chromium 起一次」，
+# 内核有问题时更要等满 Playwright 的 30 秒超时。
+_browser_cache: tuple[float, tuple[bool, str]] | None = None
+_BROWSER_TTL = 300.0          # 成功结果缓存 5 分钟
+_BROWSER_TTL_FAIL = 30.0      # 失败结果缓存短一些，便于装完内核尽快恢复
+_browser_lock = threading.Lock()
+
+
+def browser_ready(max_age: float | None = None) -> tuple[bool, str]:
+    """Chromium 内核是否真的可用（带缓存）。
+
+    为什么要有缓存：健康检查在页面启动路径上，每次都真启动浏览器要
+    1~3 秒，内核损坏时更会挂到超时——用户看到的是「网页打不开」，
+    而实际卡在一个跟网页毫无关系的后台探测上。内核状态在几分钟内
+    不会变，缓存完全够用；真要立刻复查用 max_age=0。
+
+    线程安全：并发首个请求会真正探测，其余请求等同一个结果，
+    不会一起启动 N 个 Chromium（那会互相抢 CPU，反而更慢）。
+    """
+    global _browser_cache
+    now = time.monotonic()
+    ttl = max_age
+    if ttl is None:
+        c = _browser_cache
+        if c is not None:
+            ok = c[1][0]
+            ttl = _BROWSER_TTL if ok else _BROWSER_TTL_FAIL
+            if now - c[0] < ttl:
+                return c[1]
+    with _browser_lock:
+        # 双检：等锁期间可能已被别的线程探测完
+        c = _browser_cache
+        if c is not None and ttl is not None and time.monotonic() - c[0] < ttl:
+            return c[1]
+        val = _browser_ready_uncached()
+        _browser_cache = (time.monotonic(), val)
+        return val
 
 
 def available() -> bool:
