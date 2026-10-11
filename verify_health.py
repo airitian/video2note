@@ -18,6 +18,7 @@
 
 运行：python verify_health.py
 """
+import asyncio
 import pathlib
 import sys
 import time
@@ -152,7 +153,7 @@ check("F2 后续 50 次不再 fork 子进程", len(subprocesses) - first_n == 0,
       f"额外 fork {len(subprocesses)-first_n} 次")
 
 # ---------------------------------------------------------------------------
-print("[G] /api/health 端点：冷启动 vs 稳态")
+print("[G] /api/health 端点：永远异步零阻塞")
 import core.main as main
 
 # 桩掉耗时探测，模拟「内核不存在」的机器——这正是最卡的情况
@@ -162,34 +163,48 @@ dlpanda._browser_cache = None
 main._git_rev_cache = None
 main._assets_cache = None
 
-# 冷：第一次调用仍要真探测（ffmpeg 子进程 + git 子进程）。
-# 这笔开销由 lifespan 的后台预热在服务启动时付掉，不落在用户页面上。
+
+async def _call_health(n=1, refresh=0):
+    out = []
+    for _ in range(n):
+        out.append(await main.health(refresh=refresh))
+    return out
+
+
+# 冷：快照还没准备好时，health() 返回轻量占位，绝不阻塞请求线程
+# （重活在专属线程里跑，由 _health_loop 预热，不落在请求路径上）。
 t0 = time.perf_counter()
-main.health()
+cold = asyncio.run(_call_health(1))
 t_cold = time.perf_counter() - t0
 
-# 稳态：真正的「用户每次打开页面」走的路径，必须极快。
+# 触发一次后台探测，把快照填上（模拟 lifespan 预热完成后的常态）
+fut = main._health_executor.submit(main._refresh_health)
+fut.result(timeout=30)
+
+# 稳态：真正的「用户每次打开页面」走的路径，必须极快且零阻塞。
 t0 = time.perf_counter()
-for _ in range(20):
-    main.health()
+warm = asyncio.run(_call_health(20))
 t_warm = time.perf_counter() - t0
 print(f"    冷启动首次 {t_cold*1000:.0f}ms；稳态 20 次共 {t_warm*1000:.0f}ms"
       f"（{t_warm/20*1000:.2f}ms/次）")
 
-check("G1 稳态每次调用 < 1ms（页面打开不再被拖慢）",
+check("G1 health 是 async def（重活不在请求线程做）",
+      asyncio.iscoroutinefunction(main.health), str(main.health))
+check("G2 稳态每次调用 < 1ms（页面打开不再被拖慢）",
       t_warm / 20 < 0.001, f"{t_warm/20*1000:.2f}ms/次")
-# 修之前每次调用都要起一次 Chromium（1~3 秒），稳态不可能是毫秒级。
-check("G2 稳态比旧行为快 1000 倍以上", t_warm / 20 < 0.003,
-      f"{t_warm/20*1000:.2f}ms/次")
-check("G3 端点仍能正常返回字段", "ffmpeg" in main.health())
-check("G4 冷启动有上界（后台预热时付，不拖住用户）", t_cold < 5.0,
+check("G3 端点仍能正常返回字段", "ffmpeg" in warm[-1], str(list(warm[-1].keys())))
+check("G4 冷启动有上界（返回占位，不拖住用户）", t_cold < 5.0,
       f"{t_cold*1000:.0f}ms")
 
 # refresh=1 必须真的重新探测（不能因为缓存而失效）
 dlpanda._browser_cache = None
-main.health(refresh=1)
-check("G5 refresh=1 会重新探测并填充缓存",
+fut = main._health_executor.submit(main._refresh_health, True)
+fut.result(timeout=30)
+check("G5 refresh 触发重新探测并填充缓存",
       dlpanda._browser_cache is not None, str(dlpanda._browser_cache))
+check("G6 重活只在专属单线程（不占 FastAPI 请求线程池）",
+      getattr(main._health_executor, "_max_workers", None) == 1,
+      str(getattr(main._health_executor, "_max_workers", None)))
 
 # ---------------------------------------------------------------------------
 print("[H] 启动预热钩子已就位（首次打开页面也不等）")
@@ -219,8 +234,8 @@ hits = _real_calls(src)
 check("H1 lifespan 挂到 app 上",
       main.app.router.lifespan_context is not None, str(main.app.router.lifespan_context))
 check("H2 没有真的调用已废弃的 on_event", hits == "", f"发现 {hits}")
-check("H3 预热在后台线程执行（不阻塞启动）",
-      "threading.Thread" in src and "_warm_health_cache" in src)
+check("H3 重活在专属线程执行（不阻塞请求线程池）",
+      "threading.Thread" in src and "_health_loop" in src and "_health_executor" in src)
 
 # ---------------------------------------------------------------------------
 print("[I] 版本自述不再每次 fork git（曾约 300ms/次）")

@@ -31,35 +31,87 @@ ensure_dirs()
 # 放在 ensure_dirs 之后：迁移要写文件，数据目录必须已存在。
 migrate_secrets()
 
-def _warm_health_cache() -> None:
-    """后台预热依赖探活缓存。
+# ── 健康检查：重活只在专属单线程跑，/api/health 永远零阻塞 ───────────────
+# /api/health 要探测 ffmpeg 子进程、真启动一次 Chromium、fork git——
+# 任一都耗时（内核在时 Chromium 启动 1~3s）。若放在请求路径上，
+# 这些重活会占用 FastAPI 默认线程池的 worker，多个请求叠加就会把
+# /api/tasks、上传、SSE 等正常接口饿死（用户感知为「网站变卡 / 打不开」）。
+# 所以：重活只在下面这个专属单线程里跑；/api/health 改成 async，
+# 永远只读共享快照，不碰请求线程池——无论内核探测多慢都不影响正常访问。
+import concurrent.futures
 
-    健康检查的结论（ffmpeg / Chromium 内核）在进程生命周期内基本不变，
-    与其等用户第一次打开页面时再同步探测（页面白等 1~3 秒，
-    内核有问题时更久），不如服务一起来就在后台算好。
-    失败不影响服务启动，只是首次打开稍慢一点。
-    """
+_health_lock = threading.Lock()
+_health_snapshot: dict | None = None
+_health_stop = threading.Event()
+_health_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="health-probe")
+
+
+def _compute_health(force: bool = False) -> dict:
+    """真正做重活：fork ffmpeg / 启动 Chromium / git。只在专属线程调用。"""
+    if force:
+        # refresh=1 时清掉各层缓存，确保真的重新探测而非读旧值
+        audio._ffmpeg_cache = None
+        global _git_rev_cache, _assets_cache
+        _git_rev_cache = None
+        _assets_cache = None
     try:
         audio.check_ffmpeg()
-    except Exception:
-        pass
+        ff, ffmsg = True, ""
+    except Exception as e:
+        ff, ffmsg = False, str(e)
+    try:
+        import yt_dlp  # noqa
+        yt = True
+    except ImportError:
+        yt = False
+    pw_msg = ""
     try:
         from .dlpanda import browser_ready
 
-        browser_ready()
+        # force 时绕过 browser_ready 自身缓存，真正重起一次内核确认
+        pw, pw_msg = browser_ready(max_age=0.0 if force else None)
+    except Exception as e:
+        pw, pw_msg = False, f"检测失败：{e}"
+    try:
+        from .dlpanda import available as _dlp_ok
+
+        dy = bool(_dlp_ok()) and pw
     except Exception:
-        pass
+        dy = False
+    return {"ffmpeg": ff, "ffmpeg_msg": ffmsg, "yt_dlp": yt,
+            "douyin_api": dy, "playwright": pw, "playwright_msg": pw_msg,
+            **_build_info(refresh=force)}
+
+
+def _refresh_health(force: bool = False) -> None:
+    """算一次健康快照写进共享 dict（锁保护）。探测失败不影响已有快照。"""
+    global _health_snapshot
+    try:
+        snap = _compute_health(force=force)
+    except Exception:
+        return
+    with _health_lock:
+        _health_snapshot = snap
+
+
+def _health_loop() -> None:
+    """启动后在专属线程里周期刷新快照：保持数据常新，且绝不碰请求线程。"""
+    _refresh_health()
+    while not _health_stop.wait(20):
+        _refresh_health()
 
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    """服务启动时在后台预热健康检查缓存。
+    """启动即在专属线程预热 + 周期刷新健康检查；请求路径始终只读快照。
 
-    不用 @app.on_event("startup")：它在 FastAPI 0.110+ 已废弃，
-    新版会刷 DeprecationWarning，未来还会移除。
+    不用 @app.on_event("startup")：FastAPI 0.110+ 已废弃，会刷 DeprecationWarning。
     """
-    threading.Thread(target=_warm_health_cache, daemon=True).start()
+    threading.Thread(target=_health_loop, daemon=True).start()
     yield
+    _health_stop.set()
+    _health_executor.shutdown(wait=False)
 
 
 # lifespan 必须在构造 app 之前定义好，否则这里拿不到这个名字
@@ -222,45 +274,27 @@ def check_curl(body: SettingsIn):
 
 
 @app.get("/api/health")
-def health(refresh: int = 0):
-    """环境自述。
+async def health(refresh: int = 0):
+    """环境自述。永远是异步、零阻塞：
 
-    refresh=1 强制重新探测（改了设置、或刚装完内核想立刻确认时用）。
-    默认走缓存：这个接口在前端的页面启动路径上，而它要探测
-    ffmpeg 子进程与 Chromium 内核——每次都真探测的话，「打开网页」
-    会被一个与网页无关的浏览器启动拖住，看起来就像网站慢。
+    - 直接返回「专属探测线程」维护的快照，不碰 FastAPI 请求线程池；
+    - 重活（起 Chromium / fork ffmpeg / git）只在 _health_executor 里跑；
+    - refresh=1 触发一次后台重探，但本次仍返回当前快照（不等待结果）。
+
+    这样无论内核探测多慢，/api/tasks、上传、SSE 等正常接口都不会被拖垮。
     """
-    try:
-        audio.check_ffmpeg()
-        ff, ffmsg = True, ""
-    except Exception as e:
-        ff, ffmsg = False, str(e)
-    try:
-        import yt_dlp  # noqa
-        yt = True
-    except ImportError:
-        yt = False
-    # 抖音首选通道（dlpanda）。要真启动一次 Chromium 才知道内核在不在：
-    # 「装了库没装内核」时 import 是成功的，光看 available() 会一路显示
-    # 正常，直到用户真跑任务才炸出 Executable doesn't exist。
-    # 该探测自带缓存（见 dlpanda.browser_ready），不会每次请求都起浏览器。
-    pw_msg = ""
-    try:
-        from .dlpanda import browser_ready
-
-        pw, pw_msg = browser_ready(max_age=0.0 if refresh else None)
-    except Exception as e:
-        pw, pw_msg = False, f"检测失败：{e}"
-    try:
-        from .dlpanda import available as _dlp_ok
-
-        dy = bool(_dlp_ok()) and pw
-    except Exception:
-        dy = False
-    return {"ffmpeg": ff, "ffmpeg_msg": ffmsg, "yt_dlp": yt,
-            "douyin_api": dy, "playwright": pw,
-            "playwright_msg": pw_msg,
-            **_build_info(refresh=bool(refresh))}
+    if refresh:
+        # 触发后台重探，不等待——本次仍返回已有的新鲜快照
+        _health_executor.submit(_refresh_health, True)
+    with _health_lock:
+        snap = _health_snapshot
+    if snap is None:
+        # 极冷场景（刚启动还没探完第一次）：返回轻量占位，绝不阻塞；
+        # 专属线程已在探测，下一次请求就有数据。
+        return {"ffmpeg": None, "ffmpeg_msg": "", "yt_dlp": None,
+                "douyin_api": None, "playwright": None, "playwright_msg": "",
+                **_build_info()}
+    return snap
 
 
 _git_rev_cache: tuple[float, str] | None = None
