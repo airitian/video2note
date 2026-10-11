@@ -8,10 +8,58 @@
   // 每个任务一个 AbortController：切换任务时主动 abort 旧连接的 fetch，
   // 否则旧的 SSE 会一直 hanging，断开后又被 scheduleReconnect 无限重连（#1 泄漏）。
   const controllers = new Map();
+  // 轮询兜底（应对预览代理缓冲 SSE 流导致 partial 到不了浏览器）：
+  // 每个被 follow 的任务额外挂一个定时拉详情的计时器，SSE 静默超时就补拉一次。
+  const pollers = new Map();
+  const lastSseAt = new Map();
+  const pollingInFlight = new Set();
+  const POLL_INTERVAL_MS = 1500;   // 兜底轮询周期
+  // SSE 超过这么久没数据才启用轮询。故意压短：预览代理(monkeycode-ai.online)
+  // 会缓冲 SSE 流，partial 到不了浏览器，页面冻在 0%；窗口太长用户会以为还卡。
+  // 直连环境 SSE 持续推数据(节流 0.4s)，2.5s 内必有 lastSseAt 刷新，轮询不会误触发。
+  const SSE_SILENCE_MS = 2500;
+
+  function clearPoller(tid) {
+    const iv = pollers.get(tid);
+    if (iv) { clearInterval(iv); pollers.delete(tid); }
+  }
 
   function stopFollow(tid) {
     const c = controllers.get(tid);
     if (c) c.abort();
+    clearPoller(tid);
+    lastSseAt.delete(tid);
+  }
+
+  // 轮询兜底：代理缓冲 SSE 时，partial 被卡在网关、页面冻在 0%；
+  // 周期拉一次 /api/tasks/<tid>（即刷新走的非流式详情接口，代理不缓冲）回填进度，
+  // 保证「转多少显多少」在代理环境下也成立。SSE 一旦有数据就暂停轮询，不浪费请求。
+  async function _pollTick(tid) {
+    const t = tasks.get(tid);
+    if (!t) { clearPoller(tid); return; }
+    // 终态由 eof / loadDetail 收口，不必再轮询
+    if (t.status === "done" || t.status === "failed"
+        || t.status === "canceled" || t.status === "transcribed") {
+      clearPoller(tid); return;
+    }
+    // SSE 最近 4 秒内还有数据，信任它，跳过本轮
+    if (following.has(tid)
+        && (Date.now() - (lastSseAt.get(tid) || 0)) < SSE_SILENCE_MS) return;
+    if (pollingInFlight.has(tid)) return;   // 上次还没回来，避免请求堆叠
+    pollingInFlight.add(tid);
+    try {
+      await refreshOne(tid);                // 原地合并 + 本地增量优先
+      const cur = tasks.get(tid);
+      if (cur) { ws.linesTask = null; ws.linesSig = null; render(); }
+    } catch (e) { /* 网络抖动忽略，下个周期再试 */ }
+    finally { pollingInFlight.delete(tid); }
+  }
+
+  function startPolling(tid) {
+    clearPoller(tid);
+    lastSseAt.set(tid, Date.now());         // 先给 SSE 一个窗口，别一上来就拉
+    const iv = setInterval(() => _pollTick(tid), POLL_INTERVAL_MS);
+    pollers.set(tid, iv);
   }
   let currentId = null;
   let pickedFile = null;
@@ -526,6 +574,7 @@
     const ctrl = new AbortController();
     controllers.set(tid, ctrl);
     let reachedEof = false;
+    startPolling(tid);             // 轮询兜底：代理缓冲 SSE 时也能回填进度
     try {
       const r = await fetch("/api/tasks/" + tid + "/events", { signal: ctrl.signal });
       const reader = r.body.getReader();
@@ -544,6 +593,7 @@
           const t = tasks.get(tid);
           if (!t) continue;
           clearRetry(tid);          // 收到事件 = 连接正常，退避计数归零
+          lastSseAt.set(tid, Date.now());   // 标记 SSE 有数据，暂停轮询
           if (ev.type === "state") {
             t.status = ev.status; t.stage = ev.stage; t.percent = ev.percent;
             t.spercent = ev.spercent; t.message = ev.message; t.error = ev.error;
@@ -563,6 +613,7 @@
             t.meta = ev.meta || {};
             ws.videoKey = null;
           } else if (ev.type === "eof") {
+            clearPoller(tid);       // 任务结束，停掉轮询兜底
             // eof 携带最终结果，先就地采用，避免依赖 refreshOne 的网络往返
             // ——那次往返失败或慢时，页面就会停在不完整的增量内容上。
             reachedEof = true;
