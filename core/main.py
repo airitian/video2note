@@ -291,10 +291,17 @@ async def health(refresh: int = 0):
     if snap is None:
         # 极冷场景（刚启动还没探完第一次）：返回轻量占位，绝不阻塞；
         # 专属线程已在探测，下一次请求就有数据。
-        return {"ffmpeg": None, "ffmpeg_msg": "", "yt_dlp": None,
+        snap = {"ffmpeg": None, "ffmpeg_msg": "", "yt_dlp": None,
                 "douyin_api": None, "playwright": None, "playwright_msg": "",
                 **_build_info()}
-    return snap
+    # 显式关掉代理缓冲 + 禁止缓存：预览网关(monkeycode-ai.online)会缓冲
+    # 响应，曾导致 SSE 推流到不了浏览器；即便普通 JSON 也带上，双保险。
+    return Response(
+        content=json.dumps(snap, ensure_ascii=False),
+        media_type="application/json",
+        headers={"Cache-Control": "no-store, no-transform",
+                 "X-Accel-Buffering": "no"},
+    )
 
 
 _git_rev_cache: tuple[float, str] | None = None

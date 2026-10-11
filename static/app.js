@@ -1128,48 +1128,66 @@ if (rest.length) {
   // 渲染顶栏环境自述。独立成函数是为了能「不阻塞页面启动」地调用，
   // 并且支持点击重新检测（refresh=1 强制重新探测，跳过后端缓存）。
   async function loadHealth(refresh) {
+    // 顶栏「检测中…」一旦卡死，说明 /api/health 请求没回来——
+    // 云机器上多半是后端进程没起来 / 被预览代理(monkeycode-ai.online)缓冲掐住。
+    // 这里加 6s 超时 + 失败自动重试，绝不无限转圈：超时就亮「后端未连接」，
+    // 后端恢复后下次轮询自动刷新回来。
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 6000);
+    let h;
     try {
-      const h = await api("/api/health" + (refresh ? "?refresh=1" : ""));
-      const bits = [];
-      bits.push(h.ffmpeg ? "ffmpeg 就绪" : '<span class="bad">缺少 ffmpeg</span>');
-      bits.push(h.yt_dlp ? "yt-dlp 就绪" : '<span class="bad">缺少 yt-dlp</span>');
-      // 抖音通道：必须报真实原因。「装了 playwright 库但没装浏览器内核」
-      // 时import 是成功的，只显示 ready 会让用户跑到下载时才炸出
-      // Executable doesn't exist，title 里直接给出修复命令。
-      if (h.playwright) {
-        bits.push('<span class="ok" title="' + esc(h.playwright_msg || "")
-          + '">抖音通道就绪</span>');
-      } else {
-        bits.push('<span class="bad" title="' + esc(h.playwright_msg || "")
-          + '">抖音通道不可用</span>');
-      }
-      const v = h.version || {};
-      // 把版本号亮出来：云机器上「看不到某个功能」时，第一件事就是确认
-      // 浏览器连的是不是最新代码，而不是靠猜缓存/没重启
-      if (v.commit || v.assets) {
-        bits.push('<span class="ver" title="git commit / 静态资源版本戳">v'
-          + esc(v.commit || "?") + (v.assets ? " · " + esc(v.assets) : "") + "</span>");
-      } else {
-        // ★ 后端连版本自述都没有 = 它跑的是 63f7a8e 之前的代码。
-        // 这种情况顶栏必须开口，否则用户看到的是一个「一切正常」的页面，
-        // 只有设置面板里才冒出那句「后端未返回 resolver_curl」——
-        // 而那句会被理解成前端坏了。版本不一致必须在这里就说清楚。
-        bits.push('<span class="bad" title="后端进程仍在运行旧代码，'
-          + 'git pull 只更新磁盘文件，不会让运行中的进程重新加载">'
-          + "后端代码过旧（无版本自述），请重启服务</span>");
-      }
-      if (v.has_groups === false) {
-        bits.push('<span class="bad">后端版本过旧，请 git pull 后重启</span>');
-      }
-      const el = $("#health");
-      el.innerHTML = bits.join(" · ");
-      el.classList.remove("checking");
-      el.title = "点击重新检测依赖";
+      const r = await fetch("/api/health" + (refresh ? "?refresh=1" : ""), {
+        headers: { "Content-Type": "application/json" },
+        signal: ctrl.signal,
+      });
+      if (!r.ok) throw new Error("请求失败 " + r.status);
+      h = await r.json();
     } catch (e) {
+      clearTimeout(timer);
       const el = $("#health");
       el.classList.remove("checking");
-      el.innerHTML = '<span class="bad">后端未连接</span>';
+      el.innerHTML = '<span class="bad" title="后端无响应：进程可能没启动，'
+        + '或预览代理缓冲了请求。点此手动重试">后端未连接</span>';
+      // 非手动触发才自动重试：后端临时抽风/刚重启时自愈，不必用户守着点
+      if (!refresh) setTimeout(() => loadHealth(false), 8000);
+      return;
     }
+    clearTimeout(timer);
+    const bits = [];
+    bits.push(h.ffmpeg ? "ffmpeg 就绪" : '<span class="bad">缺少 ffmpeg</span>');
+    bits.push(h.yt_dlp ? "yt-dlp 就绪" : '<span class="bad">缺少 yt-dlp</span>');
+    // 抖音通道：必须报真实原因。「装了 playwright 库但没装浏览器内核」
+    // 时import 是成功的，只显示 ready 会让用户跑到下载时才炸出
+    // Executable doesn't exist，title 里直接给出修复命令。
+    if (h.playwright) {
+      bits.push('<span class="ok" title="' + esc(h.playwright_msg || "")
+        + '">抖音通道就绪</span>');
+    } else {
+      bits.push('<span class="bad" title="' + esc(h.playwright_msg || "")
+        + '">抖音通道不可用</span>');
+    }
+    const v = h.version || {};
+    // 把版本号亮出来：云机器上「看不到某个功能」时，第一件事就是确认
+    // 浏览器连的是不是最新代码，而不是靠猜缓存/没重启
+    if (v.commit || v.assets) {
+      bits.push('<span class="ver" title="git commit / 静态资源版本戳">v'
+        + esc(v.commit || "?") + (v.assets ? " · " + esc(v.assets) : "") + "</span>");
+    } else {
+      // ★ 后端连版本自述都没有 = 它跑的是 63f7a8e 之前的代码。
+      // 这种情况顶栏必须开口，否则用户看到的是一个「一切正常」的页面，
+      // 只有设置面板里才冒出那句「后端未返回 resolver_curl」——
+      // 而那句会被理解成前端坏了。版本不一致必须在这里就说清楚。
+      bits.push('<span class="bad" title="后端进程仍在运行旧代码，'
+        + 'git pull 只更新磁盘文件，不会让运行中的进程重新加载">'
+        + "后端代码过旧（无版本自述），请重启服务</span>");
+    }
+    if (v.has_groups === false) {
+      bits.push('<span class="bad">后端版本过旧，请 git pull 后重启</span>');
+    }
+    const el = $("#health");
+    el.innerHTML = bits.join(" · ");
+    el.classList.remove("checking");
+    el.title = "点击重新检测依赖";
   }
 
   async function boot() {
