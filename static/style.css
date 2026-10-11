@@ -38,20 +38,27 @@ code, pre, .mono { font-family: var(--wb-font-mono); }
 .health .ok { color: var(--text-2); }
 
 /* 三栏布局：左=历史记录，中=主工作区，右=处理日志 */
-.layout { display: grid; grid-template-columns: 272px minmax(0, 1fr) 300px; gap: 16px; align-items: start; max-width: 1600px; margin: 0 auto; padding: 16px 24px 48px; }
+.layout { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 16px; align-items: start; max-width: 1600px; margin: 0 auto; padding: 16px 24px 48px; }
 .side { position: sticky; top: 78px; }
+/* 侧栏宽度放在卡片上：折叠(display:none)时 auto 轨道自动收为 0，不留空白 */
+#side-left .side-card { width: 272px; }
+#side-right .side-card { width: 300px; }
 .side-card { display: flex; flex-direction: column; max-height: calc(100vh - 100px); padding: 14px 12px; }
 .side.folded { display: none; }
 /* grid item 默认 min-width:auto，内容一多就把列撑宽导致横向滚动 */
 .layout > * { min-width: 0; }
 /* 中等宽度：先收窄两侧栏 + 中间改单列，死保三栏结构 */
 @media (max-width: 1240px) {
-  .layout { grid-template-columns: 214px minmax(0, 1fr) 246px; gap: 12px; padding: 16px 14px 48px; }
+  .layout { grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; padding: 16px 14px 48px; }
+  #side-left .side-card { width: 214px; }
+  #side-right .side-card { width: 246px; }
   .composer .input-grid, .ws-grid { grid-template-columns: 1fr; }
 }
 /* 再窄一档：两侧栏压到最小，仍然保持三栏 */
 @media (max-width: 960px) {
-  .layout { grid-template-columns: 168px minmax(0, 1fr) 196px; gap: 10px; padding: 14px 10px 40px; }
+  .layout { grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; padding: 14px 10px 40px; }
+  #side-left .side-card { width: 168px; }
+  #side-right .side-card { width: 196px; }
 }
 /* 只有极窄屏（<720px，手机竖屏）才允许堆叠 */
 @media (max-width: 720px) {
