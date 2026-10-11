@@ -188,6 +188,12 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 .field textarea { width: 100%; padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: 8px; font-size: 12px; line-height: 1.6; resize: vertical; font-family: var(--wb-font-mono); }
 .modal-foot { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
 
+/* 删除确认弹窗：比设置面板窄，专注一句话确认 */
+.modal-body.narrow { width: 420px; }
+.confirm-msg { margin: 14px 0 0; font-size: 14px; line-height: 1.7; color: var(--text-2); }
+.confirm-msg b { color: var(--text); font-weight: 600; word-break: break-all; }
+.confirm-sub { font-size: 12.5px; color: var(--text-3); }
+
 .toast { position: fixed; left: 50%; bottom: 32px; transform: translateX(-50%); background: #1a1d21; color: #fff; padding: 10px 18px; border-radius: 9px; font-size: 13px; z-index: 99; }
 .toast.err { background: var(--err); }
 

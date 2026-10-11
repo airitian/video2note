@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>抖音 / B站 视频转文字</title>
-<link rel="stylesheet" href="/static/style.css?v=20261011ab">
+<link rel="stylesheet" href="/static/style.css?v=20261011ac">
 </head>
 <body>
 <header class="topbar">
@@ -130,8 +130,22 @@
   </div>
 </div>
 
+<div id="confirm-modal" class="modal hidden">
+  <div class="modal-body narrow">
+    <div class="modal-head">
+      <h2>删除确认</h2>
+      <button id="btn-close-confirm" class="icon" title="取消">×</button>
+    </div>
+    <p id="confirm-msg" class="confirm-msg"></p>
+    <div class="modal-foot">
+      <button id="btn-cancel-confirm" class="btn ghost">取消</button>
+      <button id="btn-ok-confirm" class="btn danger">删除</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="toast hidden"></div>
 
-<script src="/static/app.js?v=20261011ab"></script>
+<script src="/static/app.js?v=20261011ac"></script>
 </body>
 </html>

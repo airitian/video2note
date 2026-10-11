@@ -801,6 +801,17 @@
     }
   }
 
+  let pendingDeleteId = null;
+  function confirmDelete(id) {
+    const t = tasks.get(id);
+    if (!t) return;
+    pendingDeleteId = id;
+    const title = t.title || "(无标题)";
+    $("#confirm-msg").innerHTML = "确定要删除这条记录吗？<br><b>" + esc(title)
+      + "</b><br><span class=\"confirm-sub\">删除后无法恢复，视频与转写稿会一并清除。</span>";
+    $("#confirm-modal").classList.remove("hidden");
+  }
+
   // 设置面板不展示的配置项。
   // 这些是部署期参数（接口地址、协议、Token、模型名）或与本项目无关的本地环境项，
   // 日常使用改不动也不需要改，暴露出来只会让设置面板变得冗长、容易误填。
@@ -1043,7 +1054,7 @@ if (rest.length) {
     const clr = e.target.closest("[data-clear]");
     if (clr) { e.stopPropagation(); clearSecret(clr.dataset.clear); return; }
     const del = e.target.closest("[data-del]");
-    if (del) { e.stopPropagation(); removeTask(del.dataset.del); return; }
+    if (del) { e.stopPropagation(); confirmDelete(del.dataset.del); return; }
     const hitem = e.target.closest(".hitem");
     if (hitem) { selectTask(hitem.dataset.id); return; }
 
@@ -1085,6 +1096,21 @@ if (rest.length) {
     else if (e.target.id === "btn-settings") openSettings();
     else if (e.target.id === "btn-close-settings" || e.target.id === "btn-cancel-settings") $("#settings-modal").classList.add("hidden");
     else if (e.target.id === "btn-save-settings") saveSettings();
+    else if (e.target.id === "btn-ok-confirm") {
+      $("#confirm-modal").classList.add("hidden");
+      const id = pendingDeleteId;
+      pendingDeleteId = null;
+      if (id) removeTask(id);
+    }
+    else if (e.target.id === "btn-cancel-confirm" || e.target.id === "btn-close-confirm") {
+      $("#confirm-modal").classList.add("hidden");
+      pendingDeleteId = null;
+    }
+    // 点击遮罩空白处也关闭确认弹窗（不删）
+    else if (e.target.id === "confirm-modal") {
+      $("#confirm-modal").classList.add("hidden");
+      pendingDeleteId = null;
+    }
     else if (e.target.id === "pick") $("#file").click();
   });
 
@@ -1109,7 +1135,11 @@ if (rest.length) {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) start();
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { $("#settings-modal").classList.add("hidden"); }
+    if (e.key === "Escape") {
+      $("#settings-modal").classList.add("hidden");
+      $("#confirm-modal").classList.add("hidden");
+      pendingDeleteId = null;
+    }
   });
 
   // ---------- 启动 ----------
