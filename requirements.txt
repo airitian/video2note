@@ -26,3 +26,4 @@ openai>=1.30              # 仅当 llm_protocol=openai 时需要
 python-dotenv>=1.0        # 本地 .env 支持
 pydantic>=2.0             # FastAPI 接口模型（此前仅靠间接依赖，现显式声明）
 imageio-ffmpeg>=0.4.9     # 本机无系统 ffmpeg 时，用其自带二进制兜底（core/config.py:ff_bin）
+qiniu>=7.18.0

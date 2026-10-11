@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import re
@@ -13,15 +14,17 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
+                               RedirectResponse, Response, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import audio, downloader, exporters, store
 from .downloader import detect_platform, extract_url
-from .config import (HELP, MEDIA_DIR, ROOT, SECRET_KEYS, SETTINGS_GROUPS,
-                     ensure_cookie_file, ensure_dirs, load_settings,
-                     migrate_secrets, normalize_browser, public_settings,
+from .config import (ACCESS_TOKEN, HELP, MEDIA_DIR, ROOT, SECRET_KEYS,
+                     SETTINGS_GROUPS, ensure_cookie_file, ensure_dirs,
+                     load_settings, migrate_secrets, normalize_browser,
+                     public_settings,
                      save_settings)
 from .pipeline import (_apply_variant, _mark_idempotent_hit, _sync_variant_meta,
                        polish_needed, retry as pipeline_retry,
@@ -103,6 +106,32 @@ def _health_loop() -> None:
         _refresh_health()
 
 
+_ARCHIVE_STOP = threading.Event()
+
+
+def _archive_loop() -> None:
+    """每天跑一次归档清理，回收冷任务的源视频占用。
+
+    独立于请求线程：即便某轮上传很慢，也不会拖慢任何页面操作。
+    """
+    from .qiniu_archive import cleanup
+    time.sleep(90)          # 服务刚起来，先别抢占资源
+    log = logging.getLogger("uvicorn.error")
+    while not _ARCHIVE_STOP.is_set():
+        try:
+            s = cleanup()
+            # 未配置凭据只是「功能没开」，天天写日志很吵，静默即可
+            if not s.get("reason"):
+                freed = (s.get("freed") or 0) / 1048576
+                skipped = s.get("skipped") or []
+                if freed or skipped:
+                    log.info(f"媒体归档：释放 {freed:.1f} MB，"
+                             f"{len(skipped)} 个因校验未通过保留本地")
+        except Exception as e:      # noqa: BLE001 - 后台线程不该把进程带崩
+            logging.getLogger("uvicorn.error").warning(f"媒体归档异常：{e}")
+        _ARCHIVE_STOP.wait(86400)
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """启动即在专属线程预热 + 周期刷新健康检查；请求路径始终只读快照。
@@ -120,14 +149,52 @@ async def _lifespan(_app: FastAPI):
     except Exception:
         pass  # 清理失败不挡启动
     threading.Thread(target=_health_loop, daemon=True).start()
+    threading.Thread(target=_archive_loop, daemon=True).start()
     yield
     _health_stop.set()
+    _ARCHIVE_STOP.set()
     _health_executor.shutdown(wait=False)
 
 
 # lifespan 必须在构造 app 之前定义好，否则这里拿不到这个名字
 app = FastAPI(title="视频转笔记", version="1.1.0", lifespan=_lifespan)
 STATIC = ROOT / "static"
+
+# ---- 访问控制 ----------------------------------------------------------
+# 整个应用原本没有任何鉴权：只要能连到端口，任何人都能读全部转写稿与成稿、
+# 删任意任务、无限触发昂贵的 LLM 调用；更隐蔽的是把 asr/llm_base_url
+# 改成自己的服务器即可截获真实 API Key（请求会原样带上 Bearer Token，
+# 而这两个字段属于「非敏感项」，改动不会动到 Key，表面看毫无异常）。
+#
+# 这里加一道可选门禁（环境变量 V2N_ACCESS_TOKEN）：
+#   留空 -> 不校验，行为与过去一致（本地 127.0.0.1 使用足够）
+#   非空 -> 除 state/login 外的 /api/* 一律需要令牌
+# 令牌可用 Authorization: Bearer / X-Access-Token / cookie / ?token= 四种方式
+# 提供。支持 cookie 是关键：<video src="/api/media/..."> 这类浏览器直连请求
+# 无法自定义 header，靠 cookie 才能自动带上，前端不必改写资源地址。
+_AUTH_FREE_PATHS = ("/api/auth/state", "/api/auth/login")
+
+if ACCESS_TOKEN:
+
+    @app.middleware("http")
+    async def _auth_guard(request: Request, call_next):
+        path = request.url.path
+        if path.startswith("/api/") and path not in _AUTH_FREE_PATHS:
+            tok = ""
+            auth = request.headers.get("authorization") or ""
+            if auth.lower().startswith("bearer "):
+                tok = auth[7:].strip()
+            if not tok:
+                tok = (request.headers.get("x-access-token") or "").strip()
+            if not tok:
+                tok = (request.cookies.get("v2n_token") or "").strip()
+            if not tok:
+                tok = (request.query_params.get("token") or "").strip()
+            # 定长比较：避免攻击者用响应时间差逐字节猜出令牌
+            if not hmac.compare_digest(tok, ACCESS_TOKEN):
+                return JSONResponse({"detail": "未授权：请提供访问令牌"},
+                                    status_code=401)
+        return await call_next(request)
 
 STYLES = ("general", "note", "article", "clean")
 
@@ -157,6 +224,40 @@ class CreateIn(BaseModel):
     model: str = ""
 
 
+class LoginIn(BaseModel):
+    token: str = ""
+
+
+@app.get("/api/auth/state")
+def auth_state():
+    """免鉴权：前端据此判断要不要弹令牌输入框。"""
+    return {"required": bool(ACCESS_TOKEN)}
+
+
+@app.post("/api/auth/login")
+def auth_login(body: LoginIn):
+    """校验令牌后写入 httpOnly cookie，后续请求由浏览器自动携带。
+
+    用 cookie 而不是让前端存 localStorage，是为了让
+    <video src="/api/media/..."> 这类无法自定义 header 的请求也能通过校验。
+    """
+    if not ACCESS_TOKEN:
+        return {"ok": True}
+    if not hmac.compare_digest((body.token or "").strip(), ACCESS_TOKEN):
+        raise HTTPException(401, "访问令牌不正确")
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie("v2n_token", ACCESS_TOKEN, httponly=True, samesite="lax",
+                    max_age=30 * 24 * 3600)
+    return resp
+
+
+@app.post("/api/auth/logout")
+def auth_logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie("v2n_token")
+    return resp
+
+
 class PolishIn(BaseModel):
     style: str = "general"
 
@@ -166,6 +267,24 @@ class SettingsIn(BaseModel):
     # 显式要求清空的敏感项（Token / Cookie）。
     # 敏感项不再回传，前端无法区分「没改」和「想清空」，所以必须单独传。
     clear: list[str] = []
+
+
+def _safe_tid(tid: str) -> str:
+    """校验任务 id：不合法一律 404，绝不拿去拼路径。
+
+    ★ 必须白名单，不能黑名单。路由参数 tid 的匹配规则是 [^/]+，
+    既拦不住 ".."，在 Windows 上也拦不住反斜杠路径。而 tid 会参与
+    拼接 MEDIA_DIR / tid：
+        MEDIA_DIR / ".."  ->  data/media/..  ==  DATA_DIR 本身
+    于是 DELETE /api/tasks/.. 会让 shutil.rmtree 把 DATA_DIR 整个删掉
+    （tasks/、media/、settings.json、secrets.json、cookies.txt 全没），
+    且 ignore_errors=True 不留任何痕迹。
+
+    任务 id 由 store.create() 生成为 uuid4().hex[:12]，用严格白名单最稳。
+    """
+    if not re.fullmatch(r"[0-9a-f]{12}", tid or ""):
+        raise HTTPException(404, "任务不存在")
+    return tid
 
 
 def _clean_style(s: str | None) -> str:
@@ -527,6 +646,96 @@ def retry_task(tid: str):
             "message": "正在重试 AI 整理" if action == "polish" else "正在重新转写"}
 
 
+@app.get("/api/archive/status")
+def archive_status():
+    """本地媒体占用 + 归档配置概览，供人工判断要不要清理。"""
+    from . import store
+    from .qiniu_archive import _source_files, cfg, configured, pending
+    c = cfg()
+    able, why = configured(c)
+    total = 0
+    per = []
+    pend = []
+    pend_bytes = 0
+    for t in store.list_tasks():
+        mdir = MEDIA_DIR / t.id
+        if not mdir.is_dir():
+            continue
+        fs = _source_files(mdir)
+        if not fs:
+            continue
+        sz = sum(f.stat().st_size for f in fs)
+        total += sz
+        per.append({"tid": t.id, "size": sz, "files": [f.name for f in fs]})
+        # 已落盘但云端还没有的：清理掉这些就等于丢数据，必须让用户看得见
+        n = pending(t)
+        if n and able:
+            pend.append({"tid": t.id, "pending": n, "size": sz})
+            pend_bytes += sz
+    per.sort(key=lambda x: -x["size"])
+    return {
+        "configured": able,
+        "reason": why,
+        "bucket": c["bucket"],
+        "domain": c["domain"],
+        "local_bytes": total,
+        "local_mb": round(total / 1048576, 1),
+        "pending_tasks": pend[:100],
+        "pending_count": sum(p["pending"] for p in pend),
+        "pending_bytes": pend_bytes,
+        "tasks": per[:100],
+    }
+
+
+@app.post("/api/archive/sync")
+def archive_sync(tid: str = "", limit: int = 0):
+    """手动把「还没备份到云端的源视频」补传上去。
+
+    自动备份可能因为当时没配密钥、网络抖了一下而漏掉几个，
+    这时任务列表会显示待同步数量，用户点一下这个就把它们补上。
+    不指定 tid 则补全量（默认上限 20 个，避免一次拖太久）。
+
+    ★只上传，不删任何本地文件——删除始终属于 cleanup 的职责。
+    """
+    if tid:
+        _safe_tid(tid)          # tid 会拿去查任务、拼路径，先过白名单
+    from . import store
+    from .qiniu_archive import cfg, configured, pending, schedule_backup
+    able, why = configured(cfg())
+    if not able:
+        raise HTTPException(400, f"未配置对象存储：{why}")
+    lim = limit or 20
+    targets = []
+    if tid:
+        t = store.get(tid)
+        if not t:
+            raise HTTPException(404, "任务不存在")
+        if pending(t):
+            targets.append(t)
+    else:
+        for t in store.list_tasks():
+            if pending(t):
+                targets.append(t)
+                if len(targets) >= lim:
+                    break
+    for t in targets:
+        schedule_backup(t, priority="instant")
+    return {"ok": True, "started": len(targets),
+            "tids": [t.id for t in targets]}
+
+
+@app.post("/api/archive/run")
+def archive_run(days: int = 0, dry_run: int = 1, limit: int = 0):
+    """手动触发归档清理。
+
+    dry_run 默认为 1：只算不改，先看清楚会释放哪些空间，
+    确认无误再显式传 dry_run=0。真正执行时仍然遵循
+    「云端 stat 校验大小一致才删本地」的铁律。
+    """
+    from .qiniu_archive import cleanup
+    return cleanup(days or None, dry_run=bool(dry_run), limit=limit or None)
+
+
 @app.get("/api/tasks/{tid}")
 def get_task(tid: str):
     t = store.get(tid)
@@ -537,6 +746,7 @@ def get_task(tid: str):
 
 @app.delete("/api/tasks/{tid}")
 def delete_task(tid: str):
+    _safe_tid(tid)          # 先校验，再拼路径（拼错会删掉整个 data 目录）
     ok = store.remove(tid)
     # 同时释放该任务的视频/音频，避免磁盘占用累积
     shutil.rmtree(MEDIA_DIR / tid, ignore_errors=True)
@@ -663,9 +873,89 @@ async def task_events(tid: str):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+def _proxy_mode() -> bool:
+    try:
+        return (load_settings().get("qiniu_proxy") or "0").strip() == "1"
+    except Exception:
+        return False
+
+
+def _cloud_playback(tid: str, name: str, request: Request):
+    """本地媒体已被清理时的云端回显。返回 None 表示云端也没有这份文件。
+
+    两种模式，默认走第一条：
+      0 → 302 直跳云端地址：浏览器自己去 CDN 拉，服务器不占带宽，最快
+      1 → 服务端代拉再转发：部署机出网受限、或空间设为私有时只能这样
+    """
+    from . import store
+    from .qiniu_archive import remote_info, open_remote
+
+    t = store.get(tid)
+    if t is None:
+        return None
+    info = remote_info(t, name)
+    if not info:
+        # 没记过归档信息不代表云端一定没有——下载完就备份那一步还没跑时
+        # 本地就被删了才会走到这里，只能如实告诉调用方没有。
+        return None
+    url = info["url"]
+
+    if not _proxy_mode():
+        return RedirectResponse(url, status_code=302)
+
+    # ---- 代理模式：Range 必须透传，否则 <video> 拖不动进度条 ----
+    size = int(info.get("size") or 0)
+    rng = (request.headers.get("range") or "").strip()
+    start, end = None, None
+    if rng.lower().startswith("bytes="):
+        spec = rng[6:].split(",")[0].strip()
+        s, _, e = spec.partition("-")
+        if s:
+            start = int(s)
+        if e:
+            end = min(int(e), size - 1) if size else int(e)
+    try:
+        up = open_remote(url, start, end)
+    except Exception as e:
+        raise HTTPException(502, f"从对象存储取回失败：{e}")
+    if up.status_code >= 400:
+        up.close()
+        raise HTTPException(404, f"对象存储返回 {up.status_code}")
+
+    out = {"Accept-Ranges": up.headers.get("Accept-Ranges") or "bytes"}
+    # 上游可能做了 gzip；这时 Content-Length 说的是压缩后的长度，
+    # 而我们吐出的是解压后的字节，照抄会让浏览器提前判定结束。
+    encoded = bool(up.headers.get("Content-Encoding"))
+    for h in ("Content-Type", "Content-Range", "Content-Length",
+              "ETag", "Last-Modified"):
+        v = up.headers.get(h)
+        if v and not (encoded and h == "Content-Length"):
+            out[h] = v
+    # Content-Type 交给 StreamingResponse 的 media_type 参数下发。
+    # 同时在 headers 里再放一份会在响应里出现两个 Content-Type，
+    # 部分浏览器/播放器遇到重复头会直接判这个响应无效。
+    mime = out.pop("Content-Type", None) or _media_type(name) \
+        or "application/octet-stream"
+
+    def gen():
+        try:
+            # decode_content 要在开始读之前设；晚了就只能拿到原始压缩块
+            if encoded and hasattr(up, "raw"):
+                up.raw.decode_content = True
+            for chunk in up.iter_content(65536):
+                if chunk:
+                    yield chunk
+        finally:
+            up.close()
+
+    return StreamingResponse(gen(), status_code=up.status_code if up.status_code in (200, 206) else 200,
+                             headers=out, media_type=mime)
+
+
 @app.get("/api/media/{tid}/{name}")
 def media(tid: str, name: str, request: Request, download: int = 0):
     """视频/音频流式服务，支持 HTTP Range（浏览器拖动进度条必需）"""
+    _safe_tid(tid)          # 与 delete 同理：tid 参与路径拼接，必须先过白名单
     mt = _media_type(name)
     if not mt:
         raise HTTPException(404, "不支持的媒体文件")
@@ -674,6 +964,12 @@ def media(tid: str, name: str, request: Request, download: int = 0):
         raise HTTPException(404, "不支持的媒体文件")
     p = MEDIA_DIR / tid / name
     if not p.is_file():
+        # 本地文件已被清理（过期释放 / 用户手动删除）。此时从对象存储回显：
+        # 前端与 <video src> 的地址「/api/media/{tid}/{name}」一律不用改，
+        # 表单没有重传入口，任务列表点开就该能播。
+        remote = _cloud_playback(tid, name, request)
+        if remote is not None:
+            return remote
         raise HTTPException(404, "媒体文件不存在（可能已被清理）")
 
     size = p.stat().st_size

@@ -151,16 +151,71 @@
   }
 
   let toastTimer = null;
-  function toast(msg, isErr) {
+  // ms：停留时长。默认 3.2 秒对「一键说明白一件事」够用，
+  // 但带操作指引的提示（比如待同步数量）一闪而过等于没说，所以要能拉长。
+  function toast(msg, isErr, ms) {
     const el = $("#toast");
     el.textContent = msg;
     el.className = "toast" + (isErr ? " err" : "");
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => el.classList.add("hidden"), 3200);
+    toastTimer = setTimeout(() => el.classList.add("hidden"), ms || 3200);
+  }
+
+  // ---- 访问控制 ----------------------------------------------------------
+  // 服务端设置 V2N_ACCESS_TOKEN 后，未携带令牌的 /api/* 一律返回 401。
+  // 登录成功会写入 httpOnly cookie，同源请求（包括 <video src="/api/media/..">
+  // 这类无法自定义 header 的浏览器直连请求）由浏览器自动携带，
+  // 所以只需要在第一次 401 时引导用户输入一次即可。
+  let authToken = "";
+  let authResolve = null;
+
+  function askToken() {
+    return new Promise((resolve) => {
+      if (authResolve) { authResolve(false); authResolve = null; }
+      authResolve = resolve;
+      $("#auth-err").textContent = "";
+      $("#auth-token-input").value = "";
+      $("#auth-modal").classList.remove("hidden");
+      setTimeout(() => { try { $("#auth-token-input").focus(); } catch (e) {} }, 50);
+    });
+  }
+
+  function settleAuth(v) {
+    $("#auth-modal").classList.add("hidden");
+    const rs = authResolve;
+    authResolve = null;
+    if (rs) rs(v);
+  }
+
+  async function submitToken() {
+    const tok = ($("#auth-token-input").value || "").trim();
+    if (!tok) { $("#auth-err").textContent = "请输入令牌"; return; }
+    try {
+      const r = await fetch("/api/auth/login", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: tok }),
+      });
+      if (r.ok) { authToken = tok; settleAuth(true); return; }
+      $("#auth-err").textContent = "令牌不正确，请重试";
+    } catch (e) {
+      $("#auth-err").textContent = "网络错误，请重试";
+    }
   }
 
   async function api(path, opts) {
-    const r = await fetch(path, Object.assign({ headers: { "Content-Type": "application/json" } }, opts));
+    const call = async () => {
+      // opts.headers 优先（上传等场景自带 Content-Type 或不带）
+      const headers = Object.assign({ "Content-Type": "application/json" },
+                                    (opts && opts.headers) || {});
+      if (authToken) headers["X-Access-Token"] = authToken;
+      return fetch(path, Object.assign({}, opts, { headers }));
+    };
+    let r = await call();
+    // 401 = 需要令牌。引导一次，成功后重试同一个请求，用户无感知。
+    if (r.status === 401) {
+      const okd = await askToken();
+      if (okd) r = await call();
+    }
     if (!r.ok) {
       let msg = "请求失败 " + r.status;
       try { const d = await r.json(); msg = d.detail || msg; } catch (e) {}
@@ -831,6 +886,10 @@
     cookie_text: "cookie_douyin",
     cookie_text_bili: "cookie_bilibili",
     resolver_curl: "resolver_curl",
+    // 七牛密钥同属敏感项：不进 HELP 的话整项压根不渲染（用户会以为没这功能），
+    // 进 HELP 但不列进这里的话会渲染成普通明文输入框（看着像能改、实则填了不生效）。
+    qiniu_ak: "qiniu_ak",
+    qiniu_sk: "qiniu_sk",
   };
 
   async function openSettings() {
@@ -866,7 +925,9 @@
         + "在 dlpanda 页面上 F12 → Network → 随便点一次解析请求 → 右键「复制」→"
         + "「复制为 cURL」，把整段粘到这里。程序会自动："
         + "① 替换 _token / t0ken 为页面实时值 ② 只替换 url 字段为你要解析的链接 "
-        + "③ 把 Cookie 注入浏览器会话。留空则使用内置模板。",
+            + "③ 把 Cookie 注入浏览器会话。留空则使用内置模板。",
+      qiniu_ak: "七牛云控制台 → 密钥管理 → AK。已保存的内容不会回显，留空即保持不变",
+      qiniu_sk: "七牛云控制台 → 密钥管理 → SK。已保存的内容不会回显，留空即保持不变",
     };
     const rows = { cookie_text: 4, cookie_text_bili: 4, resolver_curl: 9 };
 
@@ -962,25 +1023,39 @@ if (rest.length) {
     const val = isSecret ? "" : (v[k] !== undefined ? v[k] : "");
     let ctl;
     if (areas.indexOf(k) >= 0) {
-      const on = isSecret && !!cfg[SECRET_UI[k]];
-      const state = on
-        ? "✅ 已配置（内容不回显，留空保持不变）"
-        : "未配置 —— 粘贴后点保存";
       ctl = '<textarea data-key="' + k + '" rows="' + (rows[k] || 4)
-        + '" placeholder="' + esc(PH[k] || "") + '">' + esc(val) + "</textarea>"
-        + '<div class="secret-row"><span class="secret-state">' + state + "</span>"
-        + (on ? '<button type="button" class="btn small danger" data-clear="' + k
-               + '">清除</button>' : "") + "</div>"
-        + (k === "resolver_curl"
-          ? '<div class="secret-row"><button type="button" class="btn small"'
-            + ' data-parse-curl="1">校验这段 curl</button>'
-            + '<span class="secret-state" id="curl-check"></span></div>'
-            + '<p class="field-note">解析接口改版或解析失败时，用这段模板让程序沿用'
-            + '你浏览器里的真实请求；不填也能正常用内置模板。</p>'
-          : "");
+        + '" placeholder="' + esc(PH[k] || "") + '">' + esc(val) + "</textarea>";
     } else {
       ctl = '<input data-key="' + k + '" value="' + esc(val) + '" placeholder="'
         + esc(PH[k] || "") + '">';
+    }
+    // ★状态行必须挂在「所有敏感项」上，不能只挂多行文本那三项。
+    // 早前的写法把状态判断写在 areas 分支里，于是单行输入的敏感项会被渲染成
+    // 一个「空的普通输入框」：填了不知道有没有生效，配错了界面毫无提示。
+    // 七牛 AK/SK 正好是单行输入，直接撞上这个缺口。
+    if (isSecret) {
+      const on = !!cfg[SECRET_UI[k]];
+      // 每个框如实报自己的状态，不被「成对才算可用」顶掉：
+      // SK 没填就是没填，直接说「粘贴后点保存」最可操作；
+      // 说「密钥不完整」的话，用户还得自己判断缺的是哪一个。
+      ctl += '<div class="secret-row"><span class="secret-state">'
+        + (on ? "✅ 已配置（内容不回显，留空保持不变）" : "未配置 —— 粘贴后点保存")
+        + "</span>"
+        + (on ? '<button type="button" class="btn small danger" data-clear="' + k
+               + '">清除</button>' : "") + "</div>";
+      // 两个都填却判定不可用最难自查，所以成对校验单独再给一行，
+      // 「归档为什么没跑」在这行能直接看到。
+      if ((k === "qiniu_ak" || k === "qiniu_sk") && !cfg.qiniu) {
+        ctl += '<div class="secret-row"><span class="secret-state warn">'
+          + "⚠️ 密钥不完整 —— AK 与 SK 需同时填写，缺一个归档不会启用</span></div>";
+      }
+    }
+    if (k === "resolver_curl") {
+      ctl += '<div class="secret-row"><button type="button" class="btn small"'
+        + ' data-parse-curl="1">校验这段 curl</button>'
+        + '<span class="secret-state" id="curl-check"></span></div>'
+        + '<p class="field-note">解析接口改版或解析失败时，用这段模板让程序沿用'
+        + '你浏览器里的真实请求；不填也能正常用内置模板。</p>';
     }
     // resolver_curl 额外加一个醒目标记，避免用户在一堆字段里找不到它
     const mark = k === "resolver_curl" ? ' data-mark="curl"' : "";
@@ -990,18 +1065,21 @@ if (rest.length) {
 
   async function clearSecret(key) {
     const labels = { cookie_text: "抖音", cookie_text_bili: "B站",
-                     resolver_curl: "解析请求模板" };
+                     resolver_curl: "解析请求模板",
+                     qiniu_ak: "七牛云 AccessKey", qiniu_sk: "七牛云 SecretKey" };
     const label = labels[key] || key;
     const extra = key === "resolver_curl"
       ? "清除后抖音解析将回到内置模板。"
-      : "清除后下载这两个平台的视频会因缺少登录态而失败。";
+      : (key === "qiniu_ak" || key === "qiniu_sk")
+        ? "清除后自动归档不会再跑（本地文件不会被删），已上传到云端的视频不受影响。"
+        : "清除后下载这两个平台的视频会因缺少登录态而失败。";
     if (!confirm("确定清除已保存的" + label + "？" + extra)) return;
     try {
       settingsCache = await api("/api/settings", {
         method: "POST", body: JSON.stringify({ values: {}, clear: [key] }),
       });
       openSettings();
-      toast(label + " Cookie 已清除");
+      toast(label + " 已清除");
     } catch (e) { toast(e.message, true); }
   }
 
@@ -1053,6 +1131,8 @@ if (rest.length) {
     if (chk) { e.stopPropagation(); checkCurl(); return; }
     const clr = e.target.closest("[data-clear]");
     if (clr) { e.stopPropagation(); clearSecret(clr.dataset.clear); return; }
+    const syncB = e.target.closest("#btn-cloud-sync");
+    if (syncB) { e.stopPropagation(); syncNow(); return; }
     const del = e.target.closest("[data-del]");
     if (del) { e.stopPropagation(); confirmDelete(del.dataset.del); return; }
     const hitem = e.target.closest(".hitem");
@@ -1096,6 +1176,9 @@ if (rest.length) {
     else if (e.target.id === "btn-settings") openSettings();
     else if (e.target.id === "btn-close-settings" || e.target.id === "btn-cancel-settings") $("#settings-modal").classList.add("hidden");
     else if (e.target.id === "btn-save-settings") saveSettings();
+    // 令牌输入框：点确定去校验，关闭则放弃本次请求重试
+    else if (e.target.id === "btn-ok-auth") { submitToken(); return; }
+    else if (e.target.id === "auth-modal") { settleAuth(false); return; }
     else if (e.target.id === "btn-ok-confirm") {
       $("#confirm-modal").classList.add("hidden");
       const id = pendingDeleteId;
@@ -1139,7 +1222,10 @@ if (rest.length) {
       $("#settings-modal").classList.add("hidden");
       $("#confirm-modal").classList.add("hidden");
       pendingDeleteId = null;
+      if (!$("#auth-modal").classList.contains("hidden")) settleAuth(false);
     }
+    // 令牌框里回车直接提交，省得再去点按钮
+    if (e.key === "Enter" && e.target.id === "auth-token-input") submitToken();
   });
 
   // ---------- 启动 ----------
@@ -1258,6 +1344,45 @@ if (rest.length) {
     } catch (e) {
       settingsLoadErr = (e && e.message) || String(e);
       settingsCache = {};
+    }
+    nudgePendingSync();
+  }
+
+  // 备份到云端有可能漏掉几个（当时没配密钥、网络抖了一下）。
+  // 这类「看起来没事、清理掉就丢数据」的状态必须让用户看得见，
+  // 所以启动时查一次：有待同步的就提示一次，点一下补传，不打断正常使用。
+  let syncNudged = false;
+  async function nudgePendingSync() {
+    if (syncNudged) return;
+    syncNudged = true;
+    let st;
+    try {
+      st = await api("/api/archive/status");
+    } catch (e) {
+      return;                       // 拿不到就算了，不能因为提示挡住页面
+    }
+    if (!st || !st.configured || !st.pending_count) return;
+    const mb = (st.pending_bytes || 0) / 1048576;
+    toast(st.pending_count + " 个视频还没同步到云端（约 "
+      + (mb >= 1024 ? (mb / 1024).toFixed(1) + "GB" : Math.round(mb) + "MB")
+      + "），点顶栏「☁ 同步」补传", false, 8000);
+    syncBtnOn();
+  }
+
+  function syncBtnOn() {
+    const b = $("#btn-cloud-sync");
+    if (b) b.classList.remove("hidden");
+  }
+
+  async function syncNow() {
+    try {
+      const r = await api("/api/archive/sync", { method: "POST" });
+      toast(r.started ? ("已开始同步 " + r.started + " 个视频") : "没有待同步的视频");
+      if (r.started) {
+        setTimeout(() => { syncNudged = false; nudgePendingSync(); }, 8000);
+      }
+    } catch (e) {
+      toast(e.message, true);
     }
   }
 

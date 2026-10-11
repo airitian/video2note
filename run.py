@@ -49,6 +49,14 @@ def main() -> None:
     print(f"  LLM : {s['llm_base_url']}  model={s['llm_model']}  key={'已配置' if (s['llm_api_key'] or s['asr_api_key']) else '缺失'}")
     if not s["asr_api_key"]:
         print("  提示：请先在页面右上角「设置」中填写模力方舟 API Token")
+    # 对外暴露且没设令牌时给出强提示：此时任何人都能读全部转写稿、
+    # 删任务、刷 LLM 额度，还能把 base_url 改成自己的服务器截获 API Key。
+    _loopback = {"127.0.0.1", "localhost", "::1", "::"}
+    from core.config import ACCESS_TOKEN
+    if not ACCESS_TOKEN and args.host not in _loopback:
+        print("  ⚠ 安全警告：监听 %s 且未设置 V2N_ACCESS_TOKEN" % args.host)
+        print("    任何人都能读取全部笔记、删除任务、并截获你的 API Key。")
+        print("    建议：export V2N_ACCESS_TOKEN=<自定义长令牌> 后重启。")
     print("=" * 56)
     uvicorn.run(
         "core.main:app",

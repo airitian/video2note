@@ -160,6 +160,12 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
     t.log("info", f"获取媒体：{meta['title']}（{int(meta.get('duration') or 0)} 秒）")
     store.save(t)
 
+    # 媒体刚落盘，异步复制到对象存储。此刻本地文件是完整的，
+    # 后续无论转写成败、磁盘何时清理，云端这一份都已经有了。
+    # 必须在已经开始转写之前踢出去（而不是等流程结束）：
+    # 用户在长视频上可能中途取消或失败，等不到最后才有备份。
+    _schedule_backup(t)
+
     _check_cancel(t)
     if not src:
         _set(t, "extracting", 1.0, "音频提取完成", emit=emit)
@@ -218,21 +224,32 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
         ex = ThreadPoolExecutor(max_workers=max(maxw, 1))
         pending: list = []
         failed_chunks: list = []
+        pump_err: list = []          # pump 线程异常由此带回主线程
         pump_done = threading.Event()
         try:
             def pump() -> None:
-                # 有界队列 = 背压：切片跑太快时会被挡住，不会堆满磁盘
-                for i, c in enumerate(audio.iter_chunks(
-                        Path(meta["audio_path"]), workdir / "chunks",
-                        chunk_seconds, first_seconds=first_seconds)):
-                    while True:
-                        try:
-                            q.put((i, c), timeout=0.5)
-                            break
-                        except queue.Full:
-                            if finished.is_set():
-                                return
-                pump_done.set()   # ★切片结束，通知 consume 可在队列空时退出
+                # ★pump_done 必须在 finally 置位，不能只在正常路径结尾。
+                # iter_chunks 是生成器，随时可能抛异常（音频损坏、ffprobe
+                # 读不到时长、ffmpeg 失败、磁盘满）——此时若 pump_done 没置位，
+                # 而 finished 要等 run() 返回才 set、run() 又正卡在
+                # consume_th.join()，两边互等：consume 每 0.5s 空转一圈永不退出，
+                # 任务永久死锁（线程池只有 2 个 worker，两次就把全站堵死）。
+                try:
+                    # 有界队列 = 背压：切片跑太快时会被挡住，不会堆满磁盘
+                    for i, c in enumerate(audio.iter_chunks(
+                            Path(meta["audio_path"]), workdir / "chunks",
+                            chunk_seconds, first_seconds=first_seconds)):
+                        while True:
+                            try:
+                                q.put((i, c), timeout=0.5)
+                                break
+                            except queue.Full:
+                                if finished.is_set():
+                                    return
+                except BaseException as e:      # noqa: BLE001 - 跨线程传递
+                    pump_err.append(e)
+                finally:
+                    pump_done.set()   # 无论正常还是异常，都要通知 consume 收尾
 
             def consume() -> None:
                 while True:
@@ -279,6 +296,13 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
             # ★无论成功还是异常都要关线程池，否则 ex 泄漏、worker 线程常驻（#7）。
             # 旧代码把 ex.shutdown 写在正常路径末尾，run() 中途抛异常时就被跳过。
             ex.shutdown(wait=True)
+        # ★切片失败要报真实原因。否则队列为空 -> segments 为空，会落到
+        # 下面「转写结果为空」那种无信息量的报错，用户根本看不出其实是
+        # 音频损坏 / ffmpeg 异常 / 磁盘满。
+        if pump_err and not segments:
+            raise pump_err[0]
+        if pump_err:
+            t.log("warn", f"切片未能全部完成，成稿可能缺失内容：{pump_err[0]}")
         if failed_chunks and not segments:
             raise RuntimeError(
                 f"全部 {len(failed_chunks)} 个分片转写失败，请检查 ASR 接口 / 网络 / Token")
@@ -660,6 +684,18 @@ def _meta_from_file(src: Path, workdir: Path) -> dict:
         # 必须转 str：meta 会被 json 序列化落盘，Path 不可序列化
         meta["video_path"] = str(video_path)
     return meta
+
+
+def _schedule_backup(t: store.Task) -> None:
+    """落盘后触发云端备份。整个函数不允许抛异常——备份是加分项，
+    它的失败绝不能影响正在进行的转写。"""
+    try:
+        if (load_settings().get("qiniu_backup_on_finish") or "1").strip() == "0":
+            return
+        from . import qiniu_archive as QA
+        QA.schedule_backup(t)
+    except Exception:
+        pass
 
 
 def _cleanup_chunks(workdir: Path) -> None:

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>抖音 / B站 视频转文字</title>
-<link rel="stylesheet" href="/static/style.css?v=20261011ad">
+<link rel="stylesheet" href="/static/style.css?v=20261011ag">
 </head>
 <body>
 <header class="topbar">
@@ -17,6 +17,9 @@
   </div>
   <div class="topbar-right">
     <span id="health" class="health"></span>
+    <!-- 默认隐藏：只在确实有「已下载但还没备份到云端」的视频时才显示，
+         没有待同步项时不该占一个按钮位置。 -->
+    <button id="btn-cloud-sync" class="btn ghost hidden" title="把还没备份到云端的视频补传上去">☁ 同步</button>
     <button id="btn-history" class="btn ghost">🕘 历史记录</button>
     <button id="btn-logs" class="btn ghost">📋 处理日志</button>
     <button id="btn-settings" class="btn ghost">设置</button>
@@ -130,6 +133,26 @@
   </div>
 </div>
 
+<div id="auth-modal" class="modal hidden">
+  <div class="modal-body narrow">
+    <div class="modal-head">
+      <h2>需要访问令牌</h2>
+    </div>
+    <p class="confirm-msg">
+      该服务已启用访问控制。请输入令牌后继续：<br>
+      <span class="ts">令牌验证通过后会写入 cookie，后续请求自动携带，无需重复输入。</span>
+    </p>
+    <div style="margin: 12px 0 4px;">
+      <input id="auth-token-input" type="password" class="inp" autocomplete="off"
+             placeholder="访问令牌" style="width: 100%;">
+    </div>
+    <p id="auth-err" class="ts" style="color: var(--err); min-height: 18px;"></p>
+    <div class="modal-foot">
+      <button id="btn-ok-auth" class="btn">确定</button>
+    </div>
+  </div>
+</div>
+
 <div id="confirm-modal" class="modal hidden">
   <div class="modal-body narrow">
     <div class="modal-head">
@@ -146,6 +169,6 @@
 
 <div id="toast" class="toast hidden"></div>
 
-<script src="/static/app.js?v=20261011ac"></script>
+<script src="/static/app.js?v=20261011ag"></script>
 </body>
 </html>

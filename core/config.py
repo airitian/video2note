@@ -43,6 +43,12 @@ SECRETS_FILE = Path(
     (os.getenv("V2N_SECRETS_FILE") or "").strip() or (DATA_DIR / "secrets.json")
 ).expanduser()
 
+# 访问控制令牌。留空 = 不启用鉴权（本地回环使用足以）；
+# 一旦服务监听 0.0.0.0 或经反代暴露到公网，必须设置，否则任何人都能：
+#   读取全部转写稿与成稿、随意删除任务、触发昂贵的 LLM 调用，
+#   以及把 asr/llm_base_url 改成自己的服务器来截获真实 API Key。
+ACCESS_TOKEN = (os.getenv("V2N_ACCESS_TOKEN") or "").strip()
+
 DEFAULTS: dict[str, str] = {
     # ---- 语音识别（模力方舟 / Gitee AI，OpenAI 兼容）----
     "asr_base_url": "https://api.moark.com/v1",
@@ -72,6 +78,21 @@ DEFAULTS: dict[str, str] = {
     # 解析接口的浏览器抓包模板（dlpanda 等）。含 Cookie，等价于会话凭证，
     # 所以归入敏感项，只落 secrets.json。
     "resolver_curl": "",
+    # ---- 媒体归档 ----
+    # AK/SK 属于 SECRET_KEYS，实际值只会落在 secrets.json；
+    # 这里保留键名是为了让 load_settings 的返回结构完整。
+    "qiniu_ak": "",
+    "qiniu_sk": "",
+    "qiniu_bucket": "",
+    "qiniu_domain": "",
+    "qiniu_prefix": "video2note/",
+    "qiniu_archive_days": "30",
+    # 下载/上传落盘后立刻异步备份到云端。关掉则只在清理时才上传——
+    # 那样接近保留期的那段时间本地就是唯一副本，风险明显更高。
+    "qiniu_backup_on_finish": "1",
+    # 本地文件缺失时的回显方式：0=302 直跳 CDN（默认，最快）；
+    # 1=服务端从云端拉下来再转发（出网受限或私有桶时必须用这个）。
+    "qiniu_proxy": "0",
 }
 
 # 敏感配置：只落在 secrets.json，永不经接口下发。
@@ -79,6 +100,9 @@ DEFAULTS: dict[str, str] = {
 SECRET_KEYS = {
     "asr_api_key", "llm_api_key", "cookie_text", "cookie_text_bili",
     "resolver_curl",
+    # 七牛云密钥等同于「整个存储桶的读写权限」，必须与 ASR/LLM Key 同级保护：
+    # 只落 secrets.json（0600），不随 settings.json 下发到浏览器。
+    "qiniu_ak", "qiniu_sk",
 }
 
 # ASR 可用模型（实测于 /v1/models），UI 下拉使用
@@ -128,6 +152,25 @@ HELP: dict[str, str] = {
                    "例如 D:\\cookies.txt。一般用不到，前两种任选其一即可",
     "proxy": "代理地址，如 http://127.0.0.1:7890",
     "ffmpeg_path": "ffmpeg 可执行文件路径，留空则使用 PATH 中的 ffmpeg",
+    # ---- 媒体归档 ----
+    # AK/SK 必须留在 HELP 里：前端设置面板是拿 HELP 的键名决定是否渲染的，
+    # 缺了标签页就整项消失——用户会以为这个功能不存在，或者更糟，
+    # 以为配好了（其实 /api/archive/status 永远返回未配置）。
+    # 安全不是靠「藏起来」，而是靠 public_settings 把值置空、只回 _configured。
+    "qiniu_ak": "七牛云 AccessKey（密钥内容不回显）",
+    "qiniu_sk": "七牛云 SecretKey（密钥内容不回显）",
+    "qiniu_bucket": "七牛云存储桶名称（KODO Bucket）",
+    "qiniu_domain": "下载访问域名，形如 https://cdn.example.com（结尾不要加 /）",
+    "qiniu_prefix": "归档文件在桶内的路径前缀，例如 video2note/ 。留空则放在桶根目录下",
+    "qiniu_archive_days": "任务完成超过该天数后，本地源视频可被清理，届时从云端回看。"
+                          "填 0 表示不自动清理（本地永久保留）。"
+                          "★本地源视频在下载完成时就已经异步备份过，"
+                          "所以这里的「清理」只是释放磁盘，不是第一次上传；"
+                          "上传失败的对象绝不会被删除。未配置密钥时本功能完全不生效",
+    "qiniu_backup_on_finish": "下载（或本地文件导入）完成后立即把源视频备份到云端。"
+                              "填 0 则改为等到清理时才上传",
+    "qiniu_proxy": "本地视频已清理时的回显方式：0=直接跳转到云端地址（最快，默认）；"
+                   "1=由服务端从云端取回再转发给浏览器（服务器出网受限、或空间为私有时选这个）",
 }
 
 # 设置面板的分组与顺序。设面板从长表单里找出某一项很费力——
@@ -139,6 +182,9 @@ SETTINGS_GROUPS: list[tuple[str, list[str]]] = [
     ("平台登录态", ["cookie_text", "cookie_text_bili", "resolver_curl"]),
     ("模型与生成", ["asr_language", "llm_max_tokens", "llm_temperature"]),
     ("性能", ["first_chunk_seconds", "chunk_seconds", "max_concurrency"]),
+    ("媒体归档", ["qiniu_ak", "qiniu_sk", "qiniu_bucket", "qiniu_domain",
+                 "qiniu_prefix", "qiniu_archive_days", "qiniu_backup_on_finish",
+                 "qiniu_proxy"]),
 ]
 
 
@@ -493,6 +539,11 @@ def public_settings() -> dict:
         "cookie_douyin": bool(s.get("cookie_text")),
         "cookie_bilibili": bool(s.get("cookie_text_bili")),
         "resolver_curl": bool(s.get("resolver_curl")),
+        "qiniu_ak": bool(s.get("qiniu_ak")),
+        "qiniu_sk": bool(s.get("qiniu_sk")),
+        # 归档要 AK 和 SK 齐备才算可用，缺一半等于不可用；
+        # 前端据此直接显示「密钥不完整」，省得用户逐个比对。
+        "qiniu": bool(s.get("qiniu_ak") and s.get("qiniu_sk")),
     }
     out["_from_env"] = from_env
     # 密钥落盘位置，页面据此提示用户去哪里改
@@ -617,6 +668,10 @@ def cookie_hint() -> str:
     return COOKIE_BLOCKED_HINT if cookie_state() == "blocked" else COOKIE_MISSING_HINT
 
 
+# ffmpeg / ffprobe 的文件名白名单（含 Windows 的 .exe）
+_FF_NAME_RE = re.compile(r"^ff(?:mpeg|probe)(?:\.exe)?$", re.I)
+
+
 def ff_bin(name: str) -> str:
     """返回 ffmpeg / ffprobe 可执行文件路径：
     设置里的路径 -> PATH -> imageio-ffmpeg 自带二进制（仅 ffmpeg）"""
@@ -625,7 +680,13 @@ def ff_bin(name: str) -> str:
     base = (load_settings().get("ffmpeg_path") or "").strip()
     if base:
         p = Path(base)
-        if p.exists():
+        # ★文件名必须匹配 ffmpeg / ffprobe，不能只判断存在。
+        # 旧实现只做 p.exists() 就原样返回，于是形成完整攻击链：
+        #   上传任意可执行文件（上传端点不校验类型）-> 把 ffmpeg_path 指过去
+        #   -> 健康检测每 20 秒自动 subprocess.run([它, "-version"])
+        #   -> 任意代码执行，且无需任何任务触发。
+        # 这里同时要求 is_file()（排除目录）与文件名白名单（排除任意 exe）。
+        if p.is_file() and _FF_NAME_RE.match(p.name):
             if name == "ffmpeg":
                 return str(p)
             cand = p.with_name(re.sub(r"^ffmpeg", name, p.name, flags=re.I))
