@@ -426,17 +426,36 @@ async def task_events(tid: str):
         # 预览区不必等到整个任务跑完才出现
         sent_vp = ""
         while True:
-            t = store.get(tid)
-            if not t:
-                yield 'data: {"type":"eof"}\n\n'
-                break
-            vp = (t.meta or {}).get("video_path") or ""
+            # ★在锁内一次性快照任务状态（#8）：pipeline 线程正在并发改写
+            # t.segments / t.transcript / t.status，若边读边被改写，json.dumps
+            # 可能看到「半新」的内容（例如正在替换的列表引用、或状态与进度不一致）。
+            # 这里先快照成局部变量，再在锁外慢慢序列化，既安全又不拖长持锁时间。
+            with store._lock:
+                t = store.get(tid)
+                if t is None:
+                    yield 'data: {"type":"eof"}\n\n'
+                    return
+                snap = {
+                    "status": t.status, "stage": t.stage, "percent": t.percent,
+                    "spercent": t.spercent, "message": t.message, "error": t.error,
+                    "failed_stage": t.failed_stage,
+                    "segments": list(t.segments or []),
+                    "transcript": t.transcript or "",
+                    "note": t.note or "", "note_sig": t.note_sig or "",
+                    "note_info": dict(t.note_info or {}),
+                    "variants": dict(t.variants or {}),
+                    "meta": dict(t.meta or {}),
+                }
+                vp = snap["meta"].get("video_path") or ""
+                evs = list(t.events)
+            # 视频路径：下载一落盘就推，预览区不必等全流程结束
             if vp and vp != sent_vp:
                 sent_vp = vp
-                yield "data: " + json.dumps({"type": "meta", "meta": t.meta},
+                yield "data: " + json.dumps({"type": "meta", "meta": snap["meta"]},
                                             ensure_ascii=False) + "\n\n"
-            while last < len(t.events):
-                e = t.events[last]
+            # 日志：只推新增
+            while last < len(evs):
+                e = evs[last]
                 last += 1
                 yield "data: " + json.dumps({"type": "log", **e}, ensure_ascii=False) + "\n\n"
             # 转写进度推送：只要内容有变化就推，**不看 status**。
@@ -449,43 +468,49 @@ async def task_events(tid: str):
             # 刷新一下才有」——因为刷新走详情接口，不依赖 SSE。
             # 现在改成按内容签名（句数 + 最后一句文本）判断，与状态无关：
             # 重连后 sent_sig 归零，还会把当前全量补推一次，天然自愈。
-            segs = t.segments or []
+            segs = snap["segments"]
             # 显式拆开写：`a or b if c else d` 的优先级很容易看错
             last_text = (segs[-1].get("text") or "") if segs else ""
             sig = (len(segs), last_text)
             if segs and sig != sent_sig:
                 sent_sig = sig
                 yield "data: " + json.dumps(
-                    {"type": "partial", "segments": t.segments,
-                     "transcript": t.transcript,
-                     "spercent": t.spercent}, ensure_ascii=False) + "\n\n"
+                    {"type": "partial", "segments": segs,
+                     "transcript": snap["transcript"],
+                     "spercent": snap["spercent"]}, ensure_ascii=False) + "\n\n"
                 idle = 0          # 有实质进展就不计入空闲
             # 状态指纹：下载、抽音频、切片这些阶段没有 segments，
             # 但同样是在推进。旧代码只看 segments，于是下载一个长视频
             # 就会把 idle 顶满 12 分钟然后被服务端掐断连接。
-            state_sig = (t.status, t.stage, t.percent, t.spercent, t.message)
+            state_sig = (snap["status"], snap["stage"], snap["percent"],
+                         snap["spercent"], snap["message"])
             if state_sig != last_state:
                 last_state = state_sig
                 idle = 0
             yield "data: " + json.dumps(
-                {"type": "state", "status": t.status, "stage": t.stage,
-                 "percent": t.percent, "spercent": t.spercent,
-                 "message": t.message, "error": t.error,
-                 "failed_stage": t.failed_stage},
+                {"type": "state", "status": snap["status"], "stage": snap["stage"],
+                 "percent": snap["percent"], "spercent": snap["spercent"],
+                 "message": snap["message"], "error": snap["error"],
+                 "failed_stage": snap["failed_stage"]},
                 ensure_ascii=False) + "\n\n"
-            if t.status in ("done", "failed", "canceled"):
+            # 终态（含转写完成 transcribed）即收尾：发 eof 兜底并断开连接。
+            # ★旧逻辑只在 done/failed/canceled 才断，transcribed 后连接会一直
+            # 空占着（最长 2 小时，#9）——既浪费连接，又让「转写完了但页面
+            # 不更新」这类问题更难排查。现在 transcribed 也断：前端拿到 eof
+            # 后即显示最终文字稿，polish 阶段再由前端开一条新 SSE。
+            if snap["status"] in ("done", "failed", "canceled", "transcribed"):
                 # eof 带上最终结果兜底：任务可能在两次心跳之间直接结束，
                 # 此时前端一次 partial 都没收到过，光靠增量会拿不到任何内容。
                 yield "data: " + json.dumps(
-                    {"type": "eof", "status": t.status,
-                     "segments": t.segments or [],
-                     "transcript": t.transcript or "",
-                     "note": t.note or "", "note_sig": t.note_sig or "",
-                     "note_info": t.note_info or {},
-                     "variants": t.variants or [],
-                     "meta": t.meta or {}},
+                    {"type": "eof", "status": snap["status"],
+                     "segments": segs,
+                     "transcript": snap["transcript"],
+                     "note": snap["note"], "note_sig": snap["note_sig"],
+                     "note_info": snap["note_info"],
+                     "variants": snap["variants"],
+                     "meta": snap["meta"]},
                     ensure_ascii=False) + "\n\n"
-                break
+                return
             idle += 1
             # idle 只统计「任务还在跑但确实没进展」的时间。
             # 原来它是只增不减的：900 × 0.8s = 12 分钟后连接必然被服务端
@@ -494,7 +519,7 @@ async def task_events(tid: str):
             # 现在有 partial 推送就归零；另外把上限放宽到 2 小时，
             # 即使是超长音频也不会被误杀（前端已有自动重连兜底）。
             if idle > 9000:
-                break
+                return
             await asyncio.sleep(0.8)
 
     return StreamingResponse(gen(), media_type="text/event-stream",

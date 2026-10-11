@@ -65,14 +65,30 @@ def _publish_segments(t: store.Task, segments: list[dict], force: bool = False) 
     而 SSE 本身 0.8 秒才推一次，推得再密界面也看不出来，
     只会把磁盘和网络写满、反而更卡。
     force=True 用于收尾，确保最后一批一定落盘（否则末尾几句会丢）。
+
+    ★内存更新无条件执行（#2）：旧代码把 `t.segments = segs` 也放在节流分支
+    里，节流窗口内（0.4 秒）新完成的片不会写进内存，SSE 每 0.8 秒读到的
+    是旧内容，界面要等下一次 publish 才看到 —— 表现就是「字出来了但慢半拍」。
+    现在内存始终是最新的，只有落盘才受节流。
+
+    ★去重（#3）：同一时间点 + 同一文本只保留一条。并发返回的多个分片时间本不
+    重叠，但静音点切分偶发边界重合、或某分片被重复提交时会出现重复句，
+    宁可丢一句重复的，也不能让界面出现两句一模一样的字。
     """
     segs = sorted((s for s in segments if s), key=lambda x: x.get("start", 0))
+    dedup: dict[tuple, dict] = {}
+    for s in segs:
+        key = (round(float(s.get("start", 0)) * 100) / 100, s.get("text") or "")
+        if key not in dedup:
+            dedup[key] = s
+    segs = list(dedup.values())
+    # 内存里始终反映最新进度：SSE 每 0.8 秒读一次，不能因为节流而滞后
+    t.segments = segs
+    t.transcript = asr.segments_to_text(segs)
     now = time.monotonic()
     if not force and now - t._pub_at < 0.4:
         return
     t._pub_at = now
-    t.segments = segs
-    t.transcript = asr.segments_to_text(segs)
     store.save(t)          # 落盘，刷新页面也能看到已转出的部分
 
 
@@ -201,45 +217,66 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
         q: queue.Queue = queue.Queue(maxsize=max(maxw * 2, 4))
         ex = ThreadPoolExecutor(max_workers=max(maxw, 1))
         pending: list = []
+        failed_chunks: list = []
+        try:
+            def pump() -> None:
+                # 有界队列 = 背压：切片跑太快时会被挡住，不会堆满磁盘
+                for i, c in enumerate(audio.iter_chunks(
+                        Path(meta["audio_path"]), workdir / "chunks",
+                        chunk_seconds, first_seconds=first_seconds)):
+                    while True:
+                        try:
+                            q.put((i, c), timeout=0.5)
+                            break
+                        except queue.Full:
+                            if finished.is_set():
+                                return
 
-        def pump() -> None:
-            # 有界队列 = 背压：切片跑太快时会被挡住，不会堆满磁盘
-            for i, c in enumerate(audio.iter_chunks(
-                    Path(meta["audio_path"]), workdir / "chunks",
-                    chunk_seconds, first_seconds=first_seconds)):
+            def consume() -> None:
                 while True:
                     try:
-                        q.put((i, c), timeout=0.5)
-                        break
-                    except queue.Full:
+                        i, c = q.get(timeout=0.5)
+                    except queue.Empty:
                         if finished.is_set():
                             return
+                        continue
+                    fut = ex.submit(do_chunk, c)
+                    fut._idx = i          # 记下分片下标，失败时好定位
+                    pending.append(fut)
+                    if i == 0:
+                        on_first_chunk(c)
+                    total_hint["n"] = max(total_hint["n"], i + 1)
 
-        def consume() -> None:
-            while True:
+            pump_th = threading.Thread(target=pump, daemon=True)
+            consume_th = threading.Thread(target=consume, daemon=True)
+            pump_th.start()
+            consume_th.start()
+            pump_th.join()
+            consume_th.join()
+            # 队列已空，等所有在途请求返回；按完成顺序取，先跑完的先推送。
+            # ★单片失败不再拖垮整个任务（#6）：跳过分片并记一条警告，
+            # 其余分片照常拼接；只有全部失败时整体才失败。ASR 内部已重试 3 次，
+            # 到这里还失败基本是接口/网络/Token 问题，单点失败不该让整段音频白转。
+            for f in as_completed(pending):
                 try:
-                    i, c = q.get(timeout=0.5)
-                except queue.Empty:
-                    if finished.is_set():
-                        return
+                    res = f.result()
+                except BaseException as e:      # noqa: BLE001 - 跨线程收集异常
+                    idx = getattr(f, "_idx", -1)
+                    failed_chunks.append(idx)
+                    t.log("warn", f"分片 {idx} 转写失败，已跳过：{e}")
                     continue
-                segs = ex.submit(do_chunk, c)
-                pending.append(segs)
-                if i == 0:
-                    on_first_chunk(c)
-                total_hint["n"] = max(total_hint["n"], i + 1)
-
-        pump_th = threading.Thread(target=pump, daemon=True)
-        consume_th = threading.Thread(target=consume, daemon=True)
-        pump_th.start()
-        consume_th.start()
-        pump_th.join()
-        consume_th.join()
-        # 队列已空，等所有在途请求返回；按完成顺序取，先跑完的先推送
-        for f in as_completed(pending):
-            segments.extend(f.result())
-            on_chunk(-1, {"duration": 0}, total_hint["n"])
-        ex.shutdown(wait=True)
+                segments.extend(res)
+                on_chunk(-1, {"duration": 0}, total_hint["n"])
+        finally:
+            # ★无论成功还是异常都要关线程池，否则 ex 泄漏、worker 线程常驻（#7）。
+            # 旧代码把 ex.shutdown 写在正常路径末尾，run() 中途抛异常时就被跳过。
+            ex.shutdown(wait=True)
+        if failed_chunks and not segments:
+            raise RuntimeError(
+                f"全部 {len(failed_chunks)} 个分片转写失败，请检查 ASR 接口 / 网络 / Token")
+        if failed_chunks:
+            t.log("warn", f"有 {len(failed_chunks)} 个分片转写失败（已跳过），"
+                           f"成稿可能缺失部分内容")
 
     def runner() -> None:
         # ★异常必须带回主线程：run() 跑在线程里，直接 raise 只会让线程

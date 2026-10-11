@@ -5,6 +5,14 @@
   const $$ = (s) => Array.prototype.slice.call(document.querySelectorAll(s));
   const tasks = new Map();
   const following = new Set();
+  // 每个任务一个 AbortController：切换任务时主动 abort 旧连接的 fetch，
+  // 否则旧的 SSE 会一直 hanging，断开后又被 scheduleReconnect 无限重连（#1 泄漏）。
+  const controllers = new Map();
+
+  function stopFollow(tid) {
+    const c = controllers.get(tid);
+    if (c) c.abort();
+  }
   let currentId = null;
   let pickedFile = null;
   let uploadPct = null;
@@ -492,7 +500,8 @@
     const t = tasks.get(tid);
     if (!t) return;
     // 任务已是终态，重连没有意义；等用户点历史记录时 loadDetail 会补齐
-    if (t.status === "done" || t.status === "failed" || t.status === "canceled") return;
+    if (t.status === "done" || t.status === "failed" || t.status === "canceled"
+        || t.status === "transcribed") return;
     if (retryAt.has(tid)) return;
     // n 是「已经重试过几次」。连接成功并收到数据后由下面的 clearRetry 归零，
     // 否则这里会一直递增，退避最终顶到上限再也降不下来。
@@ -514,9 +523,11 @@
   async function follow(tid) {
     if (following.has(tid)) return;
     following.add(tid);
+    const ctrl = new AbortController();
+    controllers.set(tid, ctrl);
     let reachedEof = false;
     try {
-      const r = await fetch("/api/tasks/" + tid + "/events");
+      const r = await fetch("/api/tasks/" + tid + "/events", { signal: ctrl.signal });
       const reader = r.body.getReader();
       const dec = new TextDecoder();
       let buf = "";
@@ -580,20 +591,33 @@
       /* 忽略网络中断，下面统一重连 */
     } finally {
       following.delete(tid);
-      // 只有「没走到 eof 就断了」才重连。走到 eof 说明任务真的结束了，
-      // 再连也是浪费；但polishing 可能紧跟着发生，交给 polish() 里的 follow。
-      if (!reachedEof) scheduleReconnect(tid);
+      controllers.delete(tid);
+      // 只有「没走到 eof 且不是被我们主动 abort（切任务）」才重连。
+      // 走到 eof 说明任务真的结束了，再连也是浪费；
+      // 被 abort 说明用户在切任务，旧连接本就该关，重连只会变成孤儿连接。
+      if (!reachedEof && !ctrl.signal.aborted) scheduleReconnect(tid);
     }
   }
 
   async function refreshOne(tid) {
     try {
       const d = await api("/api/tasks/" + tid);
-      tasks.set(tid, Object.assign({}, tasks.get(tid), d));
+      const cur = tasks.get(tid);
+      if (!cur) { tasks.set(tid, d); return; }
+      // 原地合并：保持对象引用不变，follow 持有的就是这同一个对象，
+      // 不会出现「follow 写旧对象、页面读新对象」的竞态（#5）。
+      // 若本地实时增量已经比详情快照更多，保留本地进度，不被旧快照回退。
+      const merged = Object.assign({}, cur, d);
+      if (cur.segments && cur.segments.length > (d.segments ? d.segments.length : 0)) {
+        merged.segments = cur.segments;
+        merged.transcript = cur.transcript;
+      }
+      tasks.set(tid, merged);
     } catch (e) {}
   }
 
   function selectTask(id) {
+    if (id !== currentId) stopFollow(currentId);   // 切任务先掐掉上一个 SSE，避免孤儿连接/重连（#1）
     currentId = id;
     ws.videoTask = null; ws.videoKey = null; ws.linesTask = null; ws.linesSig = null;
     ws.noteKey = null; ws.logCount = -1;
@@ -612,7 +636,18 @@
     try {
       const d = await api("/api/tasks/" + id);
       if (currentId !== id) return;          // 期间切走了，丢弃这次结果
-      tasks.set(id, Object.assign({}, tasks.get(id), d));
+      const cur = tasks.get(id);
+      if (cur) {
+        // 同 refreshOne：原地合并，且本地实时增量优先（#5）
+        const merged = Object.assign({}, cur, d);
+        if (cur.segments && cur.segments.length > (d.segments ? d.segments.length : 0)) {
+          merged.segments = cur.segments;
+          merged.transcript = cur.transcript;
+        }
+        tasks.set(id, merged);
+      } else {
+        tasks.set(id, d);
+      }
       const t = tasks.get(id);
       // 沿用上次查看的风格（没有才用任务最后生成的那份），并同步按钮选中态
       if (t && t.note_info && t.note_info.style && STYLE_TEXT[t.note_info.style]) {
@@ -1101,7 +1136,8 @@ if (rest.length) {
     const t = tasks.get(currentId);
     if (!t) return;
     // 已经是终态就不用折腾了，详情在点历史记录时就拉全了
-    if (t.status === "done" || t.status === "failed" || t.status === "canceled") return;
+    if (t.status === "done" || t.status === "failed" || t.status === "canceled"
+        || t.status === "transcribed") return;
     retryAt.delete(currentId);
     ws.linesTask = null; ws.linesSig = null; ws.videoKey = null;
     refreshOne(currentId).then(() => {

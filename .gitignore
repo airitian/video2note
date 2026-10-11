@@ -57,3 +57,7 @@ sse_e2e.txt
 first_sentence.txt
 chunks.txt
 lines_append.txt
+
+# 测试产生的临时切片
+fake_chunks/
+fake_src.mp3

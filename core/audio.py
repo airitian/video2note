@@ -261,11 +261,13 @@ def iter_chunks(src: Path, outdir: Path, chunk_seconds: int = 600,
     # 这样「切首片」不必等「扫完全程」。
     if stream:
         # 首片：尽量落在静音点，找不到就按长度硬切。
-        # 只扫开头 first*2 秒 —— ffmpeg 的 silencedetect 是顺序扫描，
-        # 扫全文件要好几秒，而首片只需要开头一小段。
+        # 只扫开头一小段（first*3 秒）—— ffmpeg 的 silencedetect 是顺序扫描，
+        # 扫全文件要好几秒，而首片只需要开头一小段。窗口从 first*2 放宽到
+        # first*3：连续说话超过 30 秒（first=15）的视频，first*2 往往找不到
+        # 静音点而退化成硬切（可能在句中断开），多扫 15 秒更易命中静音点（#10）。
         # ★不能把这个结果复用给后面的片：它们要的是文件后段的静音点，
         # 而这里只拿到开头的，于是后面全部退化成硬切（会在句子中间断开）。
-        silences_head = _silence_points(src, total_limit=first * 2.0)
+        silences_head = _silence_points(src, total_limit=first * 3.0)
         cut = _near_silence(silences_head, first)
         if cut <= 5:
             cut = min(float(first), total)
@@ -277,20 +279,29 @@ def iter_chunks(src: Path, outdir: Path, chunk_seconds: int = 600,
         silences = _silence_points(src)
         offset = cut
         idx = 1
-        while offset + 0.5 < total:
+        # ★不再用 `offset + 0.5 < total` 当退出条件：那样末尾不足 0.5 秒的一截
+        # 会被整个丢掉，长音频里偶尔正好卡在句尾，表现为「最后几个字没转出来」（#4）。
+        # 改为：只要还剩 >0.05 秒就继续切；循环结束后若仍有残余也单独成片。
+        while offset < total - 0.05:
             remain = total - offset
             size = min(float(chunk_seconds), remain)
             cut2 = _near_silence(silences, offset + size, lo=offset + 5.0)
             if cut2 <= offset + 5:
                 cut2 = offset + size
-            # ★不能写 total - 0.5：那样最后一片永远差0.5 秒，
-            # 每段末尾几个字会被切掉。这里允许切到音频真正末尾。
+            # 允许切到音频真正末尾，不预留 0.5 秒余量（否则末尾永远少一截）
             cut2 = min(cut2, total)
             dst = outdir / f"part_{idx:03d}.mp3"
             _transcode(src, dst, offset, cut2 - offset)
             yield {"path": str(dst), "offset": offset,
                    "duration": probe_duration(dst)}
             offset = cut2
+            idx += 1
+        # 收尾：若还剩一截（可能不足 0.5 秒）也单独成片，避免末尾丢字（#4）
+        if offset < total - 0.05:
+            dst = outdir / f"part_{idx:03d}.mp3"
+            _transcode(src, dst, offset, total - offset)
+            yield {"path": str(dst), "offset": offset,
+                   "duration": (total - offset)}
             idx += 1
         return
 
