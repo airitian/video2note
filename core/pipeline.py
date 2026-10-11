@@ -218,6 +218,7 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
         ex = ThreadPoolExecutor(max_workers=max(maxw, 1))
         pending: list = []
         failed_chunks: list = []
+        pump_done = threading.Event()
         try:
             def pump() -> None:
                 # 有界队列 = 背压：切片跑太快时会被挡住，不会堆满磁盘
@@ -231,6 +232,7 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
                         except queue.Full:
                             if finished.is_set():
                                 return
+                pump_done.set()   # ★切片结束，通知 consume 可在队列空时退出
 
             def consume() -> None:
                 while True:
@@ -238,6 +240,12 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
                         i, c = q.get(timeout=0.5)
                     except queue.Empty:
                         if finished.is_set():
+                            return
+                        # ★正常流程下 pump 已结束且队列已空时必须退出，否则
+                        # run() 会永远卡在 consume_th.join()，转写线程死锁、
+                        # segments 永远写不出、任务卡在「转写 0%」（SSE 和刷新
+                        # 都拿不到文字）。这是确定性死锁——之前所有新任务都中招。
+                        if pump_done.is_set() and q.empty():
                             return
                         continue
                     fut = ex.submit(do_chunk, c)
