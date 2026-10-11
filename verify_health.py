@@ -19,6 +19,7 @@
 运行：python verify_health.py
 """
 import asyncio
+import json
 import pathlib
 import sys
 import time
@@ -188,11 +189,21 @@ t_warm = time.perf_counter() - t0
 print(f"    冷启动首次 {t_cold*1000:.0f}ms；稳态 20 次共 {t_warm*1000:.0f}ms"
       f"（{t_warm/20*1000:.2f}ms/次）")
 
+def _j(resp):
+    """端点现在返回 starlette Response（为了带关代理缓冲的头），解出 JSON 体"""
+    return json.loads(resp.body)
+
+
 check("G1 health 是 async def（重活不在请求线程做）",
       asyncio.iscoroutinefunction(main.health), str(main.health))
 check("G2 稳态每次调用 < 1ms（页面打开不再被拖慢）",
       t_warm / 20 < 0.001, f"{t_warm/20*1000:.2f}ms/次")
-check("G3 端点仍能正常返回字段", "ffmpeg" in warm[-1], str(list(warm[-1].keys())))
+check("G3 端点仍能正常返回字段", "ffmpeg" in _j(warm[-1]), str(list(_j(warm[-1]).keys())))
+_h = warm[-1].headers
+check("G7 显式关闭代理缓冲（X-Accel-Buffering: no）——预览网关会缓冲响应",
+      _h.get("x-accel-buffering") == "no", str(dict(_h)))
+check("G8 禁缓存（Cache-Control: no-store），防代理/浏览器缓存旧快照",
+      "no-store" in (_h.get("cache-control") or ""), _h.get("cache-control"))
 check("G4 冷启动有上界（返回占位，不拖住用户）", t_cold < 5.0,
       f"{t_cold*1000:.0f}ms")
 

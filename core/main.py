@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import shutil
 import threading
@@ -108,6 +109,16 @@ async def _lifespan(_app: FastAPI):
 
     不用 @app.on_event("startup")：FastAPI 0.110+ 已废弃，会刷 DeprecationWarning。
     """
+    # 先清僵尸：上次进程遗留的「处理中」任务，执行线程已随旧进程消失，
+    # 不清理的话前端会对它们各开一条 SSE + 轮询，挂死连接占满浏览器并发池，
+    # 顶栏就永远「检测中」。标成 failed 后重试按钮出现，可智能续跑。
+    try:
+        from .pipeline import recover_interrupted
+        n = recover_interrupted()
+        if n:
+            logging.getLogger("uvicorn.error").info(f"已清理 {n} 个服务重启遗留的中断任务")
+    except Exception:
+        pass  # 清理失败不挡启动
     threading.Thread(target=_health_loop, daemon=True).start()
     yield
     _health_stop.set()

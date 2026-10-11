@@ -700,6 +700,10 @@
         tasks.set(id, d);
       }
       const t = tasks.get(id);
+      // 点开历史记录时，任务还在跑而之前没在跟随（如启动时超出跟随上限
+      // 被跳过的），这里补上跟随，恢复实时进度
+      if (t && (t.status === "running" || t.status === "pending")
+          && !controllers.has(id)) follow(id);
       // 沿用上次查看的风格（没有才用任务最后生成的那份），并同步按钮选中态
       if (t && t.note_info && t.note_info.style && STYLE_TEXT[t.note_info.style]) {
         curStyle = viewStyle.get(id) || t.note_info.style;
@@ -1198,7 +1202,12 @@ if (rest.length) {
       const sorted = list.slice().sort((a, b) => b.created_at - a.created_at);
       if (sorted.length) {
         currentId = sorted[0].id;
-        sorted.forEach((t) => { if (t.status === "running" || t.status === "pending") follow(t.id); });
+        // 只跟随最近 3 个活跃任务：每个 follow = 1 条 SSE + 1 个轮询器。
+        // 浏览器对同域名的并发连接数有限（HTTP/1.1 下 6 条），僵尸任务一多
+        // 挂死的 SSE 会占满连接池，/api/health 排不上队 → 顶栏永远「检测中」。
+        // 其余活跃任务在点开时由 loadDetail 补上跟随。
+        const active = sorted.filter((t) => t.status === "running" || t.status === "pending");
+        active.slice(0, 3).forEach((t) => follow(t.id));
       }
       render();
       // 默认选中最近一条，并拉详情回显视频/ 转写 / 文稿

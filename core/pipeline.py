@@ -493,6 +493,35 @@ def submit(t: store.Task) -> None:
     _executor.submit(lambda: _run_and_catch(t, lambda: _transcribe_body(t)))
 
 
+def recover_interrupted() -> int:
+    """进程重启后，把上一次运行遗留的「处理中」任务标记为失败。
+
+    执行线程已随旧进程消失，状态却永远停在 running/pending（僵尸任务）。
+    危害不只是显示难看：前端 boot 会对每个 running/pending 任务开一条 SSE
+    连接 + 一个周期轮询器，多个僵尸同时 follow 时，挂死的 SSE 能把浏览器
+    对同域名的并发连接数（HTTP/1.1 下 6 条）占满，/api/health 排不上队，
+    顶栏就永远停在「检测中」。
+
+    标成 failed 后：不再被 follow；「重试」按钮出现，且重试会复用已下载
+    的媒体文件（_existing_media），不会重复下载。
+    返回清理数量（仅用于启动日志）。
+    """
+    n = 0
+    for t in store.list_tasks():
+        if t.status not in ("running", "pending"):
+            continue
+        t.status = "failed"
+        # 记下中断发生在哪个阶段：重试据此走智能续跑（只补整理 / 全流程复用媒体）
+        t.failed_stage = t.stage if t.stage and t.stage != "queued" else "downloading"
+        t.error = "服务重启导致任务中断"
+        t.message = "处理失败"
+        t.log("warn", "检测到服务重启，上次未完成的任务已标记为失败；"
+                      "点「重试」可继续（会复用已下载的媒体文件）")
+        store.save(t)
+        n += 1
+    return n
+
+
 def submit_polish(t: store.Task, style: str, force: bool = False) -> None:
     """转写完成后的 AI 整理，独立触发、可换风格重跑。
 
