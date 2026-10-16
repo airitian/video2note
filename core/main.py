@@ -21,11 +21,13 @@ from pydantic import BaseModel
 
 from . import audio, downloader, exporters, store
 from .downloader import detect_platform, extract_url
-from .config import (ACCESS_TOKEN, HELP, MEDIA_DIR, ROOT, SECRET_KEYS,
-                     SETTINGS_GROUPS, ensure_cookie_file, ensure_dirs,
-                     load_settings, migrate_secrets, normalize_browser,
-                     public_settings,
-                     save_settings)
+from .config import (ACCESS_TOKEN, ADMIN_TOKEN, HELP, MEDIA_DIR, ROOT, SECRET_KEYS,
+                     SETTINGS_GROUPS, all_valid_tokens, ensure_cookie_file,
+                     ensure_dirs, free_remaining, gate_active, is_admin,
+                     load_settings, load_tokens, migrate_secrets, normalize_browser,
+                     pro_free_limit, pro_gate_enabled, pro_used, public_settings,
+                     reset_pro_usage, save_settings, token_role,
+                     add_token as cfg_add_token, remove_token as cfg_remove_token)
 from .pipeline import (_apply_variant, _mark_idempotent_hit, _sync_variant_meta,
                        polish_needed, retry as pipeline_retry,
                        submit, submit_polish)
@@ -160,41 +162,60 @@ async def _lifespan(_app: FastAPI):
 app = FastAPI(title="视频转笔记", version="1.1.0", lifespan=_lifespan)
 STATIC = ROOT / "static"
 
-# ---- 访问控制 ----------------------------------------------------------
-# 整个应用原本没有任何鉴权：只要能连到端口，任何人都能读全部转写稿与成稿、
-# 删任意任务、无限触发昂贵的 LLM 调用；更隐蔽的是把 asr/llm_base_url
-# 改成自己的服务器即可截获真实 API Key（请求会原样带上 Bearer Token，
-# 而这两个字段属于「非敏感项」，改动不会动到 Key，表面看毫无异常）。
-#
-# 这里加一道可选门禁（环境变量 V2N_ACCESS_TOKEN）：
-#   留空 -> 不校验，行为与过去一致（本地 127.0.0.1 使用足够）
-#   非空 -> 除 state/login 外的 /api/* 一律需要令牌
-# 令牌可用 Authorization: Bearer / X-Access-Token / cookie / ?token= 四种方式
-# 提供。支持 cookie 是关键：<video src="/api/media/..."> 这类浏览器直连请求
-# 无法自定义 header，靠 cookie 才能自动带上，前端不必改写资源地址。
-_AUTH_FREE_PATHS = ("/api/auth/state", "/api/auth/login")
+# ---- 访问控制 / 多令牌 / 门禁 ----------------------------------------
+# 设计目标：
+#   1) 默认开放：不要求令牌也能使用（前 pro_free_limit 次成功转写免费）。
+#   2) 门禁：成功转写达到 pro_free_limit 且已配置至少一个令牌后，
+#      任务创建类接口要求持有效令牌，否则返回 402（后端强制校验）。
+#   3) 管理员：引导令牌 ADMIN_TOKEN（兼容旧 V2N_ACCESS_TOKEN）或网页里登记的
+#      admin 令牌，可打开「设置」并管理其它令牌；普通令牌看不到设置按钮，
+#      设置类接口后端一律 401/403。
+# 令牌四种携带方式：Authorization: Bearer / X-Access-Token / cookie / ?token=。
+# cookie 用于 <video src="/api/media/..."> 这类无法自定义 header 的直连请求。
 
-if ACCESS_TOKEN:
+def _extract_token(request: Request) -> str:
+    """从四种方式中取出令牌（空串表示未携带）。"""
+    auth = request.headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    tok = (request.headers.get("x-access-token") or "").strip()
+    if tok:
+        return tok
+    tok = (request.cookies.get("v2n_token") or "").strip()
+    if tok:
+        return tok
+    return (request.query_params.get("token") or "").strip()
 
-    @app.middleware("http")
-    async def _auth_guard(request: Request, call_next):
-        path = request.url.path
-        if path.startswith("/api/") and path not in _AUTH_FREE_PATHS:
-            tok = ""
-            auth = request.headers.get("authorization") or ""
-            if auth.lower().startswith("bearer "):
-                tok = auth[7:].strip()
-            if not tok:
-                tok = (request.headers.get("x-access-token") or "").strip()
-            if not tok:
-                tok = (request.cookies.get("v2n_token") or "").strip()
-            if not tok:
-                tok = (request.query_params.get("token") or "").strip()
-            # 定长比较：避免攻击者用响应时间差逐字节猜出令牌
-            if not hmac.compare_digest(tok, ACCESS_TOKEN):
-                return JSONResponse({"detail": "未授权：请提供访问令牌"},
-                                    status_code=401)
+
+def _is_protected_create(request: Request) -> bool:
+    """任务创建 / 重跑类接口：门禁激活时要求令牌。"""
+    if request.method != "POST":
+        return False
+    p = request.url.path
+    if p in ("/api/tasks", "/api/tasks/upload", "/api/tasks/upload-raw"):
+        return True
+    return bool(re.fullmatch(r"/api/tasks/[^/]+/(polish|retry)", p))
+
+
+@app.middleware("http")
+async def _access_guard(request: Request, call_next):
+    path = request.url.path
+    tok = _extract_token(request)
+    # 1) 配置 / 管理员令牌管理：仅管理员（或开发模式全开）
+    if path.startswith("/api/settings") or path.startswith("/api/admin/"):
+        if not is_admin(tok):
+            return JSONResponse(
+                {"detail": "需要管理员令牌", "code": "NEED_ADMIN"},
+                status_code=401 if not tok else 403)
         return await call_next(request)
+    # 2) 任务创建类：门禁激活且未持有效令牌 -> 拒绝（后端强制校验）
+    if gate_active() and _is_protected_create(request):
+        if token_role(tok) is None:
+            return JSONResponse(
+                {"detail": "免费次数已用完，请提供访问令牌后继续",
+                 "code": "TOKEN_REQUIRED"},
+                status_code=402)
+    return await call_next(request)
 
 STYLES = ("general", "note", "article", "clean")
 
@@ -229,24 +250,41 @@ class LoginIn(BaseModel):
 
 
 @app.get("/api/auth/state")
-def auth_state():
-    """免鉴权：前端据此判断要不要弹令牌输入框。"""
-    return {"required": bool(ACCESS_TOKEN)}
+def auth_state(request: Request):
+    """前端据此判断：是否要弹令牌、当前角色、门禁与剩余次数。"""
+    tok = _extract_token(request)
+    role = token_role(tok) or "none"
+    return {
+        "admin_configured": bool(ADMIN_TOKEN),
+        "role": role,
+        "token_required": gate_active(),
+        "gate_active": gate_active(),
+        "free_remaining": free_remaining(),
+        "pro_used": pro_used(),
+        "pro_limit": pro_free_limit(),
+    }
 
 
 @app.post("/api/auth/login")
-def auth_login(body: LoginIn):
+def auth_login(body: LoginIn, request: Request):
     """校验令牌后写入 httpOnly cookie，后续请求由浏览器自动携带。
 
     用 cookie 而不是让前端存 localStorage，是为了让
     <video src="/api/media/..."> 这类无法自定义 header 的请求也能通过校验。
     """
-    if not ACCESS_TOKEN:
-        return {"ok": True}
-    if not hmac.compare_digest((body.token or "").strip(), ACCESS_TOKEN):
+    tok = (body.token or "").strip()
+    # 没有任何令牌体系：开发模式，直接放行（视为管理员）
+    if not all_valid_tokens():
+        resp = JSONResponse({"ok": True,
+                              "role": "admin" if not ADMIN_TOKEN else "none"})
+        if tok:
+            resp.set_cookie("v2n_token", tok, httponly=True, samesite="lax",
+                            max_age=30 * 24 * 3600)
+        return resp
+    if not tok or token_role(tok) is None:
         raise HTTPException(401, "访问令牌不正确")
-    resp = JSONResponse({"ok": True})
-    resp.set_cookie("v2n_token", ACCESS_TOKEN, httponly=True, samesite="lax",
+    resp = JSONResponse({"ok": True, "role": token_role(tok)})
+    resp.set_cookie("v2n_token", tok, httponly=True, samesite="lax",
                     max_age=30 * 24 * 3600)
     return resp
 
@@ -256,6 +294,69 @@ def auth_logout():
     resp = JSONResponse({"ok": True})
     resp.delete_cookie("v2n_token")
     return resp
+
+
+# ============================ 管理员：令牌与门禁 ============================
+# 下面所有 /api/admin/* 由中间件强制仅管理员可访问（后端校验，前端无法绕过）。
+class TokenIn(BaseModel):
+    token: str = ""
+    role: str = "user"      # admin | user
+
+
+@app.get("/api/admin/tokens")
+def admin_list_tokens():
+    """列出已登记令牌（明文，仅管理员可见）与门禁状态。仅管理员。"""
+    toks = [{"token": t["token"], "role": t["role"]} for t in load_tokens()]
+    return {
+        "tokens": toks,
+        "admin_token_set": bool(ADMIN_TOKEN),
+        "gate": {"active": gate_active(), "used": pro_used(),
+                 "limit": pro_free_limit(), "free_remaining": free_remaining(),
+                 "enabled": pro_gate_enabled()},
+    }
+
+
+@app.post("/api/admin/tokens")
+def admin_add_token(body: TokenIn):
+    """新增令牌。仅管理员。
+
+    固定按普通用户（role=user）创建——管理员唯一来源是容器环境变量里的
+    引导令牌（V2N_ACCESS_TOKEN / V2N_ADMIN_TOKEN），网页里刻意建不出管理员，
+    避免某个用户 token 泄露后直接被提权到设置层。body.role 被忽略。
+    """
+    try:
+        cfg_add_token(body.token, "user")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "role": "user"}
+
+
+@app.delete("/api/admin/tokens")
+def admin_delete_token(token: str = ""):
+    """删除已登记令牌（引导 ADMIN_TOKEN 不能在此删，改环境变量生效）。仅管理员。"""
+    tok = (token or "").strip()
+    if not tok:
+        raise HTTPException(status_code=400, detail="缺少 token")
+    if ADMIN_TOKEN and hmac.compare_digest(tok, ADMIN_TOKEN):
+        raise HTTPException(status_code=400,
+                            detail="引导管理员令牌不能在此删除（请改环境变量 V2N_ADMIN_TOKEN）")
+    cfg_remove_token(tok)
+    return {"ok": True}
+
+
+@app.get("/api/admin/usage")
+def admin_usage():
+    """查看免费次数使用量。仅管理员。"""
+    return {"used": pro_used(), "limit": pro_free_limit(),
+            "free_remaining": free_remaining(), "gate_active": gate_active(),
+            "enabled": pro_gate_enabled()}
+
+
+@app.post("/api/admin/usage/reset")
+def admin_usage_reset():
+    """清零免费次数计数（重新发放免费额度）。仅管理员。"""
+    reset_pro_usage()
+    return {"ok": True, "used": 0, "free_remaining": free_remaining()}
 
 
 class PolishIn(BaseModel):

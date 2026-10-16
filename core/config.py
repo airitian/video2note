@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
@@ -49,6 +50,163 @@ SECRETS_FILE = Path(
 #   以及把 asr/llm_base_url 改成自己的服务器来截获真实 API Key。
 ACCESS_TOKEN = (os.getenv("V2N_ACCESS_TOKEN") or "").strip()
 
+# 管理员引导令牌：用于首次登录后在网页里管理其它令牌与门禁设置。
+# 兼容旧变量 V2N_ACCESS_TOKEN：之前部署用它做全局鉴权，现转为「管理员引导令牌」，
+# 这样已有部署无需改动即拥有管理员权限；新部署可改用 V2N_ADMIN_TOKEN 单独指定。
+# 留空 = 没有任何令牌（配置全开放，开发模式）。
+ADMIN_TOKEN = (os.getenv("V2N_ADMIN_TOKEN") or "").strip() or ACCESS_TOKEN
+
+
+# ============================ 多令牌 / 角色 ============================
+# 除引导管理员令牌外，其余令牌列在 data/tokens.json，由管理员在网页里增删。
+# 每条: {"token": "<明文>", "role": "admin" | "user"}。
+# 角色只决定能否打开「设置」与管理令牌；转写/成稿等使用类接口，
+# 只要持任意一个有效令牌即可（门禁激活时）。
+TOKENS_FILE = DATA_DIR / "tokens.json"
+
+
+def load_tokens() -> list[dict]:
+    """读取已登记令牌列表（不含引导 ADMIN_TOKEN）。"""
+    data = _read_json(TOKENS_FILE)
+    raw = data.get("tokens") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        raw = []
+    out = []
+    for x in raw:
+        if isinstance(x, dict) and x.get("token"):
+            out.append({"token": str(x["token"]),
+                        "role": "admin" if x.get("role") == "admin" else "user"})
+    return out
+
+
+def save_tokens(toks: list[dict]) -> None:
+    _write_json(TOKENS_FILE, {"tokens": toks})
+
+
+def _stored_token_set() -> set[str]:
+    return {t["token"] for t in load_tokens()}
+
+
+def all_valid_tokens() -> set[str]:
+    """当前所有可用令牌（引导 admin + 已登记）。"""
+    s = _stored_token_set()
+    if ADMIN_TOKEN:
+        s.add(ADMIN_TOKEN)
+    return s
+
+
+def token_role(tok: str | None) -> str | None:
+    """返回令牌角色 'admin' / 'user'，无效返回 None。"""
+    if not tok:
+        return None
+    if ADMIN_TOKEN and hmac.compare_digest(tok, ADMIN_TOKEN):
+        return "admin"
+    for t in load_tokens():
+        if hmac.compare_digest(tok, t["token"]):
+            return t["role"]
+    return None
+
+
+def is_admin(tok: str | None) -> bool:
+    """是否拥有管理员权限。
+
+    - 引导 ADMIN_TOKEN 命中 -> admin
+    - 已登记 admin 令牌命中 -> admin
+    - 既无 ADMIN_TOKEN 又无任何已登记令牌 -> 开发模式，配置全开放（视为 admin）
+    - 否则（已有令牌体系但没有 admin 凭据）-> 否
+    """
+    if not tok:
+        return (not ADMIN_TOKEN) and (not load_tokens())
+    if ADMIN_TOKEN and hmac.compare_digest(tok, ADMIN_TOKEN):
+        return True
+    for t in load_tokens():
+        if t["role"] == "admin" and hmac.compare_digest(tok, t["token"]):
+            return True
+    # 引导 admin 未设、且尚无任何 admin 令牌时，第一个已登记令牌作为引导 admin
+    if not ADMIN_TOKEN:
+        toks = load_tokens()
+        if toks and hmac.compare_digest(tok, toks[0]["token"]):
+            return True
+    return False
+
+
+def add_token(tok: str, role: str = "user") -> None:
+    tok = (tok or "").strip()
+    if not tok:
+        raise ValueError("令牌不能为空")
+    if len(tok) < 6:
+        raise ValueError("令牌至少 6 位")
+    toks = load_tokens()
+    if tok in {t["token"] for t in toks}:
+        raise ValueError("该令牌已存在")
+    # 引导 admin 未设且当前没有 admin 令牌：把第一个添加的令牌自动设为 admin，
+    # 否则网页里永远产生不出管理员，形成死锁。
+    if not ADMIN_TOKEN and not any(t["role"] == "admin" for t in toks):
+        role = "admin"
+    toks.append({"token": tok, "role": "admin" if role == "admin" else "user"})
+    save_tokens(toks)
+
+
+def remove_token(tok: str) -> None:
+    toks = [t for t in load_tokens()
+            if not hmac.compare_digest(t["token"], tok)]
+    save_tokens(toks)
+
+
+# ============================ 免费次数 / 门禁 ============================
+# 每次「成功转写」计 1 次；达到 pro_free_limit 且已配置至少一个令牌后，
+# 后续任务创建类接口要求持有效令牌（门禁激活）。
+USAGE_FILE = DATA_DIR / "usage.json"
+
+
+def pro_free_limit() -> int:
+    try:
+        return max(0, int((load_settings().get("pro_free_limit") or "3").strip() or "3"))
+    except Exception:
+        return 3
+
+
+def pro_gate_enabled() -> bool:
+    return (load_settings().get("pro_gate") or "1").strip() != "0"
+
+
+def pro_used() -> int:
+    return int((_read_json(USAGE_FILE).get("count") or 0))
+
+
+def record_pro_use() -> None:
+    """成功转写 +1（写入失败不影响主流程）。"""
+    try:
+        d = _read_json(USAGE_FILE)
+        d["count"] = int(d.get("count") or 0) + 1
+        _write_json(USAGE_FILE, d)
+    except Exception:
+        pass
+
+
+def reset_pro_usage() -> None:
+    try:
+        _write_json(USAGE_FILE, {"count": 0})
+    except Exception:
+        pass
+
+
+def free_remaining() -> int:
+    return max(0, pro_free_limit() - pro_used())
+
+
+def gate_active() -> bool:
+    """门禁是否生效：开启 + 已达上限 + 至少存在一个可要求的令牌。
+
+    第三条是关键防呆：若没有任何令牌可要求，门禁不生效，
+    避免「达到上限却无人能发令牌」把免费服务彻底锁死。
+    """
+    if not pro_gate_enabled():
+        return False
+    if not all_valid_tokens():
+        return False
+    return pro_used() >= pro_free_limit()
+
 DEFAULTS: dict[str, str] = {
     # ---- 语音识别（模力方舟 / Gitee AI，OpenAI 兼容）----
     "asr_base_url": "https://api.moark.com/v1",
@@ -75,6 +233,11 @@ DEFAULTS: dict[str, str] = {
     "cookie_file": "",
     "proxy": "",
     "ffmpeg_path": "",
+    # ---- 访问与门禁（仅管理员可改）----
+    # 免费成功转写次数；达到后要求访问令牌。0 表示不限制（始终开放）。
+    "pro_free_limit": "3",
+    # 门禁总开关：1 开启（达上限要求令牌），0 关闭（无论用多少次都不要令牌）。
+    "pro_gate": "1",
     # 解析接口的浏览器抓包模板（dlpanda 等）。含 Cookie，等价于会话凭证，
     # 所以归入敏感项，只落 secrets.json。
     "resolver_curl": "",
@@ -86,9 +249,11 @@ DEFAULTS: dict[str, str] = {
     "qiniu_bucket": "",
     "qiniu_domain": "",
     "qiniu_prefix": "video2note/",
-    "qiniu_archive_days": "30",
-    # 下载/上传落盘后立刻异步备份到云端。关掉则只在清理时才上传——
-    # 那样接近保留期的那段时间本地就是唯一副本，风险明显更高。
+    # 本地源视频保留天数。AI 去重（整理）完成即备份到七牛云，
+    # 该任务超过此天数未再活动就删除本地源视频（届时从云端回看）。默认 1 天。
+    "qiniu_archive_days": "1",
+    # AI 去重（整理）成功后立即把源视频备份到云端（默认开）。
+    # 关掉则要等到清理时才上传——临近保留期时本地是唯一副本，风险更高。
     "qiniu_backup_on_finish": "1",
     # 本地文件缺失时的回显方式：0=302 直跳 CDN（默认，最快）；
     # 1=服务端从云端拉下来再转发（出网受限或私有桶时必须用这个）。
@@ -101,9 +266,17 @@ SECRET_KEYS = {
     "asr_api_key", "llm_api_key", "cookie_text", "cookie_text_bili",
     "resolver_curl",
     # 七牛云密钥等同于「整个存储桶的读写权限」，必须与 ASR/LLM Key 同级保护：
-    # 只落 secrets.json（0600），不随 settings.json 下发到浏览器。
+    # 只落 secrets.json（0600）。
     "qiniu_ak", "qiniu_sk",
 }
+
+# 不回显到前端的敏感项（其余敏感项正常回显）。
+# 设置面板由后端 is_admin 强校验（/api/settings 仅管理员可读），
+# 普通用户/令牌根本拿不到这份数据，因此 ASR/LLM Key、Cookie 等对管理员回显是安全的，
+# 也让管理员免去翻 JSON 文件就能核对「到底配了什么」。
+# 七牛 AK/SK 例外：它已改为完全隐藏（前端不渲染「媒体归档」分组），
+# 由环境变量 / secrets.json 托管，故既隐藏也不回显，双重保险。
+NO_ECHO_KEYS = {"qiniu_ak", "qiniu_sk"}
 
 # ASR 可用模型（实测于 /v1/models），UI 下拉使用
 ASR_MODELS = [
@@ -152,23 +325,27 @@ HELP: dict[str, str] = {
                    "例如 D:\\cookies.txt。一般用不到，前两种任选其一即可",
     "proxy": "代理地址，如 http://127.0.0.1:7890",
     "ffmpeg_path": "ffmpeg 可执行文件路径，留空则使用 PATH 中的 ffmpeg",
+    # ---- 访问与门禁 ----
+    "pro_free_limit": "免费成功转写次数：达到后要求访问令牌才能继续。"
+                      "填 0 表示不限制（服务始终免费开放）。仅管理员可改",
+    "pro_gate": "门禁总开关：1 = 开启（达到免费次数后要求令牌）；"
+                "0 = 关闭（无论使用多少次都不要求令牌）。仅管理员可改",
     # ---- 媒体归档 ----
-    # AK/SK 必须留在 HELP 里：前端设置面板是拿 HELP 的键名决定是否渲染的，
-    # 缺了标签页就整项消失——用户会以为这个功能不存在，或者更糟，
-    # 以为配好了（其实 /api/archive/status 永远返回未配置）。
-    # 安全不是靠「藏起来」，而是靠 public_settings 把值置空、只回 _configured。
-    "qiniu_ak": "七牛云 AccessKey（密钥内容不回显）",
-    "qiniu_sk": "七牛云 SecretKey（密钥内容不回显）",
+    # 这几项目前在前端「设置」里整体隐藏（见 static/app.js 的 HIDDEN_SETTINGS），
+    # 改由环境变量 V2N_QINIU_* 或 data/secrets.json 托管。
+    # 仍保留在 HELP/SETTINGS_GROUPS 里，是为了后端接口结构完整、将来可按需取消隐藏。
+    "qiniu_ak": "七牛云 AccessKey（密钥内容不回显，且设置面板已隐藏该项）",
+    "qiniu_sk": "七牛云 SecretKey（密钥内容不回显，且设置面板已隐藏该项）",
     "qiniu_bucket": "七牛云存储桶名称（KODO Bucket）",
     "qiniu_domain": "下载访问域名，形如 https://cdn.example.com（结尾不要加 /）",
     "qiniu_prefix": "归档文件在桶内的路径前缀，例如 video2note/ 。留空则放在桶根目录下",
-    "qiniu_archive_days": "任务完成超过该天数后，本地源视频可被清理，届时从云端回看。"
-                          "填 0 表示不自动清理（本地永久保留）。"
-                          "★本地源视频在下载完成时就已经异步备份过，"
-                          "所以这里的「清理」只是释放磁盘，不是第一次上传；"
-                          "上传失败的对象绝不会被删除。未配置密钥时本功能完全不生效",
-    "qiniu_backup_on_finish": "下载（或本地文件导入）完成后立即把源视频备份到云端。"
-                              "填 0 则改为等到清理时才上传",
+    "qiniu_archive_days": "本地源视频保留天数：AI 去重完成即备份到七牛云，"
+                          "该任务超过此天数未再活动就删除本地源视频，届时从云端回看。"
+                          "默认 1 天；填 0 表示不自动清理（本地永久保留）。"
+                          "★只有云端 stat 校验大小一致后才删本地，上传失败的对象绝不会被删除；"
+                          "未配置密钥时本功能完全不生效",
+    "qiniu_backup_on_finish": "AI 去重（整理）成功后立即把源视频备份到七牛云。"
+                              "填 1 开（默认）；填 0 则改为等到清理时才上传",
     "qiniu_proxy": "本地视频已清理时的回显方式：0=直接跳转到云端地址（最快，默认）；"
                    "1=由服务端从云端取回再转发给浏览器（服务器出网受限、或空间为私有时选这个）",
 }
@@ -180,11 +357,14 @@ HELP: dict[str, str] = {
 # 每一项: (分组标题, [该组内的配置键...])
 SETTINGS_GROUPS: list[tuple[str, list[str]]] = [
     ("平台登录态", ["cookie_text", "cookie_text_bili", "resolver_curl"]),
-    ("模型与生成", ["asr_language", "llm_max_tokens", "llm_temperature"]),
+    ("模型与生成", ["asr_base_url", "asr_api_key", "asr_model", "asr_language",
+                   "llm_protocol", "llm_base_url", "llm_api_key", "llm_model",
+                   "llm_max_tokens", "llm_temperature"]),
     ("性能", ["first_chunk_seconds", "chunk_seconds", "max_concurrency"]),
     ("媒体归档", ["qiniu_ak", "qiniu_sk", "qiniu_bucket", "qiniu_domain",
                  "qiniu_prefix", "qiniu_archive_days", "qiniu_backup_on_finish",
                  "qiniu_proxy"]),
+    ("访问与门禁", ["pro_free_limit", "pro_gate"]),
 ]
 
 
@@ -513,12 +693,14 @@ def ensure_cookie_file(platform: str = "douyin") -> str:
 def public_settings() -> dict:
     """给前端用的配置。
 
-    敏感项（Token / Cookie）一律返回空字符串——不是打码，是**完全不发**。
-    早前这里返回过 `sk-1***...***abcd` 这样的片段，但「前4 后4」对短密钥几乎等于
-    明文（44位里泄露 8 位），而且浏览器里F12 一开就全在，所以直接切断。
+    回显策略（2026-10 调整）：除 NO_ECHO_KEYS（七牛 AK/SK）外，
+    其余配置——含 ASR/LLM Key、Cookie、解析模板——都**正常回显真实值**，
+    让管理员在设置面板直接看到自己配了什么，不必翻 secrets.json。
 
-    前端要判断「配没配」，用返回的 `_configured`；
-    要改值，去编辑 secrets.json 或设环境变量。
+    安全性依赖两点：
+      1) /api/settings 由后端 is_admin 强校验，普通用户/令牌读不到这份数据；
+      2) 密钥仍只落 secrets.json（0600），不会进 settings.json / git。
+    七牛 AK/SK 是唯一例外：既隐藏（前端不渲染）也不回显，仅存 secrets.json。
     """
     s = load_settings()
     out = dict(s)
@@ -530,7 +712,7 @@ def public_settings() -> dict:
                 from_env[k] = name
                 break
 
-    for k in SECRET_KEYS:
+    for k in NO_ECHO_KEYS:
         out[k] = ""
 
     out["_configured"] = {

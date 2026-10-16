@@ -93,7 +93,10 @@ def object_key(tid: str, name: str, prefix: str = "") -> str:
 
 def public_url(key: str, domain: str) -> str:
     from urllib.parse import quote
-    return f"{domain}/{quote(key)}"
+    d = (domain or "").strip()
+    if d and "://" not in d:
+        d = "https://" + d
+    return f"{d}/{quote(key)}"
 
 
 def _auth(c: dict):
@@ -457,3 +460,64 @@ def resolve_missing(t, name: str) -> str | None:
         if u.startswith("http"):
             return u
     return None
+
+
+def upload_text(text, key, c):
+    from qiniu import put_data
+    data = text.encode("utf-8")
+    token = _auth(c).upload_token(c["bucket"], key, _UPLOAD_TOKEN_TTL)
+    ret, info = put_data(token, key, data)
+    if ret is None or info.status_code != 200:
+        return False, "upload failed HTTP %s" % getattr(info, "status_code", "?")
+    return True, "ok"
+
+
+def upload_note(t, style, text):
+    try:
+        import time as _t
+        c = cfg()
+        able, why = configured(c)
+        if not able:
+            try:
+                t.log("warn", "qiniu not configured, skip note upload: %s" % why)
+            except Exception:
+                pass
+            return None
+        if not text or not text.strip():
+            return None
+        name = "%s.md" % style
+        key = object_key(t.id, name, c["prefix"])
+        ok, msg = upload_text(text, key, c)
+        if not ok:
+            try:
+                t.log("warn", "note upload failed (%s): %s" % (name, msg))
+            except Exception:
+                pass
+            return None
+        size = len(text.encode("utf-8"))
+        remote = stat_size(key, c)
+        if remote != size:
+            try:
+                t.log("warn", "note cloud size mismatch (local %s / remote %s), keep url" % (size, remote))
+            except Exception:
+                pass
+        base = public_url(key, c["domain"])
+        # 私有空间：直链会 401，生成带下载令牌的签名 URL（长期有效）
+        url = _auth(c).private_download_url(base, expires=3600 * 24 * 365 * 10)
+        from . import store
+        t.meta = dict(t.meta or {})
+        notes = dict(t.meta.get("qiniu_notes") or {})
+        notes[style] = {"url": url, "key": key, "size": size, "at": int(_t.time())}
+        t.meta["qiniu_notes"] = notes
+        store.save(t)
+        try:
+            t.log("info", "note uploaded to qiniu: %s" % url)
+        except Exception:
+            pass
+        return url
+    except Exception as e:
+        try:
+            t.log("warn", "note upload exception: %s" % e)
+        except Exception:
+            pass
+        return None

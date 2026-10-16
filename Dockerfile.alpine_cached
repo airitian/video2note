@@ -1,0 +1,55 @@
+# ==============================================================================
+# 离线/受限网络适配版 Dockerfile
+# 背景：目标服务器无法访问 Docker Hub（直连被墙；可达的镜像加速器后端在
+#       Cloudflare/R2，拉镜像层超时）。但服务器已缓存 postgres:16-alpine
+#       （基于 Alpine，无需从 Docker Hub 拉取），因此以它为基础镜像，
+#       在内部用国内可达镜像装 Python/ffmpeg 与 pip 依赖。
+#   - apk 源： dl-cdn.alpinelinux.org -> mirrors.tuna.tsinghua.edu.cn
+#   - pip 源：  pypi.org              -> pypi.tuna.tsinghua.edu.cn
+# 说明：postgres:16-alpine 自带 python3(3.14) 与 apk；本文件在其上装 ffmpeg 等。
+#       抖音解析所需的 Chromium 浏览器未安装（受限网络下暂不装），不影响
+#       本地上传 / B站 解析；需要时再用 alpine 版 chromium + playwright 重建。
+# ==============================================================================
+
+FROM postgres:16-alpine
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn \
+    V2N_DATA_DIR=/data \
+    SERVER_HOST=0.0.0.0 \
+    SERVER_PORT=8765 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+
+# apk 换清华源（只替换主机名，避免重复 /alpine 路径），装 python/ffmpeg/curl/ca
+RUN sed -i 's|https://dl-cdn.alpinelinux.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apk/repositories \
+ && apk update \
+ && apk add --no-cache python3 py3-pip ffmpeg curl ca-certificates tzdata \
+ && python3 -m venv /opt/venv \
+ && /opt/venv/bin/pip install --upgrade pip setuptools wheel
+
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /build
+COPY requirements.txt .
+# 受限网络 + Alpine 3.24 自带 Python 3.14，playwright 暂无 3.14 轮子，且本部署
+# 不装 Chromium 浏览器内核（抖音解析本就不可用），故构建时跳过 playwright。
+# 代码内 playwright 为懒加载，缺失时仅抖音通道优雅降级，不影响启动与其余功能。
+RUN grep -v '^playwright' requirements.txt > /tmp/req.txt \
+ && /opt/venv/bin/pip install -r /tmp/req.txt
+
+WORKDIR /app
+COPY . /app
+
+RUN mkdir -p /data
+
+# 清掉 postgres 镜像自带的 ENTRYPOINT，避免干扰启动
+ENTRYPOINT []
+
+EXPOSE 8765
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8765/api/health >/dev/null || exit 1
+
+CMD ["sh", "-c", "exec /opt/venv/bin/python -u run.py --host \"${SERVER_HOST}\" --port \"${SERVER_PORT}\""]

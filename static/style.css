@@ -37,6 +37,20 @@ code, pre, .mono { font-family: var(--wb-font-mono); }
 .health .bad { color: var(--err); }
 .health .ok { color: var(--text-2); }
 
+/* 门禁提示条 */
+.gate-banner { padding: 8px 24px; font-size: 13px; text-align: center;
+  background: var(--primary-soft); color: var(--primary); border-bottom: 1px solid var(--border); }
+.gate-banner.hidden { display: none; }
+
+/* 管理员令牌管理 */
+.token-admin { border: 1px dashed var(--primary); }
+.token-add { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.token-list { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.token-row { display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; font-size: 13px; }
+.token-row code { font-family: ui-monospace, Menlo, Consolas, monospace; }
+
 /* 三栏布局：左=历史记录，中=主工作区，右=处理日志 */
 .layout { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 16px; align-items: start; max-width: 1600px; margin: 0 auto; padding: 16px 24px 48px; }
 .side { position: sticky; top: 78px; }

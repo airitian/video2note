@@ -26,9 +26,15 @@ dlpanda 提供了一条**已解决该问题的通道**：解析由它完成，
 
 架构取舍
 --------
-**解析**这一步必须走真实浏览器（Playwright）。实测纯 HTTP（curl_cffi
+**解析**这一步必须走真实浏览器。实测纯 HTTP（curl_cffi
 带完整浏览器指纹 + 全套Cookie 含cf_clearance）仍被 Cloudflare 403，
 CF 的 clearance 绑定了浏览器指纹细节，无法用脚本伪造。
+另有一条**直连抖音**通道（_resolve_direct）：不经过任何第三方解析站，
+用浏览器过抖音自己的 JS 挑战，再用 CDP 拦截 aweme/detail 响应拿直链。
+dlpanda.com 托管在 Cloudflare 后面，国内 VPS 常常整体不可达，此时它是唯一活路。
+（驱动用 Selenium + 系统 Chromium。早期版本用 Playwright，但本部署是
+ Alpine + Python 3.14，PyPI 上没有对应 wheel，且 Docker Hub 基础镜像
+ 在国内镜像源上全部拉不下来，故改用 Selenium。）
 
 但**下载**那一步不需要浏览器：返回的地址是抖音官方 CDN
 （``*.zjcdn.com`` / ``*.douyinstatic.com``），带 ``access-control-allow-origin: *``，
@@ -48,7 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+      "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
 
 # Chromium 启动参数。业务解析与健康检查必须用同一份——曾因两处各写一份
 # 而出现反向误报：健康检查少传 --disable-dev-shm-usage，服务器 /dev/shm
@@ -58,7 +64,8 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 #              不可用，必须关掉；普通用户去掉也无妨。
 # --disable-dev-shm-usage：共享内存改用 /tmp，绕开 64MB 上限。
 _LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled",
-                "--no-sandbox", "--disable-dev-shm-usage"]
+                "--no-sandbox", "--disable-dev-shm-usage",
+                "--accept-lang=zh-CN"]
 
 
 def _exe() -> str:
@@ -229,103 +236,462 @@ def _cookies_to_pairs(cookie_str: str) -> list[dict]:
     return out
 
 
-def resolve(url: str, platform: str = "douyin", timeout_ms: int = 45000) -> ParseResult:
-    """用真实浏览器解析，返回媒体直链。
 
-    必须走浏览器的原因见模块 docstring：Cloudflare 的 cf_clearance
-    与浏览器指纹绑定，纯 HTTP 无法伪造。
+def _chromedriver_exe():
+    # 定位 chromedriver。Alpine 的 chromium-chromedriver 包把它放在
+    # /usr/bin/chromedriver（软链到 /usr/lib/chromium/chromedriver）。
+    from shutil import which
+    p = which("chromedriver")
+    if p:
+        return p
+    for c in ("/usr/bin/chromedriver", "/usr/lib/chromium/chromedriver"):
+        if os.path.exists(c):
+            return c
+    return None
 
-    支持用户自定义 curl 模板（设置项「抖音解析请求模板」）：
-    模板里的 _token / t0ken 等动态字段一律用页面实时值替换，
-    只有 url 换成用户提交的链接。
-    """
+
+def _new_driver(timeout_ms: int = 45000):
+    # 起一个无头 Chromium（Selenium 驱动）。
+    # 分工与旧 Playwright 方案一致：浏览器只负责过 Cloudflare 挑战并发起
+    # 同源 POST；下载那一步仍走 curl_cffi，不把视频塞进浏览器。
+    import tempfile
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+
+    binary = _chromium_exe()
+    if not binary:
+        raise DlpandaError("未找到 Chromium 浏览器，执行：apk add chromium")
+    drv = _chromedriver_exe()
+    if not drv:
+        raise DlpandaError("未找到 chromedriver，执行：apk add chromium-chromedriver")
+
+    opts = Options()
+    opts.binary_location = binary
+    for a in _LAUNCH_ARGS:
+        opts.add_argument(a)
+    opts.add_argument("--headless=new")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--lang=zh-CN")
+    opts.add_argument("--window-size=1440,900")
+    # root 下 Chromium 对 user-data-dir 有归属保护，每次给独立临时目录
+    opts.add_argument("--user-data-dir=" + tempfile.mkdtemp(prefix="v2n-chrome-"))
+    opts.add_argument("--user-agent=" + UA)
+    try:
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+    except Exception:
+        pass
+    # performance 日志是 CDP 拦截详情响应的前提，没有它 get_log 拿不到东西
+    try:
+        opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+    except Exception:
+        pass
+
+    # eager：等 DOMContentLoaded 就返回，不等图片/广告等慢资源。
+    # _token 是服务端渲染的隐藏域，DOM 就绪时早已在页面里；
+    # 而 dlpanda 页面挂着第三方统计，load 事件能拖几十秒。
+    opts.page_load_strategy = "eager"
+    driver = webdriver.Chrome(service=Service(drv), options=opts)
+    driver.set_page_load_timeout(max(20, int(timeout_ms / 1000)))
+    driver.set_script_timeout(60)
+    _harden_fingerprint(driver)
+    return driver
+
+
+# 浏览器指纹加固（抖音 webmssdk 风控对抗，2026-10-16 实测有效）。
+#
+# webmssdk 会采集 navigator/screen/WebGL/hardware 一整套环境指纹做评分，
+# headless + Linux + 800x600 + en-US 的组合基本必被拦截：表现为
+# aweme/detail 返回 200 但 content-length:0，页面一直「视频数据加载中」。
+# 下面这套伪装让它看起来就是一台普通的中文 Windows 台式机。
+#
+# 注意两个顺序问题：
+#   1) addScriptToEvaluateOnNewDocument 必须在导航前调用，页面每个新文档
+#      （含 iframe）加载前都会跑，navigator 伪装才赶得上 webmssdk 采集；
+#   2) setDeviceMetricsOverride 才能改 screen.width/height——Chromium 的
+#      --window-size 只改窗口可视区，screen.* 仍是 headless 默认 800x600，
+#      而风控读的正是 screen.*。
+_HARDEN_JS = """
+(function(){
+  try { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); } catch(e) {}
+  try { Object.defineProperty(navigator, 'platform', {get: () => 'Win32'}); } catch(e) {}
+  try {
+    Object.defineProperty(navigator, 'language', {get: () => 'zh-CN'});
+    Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh']});
+  } catch(e) {}
+  try { Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8}); } catch(e) {}
+  try { Object.defineProperty(navigator, 'deviceMemory', {get: () => 8}); } catch(e) {}
+  try {
+    var orig = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(p) {
+      if (p === 37445) return 'Google Inc. (Intel)';
+      if (p === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics Direct3D11 vs_5_0 ps_5_0)';
+      return orig.call(this, p);
+    };
+  } catch(e) {}
+  try {
+    if (window.WebGL2RenderingContext) {
+      var o2 = WebGL2RenderingContext.prototype.getParameter;
+      WebGL2RenderingContext.prototype.getParameter = function(p) {
+        if (p === 37445) return 'Google Inc. (Intel)';
+        if (p === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics Direct3D11 vs_5_0 ps_5_0)';
+        return o2.call(this, p);
+      };
+    }
+  } catch(e) {}
+})();
+"""
+
+
+def _harden_fingerprint(driver) -> None:
+    # 两项都做：JS 层改 navigator/WebGL，CDP 层改 screen 分辨率。
+    # 任何一项失败都不阻塞解析（只是风控分低一点）。
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument",
+                               {"source": _HARDEN_JS})
+    except Exception:
+        pass
+    try:
+        driver.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", {
+            "width": 1920, "height": 1080, "deviceScaleFactor": 1,
+            "mobile": False, "screenWidth": 1920, "screenHeight": 1080,
+            "positionX": 0, "positionY": 0})
+    except Exception:
+        pass
+
+
+
+# ---- 通道主机可达性探测（带缓存，避免每次解析都现测）----
+# 为什么需要：dlpanda.com 在 Cloudflare 后面，国内不少 VPS 到不了
+# （TCP 通但 TLS 挂死，或直接超时）。不探测就会在一条死路上耗掉
+# 几十秒才失败，白白拖慢任务。探测结果缓存 5 分钟，与浏览器探测同量级。
+_probe_cache: dict = {}
+_PROBE_TTL = 300.0
+
+
+def _https_ok(u: str, timeout: float = 4.0) -> bool:
+    # 用 curl_cffi 做一次真实 HTTPS 探测：拿到任何 HTTP 状态码都算可达，
+    # 只有连接/TLS 超时才判不可达。Cloudflare 被墙时表现正是后者。
+    import time as _t
+    key = u
+    now = _t.monotonic()
+    c = _probe_cache.get(key)
+    if c and now - c[0] < _PROBE_TTL:
+        return c[1]
+    ok = False
+    try:
+        from curl_cffi import requests as cr
+        r = cr.get(u, headers={"User-Agent": UA}, impersonate="chrome136",
+                   timeout=(timeout, timeout), verify=False)
+        ok = r.status_code < 500
+    except Exception:
+        ok = False
+    _probe_cache[key] = (now, ok)
+    return ok
+
+
+def _dy_reachable() -> bool:
+    return _https_ok("https://www.douyin.com/")
+
+
+def _dlpanda_reachable() -> bool:
+    return _https_ok("https://dlpanda.com/zh-CN/douyin")
+
+
+def _resolve_direct(url: str, timeout_ms: int = 60000,
+                    attempts: int = 3) -> ParseResult:
+    # 直连抖音：真实浏览器过 JS 挑战落地视频页，CDP 拦截详情接口拿直链。
+    # 只依赖国内可达主机（www.douyin.com / *.douyinvod.com）。
+    #
+    # 为什么要重试：抖音风控是概率性的——同一浏览器同一链接，有时直接
+    # 放行，有时 aweme/detail 返回 200 空 body（页面一直「视频数据加载中」，
+    # 实测指纹不伪装时稳定复现）。换一个全新浏览器会话（新 user-data-dir、
+    # 新 cookie、新的指纹随机量）命中放行窗口的几率明显更高。
+    last_err = None
+    for i in range(max(1, attempts)):
+        d = _new_driver(timeout_ms)
+        seen = set()
+        try:
+            try:
+                d.execute_cdp_cmd("Network.enable", {})
+            except Exception:
+                pass
+            try:
+                d.get(url)
+            except TimeoutException:
+                pass          # eager 下重定向可能还没跑完，靠下面轮询兜底
+            # 分享链接会 302 到 /video/<aweme_id>；轮询等落地
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if "/video/" in (d.current_url or ""):
+                    break
+                time.sleep(1.0)
+            # 落地后 SPA 才发详情 XHR。轮询等真数据，不要只睡几秒——
+            # 详情接口回来的早晚不稳定（实测 3~13s 都出现过）。
+            body = None
+            poll_deadline = time.time() + 25
+            while time.time() < poll_deadline:
+                body = _grab_detail_json(d, seen)
+                if body:
+                    return _parse_detail(body)
+                time.sleep(1.0)
+            last_err = DlpandaError("未能捕获视频详情数据（页面结构可能已变更或被风控）")
+        except DlpandaError:
+            raise
+        except Exception as e:
+            last_err = DlpandaError("直连解析失败：%s" % str(e).splitlines()[0][:120])
+        finally:
+            try:
+                d.quit()
+            except Exception:
+                pass
+        # 换会话重试；间隔几秒让风控窗口轮转
+        if i + 1 < max(1, attempts):
+            time.sleep(3.0)
+    raise last_err or DlpandaError("直连解析失败")
+
+
+def _grab_detail_json(d, seen=None) -> str | None:
+    # 从 performance 日志里找 aweme/detail 的响应体。
+    # 必须显式开 goog:loggingPrefs=performance，否则 get_log 拿不到东西。
+    # seen：已取过体的 requestId 集合（轮询时避免反复 getResponseBody）。
+    import json as _json
+    if seen is None:
+        seen = set()
+    try:
+        logs = d.get_log("performance")
+    except Exception:
+        return None
+    for e in logs:
+        try:
+            msg = _json.loads(e["message"])["message"]
+        except Exception:
+            continue
+        if msg.get("method") != "Network.responseReceived":
+            continue
+        p = msg.get("params", {})
+        if "aweme/v1/web/aweme/detail" not in p.get("response", {}).get("url", ""):
+            continue
+        rid = p.get("requestId")
+        if not rid or rid in seen:
+            continue
+        seen.add(rid)
+        try:
+            r = d.execute_cdp_cmd("Network.getResponseBody", {"requestId": rid})
+        except Exception:
+            continue
+        b = r.get("body") or ""
+        if r.get("base64Encoded"):
+            import base64
+            try:
+                b = base64.b64decode(b).decode("utf-8", "replace")
+            except Exception:
+                continue
+        if "aweme_detail" in b:
+            return b
+    return None
+
+
+def _parse_detail(body: str) -> ParseResult:
+    # 详情 JSON -> ParseResult。字段路径来自实测响应：
+    # aweme_detail.video.play_addr.url_list / bit_rate[].play_addr
+    # aweme_detail.music.play_url.url_list（图文作品只有音频）
+    import json as _json
+    try:
+        data = _json.loads(body)
+    except Exception as e:
+        raise DlpandaError("视频详情数据解析失败：%s" % e)
+    detail = data.get("aweme_detail") or {}
+    if not detail:
+        raise DlpandaError("详情响应中没有 aweme_detail（可能需登录或已删除）")
+
+    def _urls(addr):
+        return [u for u in ((addr or {}).get("url_list") or [])
+                if isinstance(u, str) and u.startswith("http")]
+
+    video = detail.get("video") or {}
+    video_url = None
+    cands = _urls(video.get("play_addr"))
+    if not cands:
+        # play_addr 缺失时按清晰度档位兜底
+        for br in video.get("bit_rate") or []:
+            cands = _urls((br or {}).get("play_addr"))
+            if cands:
+                break
+    if cands:
+        video_url = cands[0]
+
+    audio_url = None
+    au = _urls((detail.get("music") or {}).get("play_url"))
+    if au:
+        audio_url = au[0]
+
+    cover_url = None
+    for c in (video.get("cover") or {}, video.get("origin_cover") or {}):
+        cu = _urls(c)
+        if cu:
+            cover_url = cu[0]
+            break
+
+    if not video_url and not audio_url:
+        raise DlpandaError("详情中没有可播放的媒体地址（可能需登录或已删除）")
+
+    return ParseResult(
+        title=(detail.get("desc") or "").strip(),
+        video_url=video_url,
+        audio_url=audio_url,
+        cover_url=cover_url,
+        author=((detail.get("author") or {}).get("nickname") or "").strip(),
+        aweme_id=str(detail.get("aweme_id") or ""),
+        extra={"state": "success", "channel": "direct"},
+    )
+
+
+def resolve(url: str, platform: str = "douyin", timeout_ms: int = 45000,
+            prefer: str | None = None) -> ParseResult:
+    # 解析分享链接，返回媒体直链。
+    #
+    # 通道优先级（prefer 可强制指定 "direct" / "dlpanda"）：
+    #   1. direct  浏览器直连抖音：过 JS 挑战 + CDP 拦截详情接口
+    #   2. dlpanda dlpanda.com 解析接口
+    # 按「主机可达性」自动排序：dlpanda.com 在 Cloudflare 后面，
+    # 国内 VPS 常常到得了抖音却到不了 dlpanda，此时直连才是唯一活路。
+    if platform != "douyin":
+        raise DlpandaError(f"dlpanda 暂不支持 {platform}")
+
+    order = [prefer] if prefer in ("direct", "dlpanda") else []
+    if not order:
+        dy_ok = _dy_reachable()
+        dl_ok = _dlpanda_reachable()
+        if dy_ok and dl_ok:
+            order = ["direct", "dlpanda"]
+        elif dy_ok:
+            order = ["direct"]
+        elif dl_ok:
+            order = ["dlpanda"]
+        else:
+            raise DlpandaError("解析通道均不可达：本机既连不上抖音站，"
+                               "也连不上 dlpanda 解析站")
+
+    last = None
+    for ch in order:
+        try:
+            if ch == "direct":
+                return _resolve_direct(url, timeout_ms)
+            return _resolve_dlpanda(url, timeout_ms)
+        except Exception as e:
+            last = e
+            continue
+    raise last if last else DlpandaError("解析失败")
+
+
+def _resolve_dlpanda(url: str, platform: str = "douyin",
+                     timeout_ms: int = 45000) -> ParseResult:
+    # dlpanda 解析接口通道（原 resolve 实现）。
+    #
+    # 必须走浏览器的原因见模块 docstring：Cloudflare 的 cf_clearance
+    # 与浏览器指纹绑定，纯 HTTP 无法伪造。
+    #
+    # 支持用户自定义 curl 模板（设置项「抖音解析请求模板」）：
+    # 模板里的 _token / t0ken 等动态字段一律用页面实时值替换，
+    # 只有 url 换成用户提交的链接。
     path = PLATFORM_PATH.get(platform)
     if not path:
         raise DlpandaError(f"dlpanda 暂不支持 {platform}")
 
     tpl = _load_template() if platform == "douyin" else None
 
+    from selenium.common.exceptions import TimeoutException, WebDriverException
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    driver = _new_driver(timeout_ms)
     try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as e:
-        raise DlpandaError("未安装 playwright，无法使用 dlpanda 解析通道") from e
-
-    page_html = ""
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=_LAUNCH_ARGS)
-        try:
-            ctx = browser.new_context(user_agent=UA, locale="zh-CN",
-                                      viewport={"width": 1440, "height": 900})
-            # 用户模板里的 Cookie 注入浏览器上下文 —— 这是让请求带上
-            # cf_clearance 的唯一有效方式（脚本裸发一律被 403）
-            if tpl and tpl.get("cookies"):
-                try:
-                    ctx.add_cookies(_cookies_to_pairs(tpl["cookies"]))
-                except Exception:
-                    pass          # 域名不匹配等，忽略：模板 Cookie 未必完整
-
-            pg = ctx.new_page()
-            # CF 挑战需要真实浏览器执行 JS 才能放行
-            pg.goto(BASE + path, wait_until="domcontentloaded",
-                    timeout=timeout_ms)
+        # 模板 Cookie 必须先注入再加载解析页：selenium 的 add_cookie
+        # 要求当前已在该域名下，所以先开一个同域页面。
+        if tpl and tpl.get("cookies"):
             try:
-                pg.wait_for_function(
-                    "() => !!document.querySelector('[name=\"_token\"]')",
-                    timeout=8000,
-                )
+                driver.get(BASE + "/")
+                for ck in _cookies_to_pairs(tpl["cookies"]):
+                    try:
+                        driver.add_cookie(ck)
+                    except Exception:
+                        pass
             except Exception:
-                pass                      # 页面结构变了，后面的取值会给出明确错误
+                pass
 
-            if "Attention Required" in (pg.title() or ""):
-                raise DlpandaError("被Cloudflare 拦截（站点要求人工验证）")
+        try:
+            driver.get(BASE + path)
+        except TimeoutException:
+            raise DlpandaError("解析页面加载超时（站点可能被风控或网络不通）")
 
-            # 动态字段一律取页面实时值，不信模板里的旧值
-            live = pg.evaluate(
-                """() => {
-                    const get = (s) => document.querySelector(s)?.value || '';
-                    return {_token: get('[name="_token"]'),
-                            t0ken: get('#token'),
-                            csrf: get('[name="csrf-token"]')};
-                }""")
-            if not live.get("_token"):
-                raise DlpandaError("未能取得会话令牌（站点结构可能已变更）")
+        # 等会话令牌出现；等不到也不要立刻失败，下面会给出明确错误
+        try:
+            WebDriverWait(driver, 25).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, '[name="_token"]')))
+        except Exception:
+            pass
 
-            form = dict((tpl or {}).get("form") or {})
-            for key in curl_dyn_keys():
-                if key in form and live.get(_dyn_source(key)):
-                    form[key] = live[_dyn_source(key)]
-            if not form.get("_token"):
-                form["_token"] = live["_token"]
-            if not form.get("t0ken"):
-                form["t0ken"] = live.get("t0ken", "")
-            # url 永远用用户提交的那条
-            form["url"] = url
+        title = driver.title or ""
+        if "Attention Required" in title or "Just a moment" in title:
+            raise DlpandaError("被 Cloudflare 拦截（站点要求人工验证）")
 
-            post_path = (tpl or {}).get("path", path)
-            page_html = pg.evaluate(
-                """async (a) => {
-                    const fd = new FormData();
-                    for (const [k, v] of Object.entries(a.form)) {
-                        if (v !== '' && v != null) fd.append(k, v);
-                    }
-                    const r = await fetch(a.path, {
-                        method: 'POST',
-                        body: fd,
-                        headers: {
-                            'Accept': 'text/html',
-                            'X-Requested-With': 'XMLHttpRequest'
-                        },
-                        credentials: 'same-origin'
-                    });
-                    return await r.text();
-                }""",
-                {"form": form, "path": post_path},
-            )
-        finally:
-            browser.close()
+        # 动态字段一律取页面实时值，不信模板里的旧值
+        live = driver.execute_script(
+            "const g = (s) => (document.querySelector(s) || {}).value || '';"
+            "return {_token: g('[name=\"_token\"]'),"
+            "        t0ken: g('#token'),"
+            "        csrf: g('[name=\"csrf-token\"]')};")
+        if not live.get("_token"):
+            raise DlpandaError("未能取得会话令牌（站点结构可能已变更）")
+
+        form = dict((tpl or {}).get("form") or {})
+        for key in curl_dyn_keys():
+            if key in form and live.get(_dyn_source(key)):
+                form[key] = live[_dyn_source(key)]
+        if not form.get("_token"):
+            form["_token"] = live["_token"]
+        if not form.get("t0ken"):
+            form["t0ken"] = live.get("t0ken", "")
+        # url 永远用用户提交的那条
+        form["url"] = url
+
+        post_path = (tpl or {}).get("path", path)
+        # 在浏览器上下文里同源 POST，带上 CF 放行后的 Cookie
+        page_html = driver.execute_async_script(
+            "const a = arguments[0];"
+            "const done = arguments[arguments.length - 1];"
+            "const fd = new FormData();"
+            "for (const [k, v] of Object.entries(a.form)) {"
+            "  if (v !== '' && v != null) fd.append(k, v);"
+            "}"
+            "fetch(a.path, {method: 'POST', body: fd,"
+            "  headers: {'Accept': 'text/html', 'X-Requested-With': 'XMLHttpRequest'},"
+            "  credentials: 'same-origin'})"
+            "  .then(r => r.text())"
+            "  .then(t => done(t))"
+            "  .catch(e => done('FETCH_ERR:' + (e && e.message ? e.message : e)));",
+            {"form": form, "path": post_path})
+    except DlpandaError:
+        raise
+    except TimeoutException:
+        raise DlpandaError("解析请求在浏览器内超时")
+    except WebDriverException as e:
+        raise DlpandaError("浏览器驱动出错：%s" % str(e).splitlines()[0][:120])
+    except Exception as e:
+        raise DlpandaError("解析失败：%s" % e)
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
     if not page_html:
         raise DlpandaError("解析请求未返回内容")
+    if isinstance(page_html, str) and page_html.startswith("FETCH_ERR:"):
+        raise DlpandaError("解析请求失败：%s" % page_html[10:130])
     return parse_html(page_html)
 
 
@@ -666,77 +1032,53 @@ def _ext_for(url: str) -> str:
     return ".mp4"
 
 
-def _chromium_exe() -> Path | None:
-    """定位 Chromium 内核文件（只查文件系统，不启动浏览器）。
-
-    用来区分两类完全不同的故障：
-      · 内核根本没装  -> 路径不存在
-      · 内核装了但一启动就崩（/dev/shm 太小、版本不匹配、缺系统库）
-    路径存在性检查是纯 stat，微秒级；「能不能起来」才需要真启动。
-    """
-    # Playwright 支持用环境变量改安装位置，优先按它的规则找
+def _chromium_exe():
+    # 定位 Chromium 可执行文件（只查文件系统，不启动浏览器）。
+    # Alpine 的 chromium 包装在 /usr/lib/chromium/chrome；
+    # 也保留 playwright 的安装位置，便于将来换回该部署形态。
+    for c in ("/usr/lib/chromium/chrome", "/usr/bin/chromium",
+              "/usr/bin/chromium-browser", "/usr/bin/google-chrome",
+              "/usr/bin/google-chrome-stable"):
+        if os.path.exists(c):
+            return c
     root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or os.path.expanduser(
         "~/.cache/ms-playwright")
-    if not os.path.isabs(root):
-        root = os.path.join(os.getcwd(), root)
     try:
         entries = sorted(Path(root).glob("chromium*"))
     except OSError:
         return None
     for d in entries:
-        for rel in ("chrome-linux/chrome",
-                    "chrome-linux64/chrome",
-                    "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
-                    "chrome-win/chrome.exe",
-                    "chrome-win64/chrome.exe"):
+        for rel in ("chrome-linux/chrome", "chrome-linux64/chrome"):
             p = d / rel
             if p.exists():
-                return p
+                return str(p)
     return None
 
 
 def _browser_ready_uncached() -> tuple[bool, str]:
-    """真启动一次 Chromium 确认内核可用。慢，只在缓存失效时调用。"""
+    # 真启动一次 Chromium 确认可用。慢，只在缓存失效时调用。
     try:
-        from playwright.sync_api import sync_playwright
+        import selenium  # noqa: F401
     except ImportError:
-        return False, f"未安装 playwright 库（{_exe()} -m pip install playwright）"
-
-    # 先用文件存在性做一次便宜的判断：内核压根没装时没必要启动，
-    # 直接把「Executable doesn't exist」翻译成可执行的修复命令。
-    if _chromium_exe() is None:
-        return False, ("未找到 Chromium 内核，执行："
-                       f"{_exe()} -m playwright install chromium"
-                       "（内核与 Python 包是两套独立的东西，"
-                       "必须装到跑服务的这个解释器里）")
-
+        return False, "未安装 selenium，执行：/opt/venv/bin/pip install selenium"
+    if not _chromedriver_exe():
+        return False, "未找到 chromedriver，执行：apk add chromium-chromedriver"
+    if not _chromium_exe():
+        return False, "未找到 Chromium 内核，执行：apk add chromium"
     try:
-        # 显式给启动设上限：Playwright 默认等 30 秒。内核损坏时进程
-        # 可能既不报错也不退出，只能干等——健康检查绝不能被它拖住，
-        # 超时按失败处理即可（下面的异常分支会给出修复命令）。
-        with sync_playwright() as p:
-            b = p.chromium.launch(headless=True, args=_LAUNCH_ARGS, timeout=8000)
-            b.close()
+        d = _new_driver(timeout_ms=15000)
+        try:
+            d.get("about:blank")
+        finally:
+            try:
+                d.quit()
+            except Exception:
+                pass
         return True, ""
     except Exception as e:
-        first = str(e).strip().splitlines()[0]
-        if "Executable doesn't exist" in first or "playwright install" in first:
-            # 不能写死 "python"：容器里通常只有 python3，写死等于
-            # 给出一条必然 command not found 的建议。用当前解释器，
-            # 确保命令指向的正是跑服务的那个环境。
-            return False, ("已装 playwright 库但缺 Chromium 内核，执行："
-                           f"{_exe()} -m playwright install chromium"
-                           "（内核与 Python 包是两套独立的东西，"
-                           "必须装到跑服务的这个解释器里）")
-        # 这句含糊的报错实际常见于两类问题，不分类用户就只能瞎试：
-        # 1) 内核与playwright 库版本对不上；2) 系统库缺失
-        if "has been closed" in first or "Target closed" in first:
-            return False, ("Chromium 内核已装但启动即崩溃（" + first + "）。"
-                           f"多为两类原因：①内核与 playwright 库版本不匹配，"
-                           f"执行 {_exe()} -m playwright install --force chromium；"
-                           f"②系统库缺失，执行 "
-                           f"{_exe()} -m playwright install --with-deps chromium")
-        return False, f"Chromium 启动失败：{first}"
+        msg = str(e).strip() or type(e).__name__
+        first = msg.splitlines()[0]
+        return False, "Chromium 启动失败：%s" % first[:160]
 
 
 # 探测结果缓存：Chromium 内核装没装、能不能起来，在进程生命周期内
@@ -781,13 +1123,15 @@ def browser_ready(max_age: float | None = None) -> tuple[bool, str]:
 
 
 def available() -> bool:
-    """运行环境是否具备该通道的依赖。"""
+    # 运行环境是否具备该通道的依赖。
     try:
-        import playwright  # noqa: F401
+        import selenium  # noqa: F401
     except ImportError:
         return False
     try:
         from curl_cffi import requests  # noqa: F401
     except ImportError:
+        return False
+    if not _chromedriver_exe() or not _chromium_exe():
         return False
     return True

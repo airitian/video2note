@@ -160,11 +160,8 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
     t.log("info", f"获取媒体：{meta['title']}（{int(meta.get('duration') or 0)} 秒）")
     store.save(t)
 
-    # 媒体刚落盘，异步复制到对象存储。此刻本地文件是完整的，
-    # 后续无论转写成败、磁盘何时清理，云端这一份都已经有了。
-    # 必须在已经开始转写之前踢出去（而不是等流程结束）：
-    # 用户在长视频上可能中途取消或失败，等不到最后才有备份。
-    _schedule_backup(t)
+    # 注：源视频的七牛云备份已改为「AI 去重（整理）成功后」触发，
+    # 见 _polish_body 末尾的 _schedule_backup(t)，不再在媒体落盘时备份。
 
     _check_cancel(t)
     if not src:
@@ -352,6 +349,12 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
     t.error = ""          # 清掉上一轮的失败信息，避免重试成功后界面仍显示旧错误
     t.message = "转写完成，可点击「AI 整理文字」生成成稿"
     store.save(t)
+    # 免费次数计数：每次成功转写 +1（失败不计数）。写入失败不影响主流程。
+    try:
+        from .config import record_pro_use
+        record_pro_use()
+    except Exception:
+        pass
 
 
 # ============================ AI 整理幂等性 ============================
@@ -443,6 +446,14 @@ def _polish_body(t: store.Task, style: str, emit: EmitFn = None, force: bool = F
         _apply_variant(t, style)
         _sync_variant_meta(t)
         _mark_idempotent_hit(t, reason)
+        # 命中缓存也算「AI 去重已完成」：补一次备份（幂等，云端已有则跳过），
+        # 避免早期漏备份的任务一直卡在「待同步」。
+        _schedule_backup(t)
+        try:
+            from . import qiniu_archive as QA
+            QA.upload_note(t, style, (t.variants or {}).get(style, {}).get("note") or t.note or "")
+        except Exception:
+            pass
         return
 
     t.options["style"] = style
@@ -479,6 +490,18 @@ def _polish_body(t: store.Task, style: str, emit: EmitFn = None, force: bool = F
     t.error = ""
     t.message = "完成"
     store.save(t)
+
+    # ★AI 去重（整理）成功：此刻把源视频备份到七牛云。
+    # 这是云端备份的唯一自动触发点——下载/转写阶段都不传，
+    # 只有整理出成稿后才上传。上传成功后，本地这份再保留
+    # qiniu_archive_days 天，之后由归档清理任务删除（删前会回查云端大小）。
+    _schedule_backup(t)
+
+    try:
+        from . import qiniu_archive as QA
+        QA.upload_note(t, style, text)
+    except Exception:
+        pass
 
 
 # ============================ 对外接口 ============================
@@ -687,8 +710,8 @@ def _meta_from_file(src: Path, workdir: Path) -> dict:
 
 
 def _schedule_backup(t: store.Task) -> None:
-    """落盘后触发云端备份。整个函数不允许抛异常——备份是加分项，
-    它的失败绝不能影响正在进行的转写。"""
+    """AI 去重（整理）成功后触发云端备份。整个函数不允许抛异常——
+    备份是加分项，它的失败绝不能影响任务。由 qiniu_backup_on_finish 开关控制。"""
     try:
         if (load_settings().get("qiniu_backup_on_finish") or "1").strip() == "0":
             return

@@ -168,6 +168,61 @@
   // 所以只需要在第一次 401 时引导用户输入一次即可。
   let authToken = "";
   let authResolve = null;
+  // 鉴权/门禁状态：role=admin|user|none；开放配置模式（未设管理员令牌）下 admin_configured=false
+  let authState = { role: "none", admin_configured: false,
+                    gate_active: false, free_remaining: 0, pro_used: 0, pro_limit: 0 };
+
+  async function refreshAuthState() {
+    try {
+      const s = await fetch("/api/auth/state").then((r) => r.json());
+      authState = Object.assign(authState, s);
+    } catch (e) {}
+    updateAuthUI();
+  }
+
+  function updateAuthUI() {
+    // 设置按钮：管理员可见；开放配置模式（未设管理员令牌）也可见；普通 token 隐藏（后端同样拒绝）
+    const showSettings = authState.role === "admin" || !authState.admin_configured;
+    const btn = $("#btn-settings");
+    if (btn) btn.classList.toggle("hidden", !showSettings);
+    // 登录/登出入口：未登录 -> "🔑 登录"（点击主动弹出令牌框）；
+    // 已登录 -> 显示角色，点击退出。没有这个入口时，未登录用户只能等
+    // 某次请求被 401/402 打回来才看到输入框，很容易以为"没有地方输密钥"。
+    const authBtn = $("#btn-auth");
+    if (authBtn) {
+      if (authState.role === "none") {
+        authBtn.textContent = "🔑 登录";
+        authBtn.classList.remove("hidden");
+        authBtn.onclick = () => askToken();
+      } else {
+        authBtn.textContent = authState.role === "admin" ? "🔓 管理员" : "👤 已登录";
+        authBtn.classList.remove("hidden");
+        authBtn.onclick = async () => {
+          if (!confirm("退出当前令牌？（退出后免费次数仍照常计算）")) return;
+          try {
+            await fetch("/api/auth/logout", { method: "POST" });
+          } catch (e) {}
+          authToken = "";
+          await refreshAuthState();
+          toast("已退出登录");
+        };
+      }
+    }
+    // 门禁横幅
+    const banner = $("#gate-banner");
+    if (banner) {
+      if (authState.gate_active) {
+        banner.textContent = "免费次数已用完，继续使用请输入访问令牌。";
+        banner.classList.remove("hidden");
+      } else if (authState.pro_limit && authState.free_remaining > 0) {
+        banner.textContent = "免费额度剩余 " + authState.free_remaining
+          + " 次（成功转写），用完需令牌";
+        banner.classList.remove("hidden");
+      } else {
+        banner.classList.add("hidden");
+      }
+    }
+  }
 
   function askToken() {
     return new Promise((resolve) => {
@@ -195,7 +250,7 @@
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: tok }),
       });
-      if (r.ok) { authToken = tok; settleAuth(true); return; }
+      if (r.ok) { authToken = tok; settleAuth(true); refreshAuthState(); return; }
       $("#auth-err").textContent = "令牌不正确，请重试";
     } catch (e) {
       $("#auth-err").textContent = "网络错误，请重试";
@@ -211,8 +266,9 @@
       return fetch(path, Object.assign({}, opts, { headers }));
     };
     let r = await call();
-    // 401 = 需要令牌。引导一次，成功后重试同一个请求，用户无感知。
-    if (r.status === 401) {
+    // 401 = 需要令牌（含管理员）；402 = 免费次数用完需令牌。
+    // 引导输入一次，成功后重试同一个请求，用户无感知。
+    if (r.status === 401 || r.status === 402) {
       const okd = await askToken();
       if (okd) r = await call();
     }
@@ -868,29 +924,31 @@
   }
 
   // 设置面板不展示的配置项。
-  // 这些是部署期参数（接口地址、协议、Token、模型名）或与本项目无关的本地环境项，
-  // 日常使用改不动也不需要改，暴露出来只会让设置面板变得冗长、容易误填。
-  // 注意：只是前端不渲染，后端 DEFAULTS 与接口照常支持，
-  // 需要改时仍可编辑 data/secrets.json 或用 V2N_* 环境变量。
+  // 模型相关（asr/llm 的接口地址、Token、模型名）已放开，由「模型与生成」分组呈现并回显；
+  // 七牛云（媒体归档）整组按需求隐藏，改由环境变量 V2N_QINIU_* / secrets.json 托管；
+  // 其余隐藏项与本项目无关的本地环境有关（浏览器读 Cookie / Cookie 文件 / 代理 / ffmpeg 路径）。
+  // 注意：只是前端不渲染，后端 DEFAULTS 与接口照常支持。
   const HIDDEN_SETTINGS = [
-    "asr_base_url", "asr_api_key", "asr_model",
-    "llm_protocol", "llm_base_url", "llm_api_key", "llm_model",
     "cookie_browser", "cookie_file",
     "proxy", "ffmpeg_path",
+    // 七牛云整组隐藏（AK/SK/Bucket/域名/前缀/保留天数/备份开关/回显方式）
+    "qiniu_ak", "qiniu_sk", "qiniu_bucket", "qiniu_domain",
+    "qiniu_prefix", "qiniu_archive_days", "qiniu_backup_on_finish",
+    "qiniu_proxy",
   ];
 
-  // 敏感项：后端只回「有没有配」，绝不回内容。
-  // 输入框因此始终为空，placeholder 提示当前状态；
-  // 留空表示不改（不是清空），要清空得点旁边的清除按钮。
-  const SECRET_UI = {
-    cookie_text: "cookie_douyin",
-    cookie_text_bili: "cookie_bilibili",
-    resolver_curl: "resolver_curl",
-    // 七牛密钥同属敏感项：不进 HELP 的话整项压根不渲染（用户会以为没这功能），
-    // 进 HELP 但不列进这里的话会渲染成普通明文输入框（看着像能改、实则填了不生效）。
-    qiniu_ak: "qiniu_ak",
-    qiniu_sk: "qiniu_sk",
-  };
+  // 「内容需回显、但后端仍按密钥存储」的项：设置面板会显示已保存的真实值，
+  // 但因为它们落在 secrets.json，清空输入框时必须走 clear 列表才能真正清除
+  // （直接提交空值会被后端当作「未修改」而保留原值）。
+  // 其余配置都是普通明文项，回显 + 改动即提交，清空即写入空值。
+  const ECHO_SECRET = [
+    "asr_api_key", "llm_api_key",
+    "cookie_text", "cookie_text_bili", "resolver_curl",
+  ];
+
+  // 仍按「不回显」渲染的敏感项。七牛 AK/SK 已整体隐藏，故这里为空；
+  // 保留结构是为了将来若取消隐藏，可直接把键加回来。
+  const SECRET_UI = {};
 
   async function openSettings() {
     // ★每次打开都重新拉，不能只依赖页面加载时那份缓存。
@@ -914,10 +972,10 @@
     const PH = {
       cookie_text: "【抖音】F12 → Network → 点任意请求 → Request Headers → 复制整段 Cookie"
         + "（形如 a=1; b=2）粘到这里，程序自动转 cookies.txt。也接受 Netscape 格式全文。"
-        + "（出于安全考虑，已保存的 Cookie 不会回显；留空即保持不变）",
+        + "（已保存的内容会回显；清空并保存即清除）",
       cookie_text_bili: "【B站】在 B站登录后按同样方式复制整段 Cookie 粘到这里。"
         + "务必包含登录态字段（登录会话凭证），否则会返回 412。"
-        + "（出于安全考虑，已保存的 Cookie 不会回显；留空即保持不变）",
+        + "（已保存的内容会回显；清空并保存即清除）",
       cookie_browser: "只填浏览器名，不要粘贴 Cookie 内容。chrome / edge / firefox / brave。"
         + "（容器/云端环境没有浏览器，优先用上面的 Cookie 文本框）",
       cookie_file: "本机已有的 Netscape cookies.txt 绝对路径，例如 D:\\cookies.txt（一般用不到）。",
@@ -978,6 +1036,8 @@ if (rest.length) {
     if (!settingsLoadErr) blocks.unshift(selfCheck(help, blocks.join("")));
     $("#settings-form").innerHTML = blocks.join("");
     $("#settings-modal").classList.remove("hidden");
+    // 管理员才渲染令牌管理区块（普通 token 看不到；后端也会拒绝）
+    if (authState.role === "admin") renderTokenAdmin();
     // 打开即定位到「平台登录态」：用户十有八九是来改 Cookie 或 curl 模板的
     const first = $("#settings-form .sgroup");
     if (first) first.scrollIntoView({ block: "start" });
@@ -1102,19 +1162,26 @@ if (rest.length) {
 
   async function saveSettings() {
     const values = {};
+    const clear = [];
     $("#settings-form").querySelectorAll("input, textarea").forEach((inp) => {
       const k = inp.dataset.key;
-      // 敏感项：只有真正填了新值才提交；留空 = 保持原值不变
+      if (!k) return;
+      // 仍按「不回显」渲染的敏感项（当前 SECRET_UI 为空）：只有填了新值才提交
       if (Object.prototype.hasOwnProperty.call(SECRET_UI, k)) {
         if (inp.value.trim()) values[k] = inp.value;
         return;
       }
       const orig = String((settingsCache.values || {})[k] !== undefined ? settingsCache.values[k] : "");
-      if (inp.value === orig) return;
+      if (inp.value === orig) return;              // 未改动，跳过
+      // 回显型密钥（ASR/LLM Key、Cookie、解析模板）：清空输入框 = 清除。
+      // 必须走后端 clear 列表——直接提交空值会被 save_settings 当作「未修改」而保留原值。
+      if (ECHO_SECRET.indexOf(k) >= 0 && !inp.value) { clear.push(k); return; }
       values[k] = inp.value;
     });
+    const payload = { values: values };
+    if (clear.length) payload.clear = clear;
     try {
-      const r = await api("/api/settings", { method: "POST", body: JSON.stringify({ values: values }) });
+      const r = await api("/api/settings", { method: "POST", body: JSON.stringify(payload) });
       settingsCache = r;
       $("#settings-modal").classList.add("hidden");
       const f = (r && r.cookie_files) || {};
@@ -1123,6 +1190,71 @@ if (rest.length) {
     } catch (e) {
       toast(e.message, true);
     }
+  }
+
+  // 管理员令牌管理区块（仅 role===admin 时由 openSettings 注入）
+  async function renderTokenAdmin() {
+    const host = document.createElement("div");
+    host.className = "sgroup token-admin";
+    host.innerHTML =
+      '<div class="sgroup-t">访问令牌（管理员）</div>'
+      + '<div id="token-usage" class="secret-row"></div>'
+      + '<div class="field"><label>新增令牌（仅普通用户）</label>'
+      + '<div class="token-add">'
+      + '<input id="tk-new" class="inp" placeholder="至少 6 位，建议随机串">'
+      + '<button id="tk-add" class="btn small">添加</button>'
+      + '</div></div>'
+      + '<div class="secret-row">管理员唯一来源：容器环境变量 V2N_ACCESS_TOKEN / V2N_ADMIN_TOKEN，此处只能添加普通用户令牌。</div>'
+      + '<div id="token-list" class="token-list"></div>';
+    $("#settings-form").appendChild(host);
+
+    try {
+      const u = await api("/api/admin/usage");
+      $("#token-usage").textContent = "免费次数：" + u.used + " / " + u.limit
+        + "（剩余 " + u.free_remaining + "）"
+        + (u.gate_active ? "；门禁已激活" : "；门禁未激活")
+        + (u.enabled ? "" : "（总开关已关）");
+    } catch (e) { $("#token-usage").textContent = "（读取使用量失败）"; }
+
+    await loadTokenList();
+
+    $("#tk-add").addEventListener("click", async () => {
+      const tok = $("#tk-new").value.trim();
+      if (tok.length < 6) { toast("令牌至少 6 位", true); return; }
+      try {
+        // 固定 role=user：管理员只能来自环境变量引导令牌，网页里建不出管理员
+        await api("/api/admin/tokens", { method: "POST",
+          body: JSON.stringify({ token: tok, role: "user" }) });
+        $("#tk-new").value = "";
+        toast("已添加令牌");
+        await loadTokenList();
+      } catch (e) { toast(e.message, true); }
+    });
+  }
+
+  async function loadTokenList() {
+    const box = $("#token-list");
+    if (!box) return;
+    let data;
+    try { data = await api("/api/admin/tokens"); }
+    catch (e) { box.innerHTML = '<div class="secret-row">读取失败</div>'; return; }
+    const rows = (data.tokens || []).map((t) =>
+      '<div class="token-row"><span><code>' + esc(t.token) + "</code> · "
+      + (t.role === "admin" ? "管理员" : "普通") + "</span>"
+      + '<button class="btn small danger" data-del="' + esc(t.token) + '">删除</button></div>'
+    ).join("") || '<div class="secret-row">暂无额外令牌（引导管理员令牌在环境变量中配置）</div>';
+    box.innerHTML = rows;
+    box.querySelectorAll("[data-del]").forEach((b) => {
+      b.addEventListener("click", async () => {
+        if (!confirm("确定删除该令牌？删除后持该令牌的用户将无法继续使用。")) return;
+        try {
+          await api("/api/admin/tokens?token=" + encodeURIComponent(b.dataset.del),
+            { method: "DELETE" });
+          toast("已删除");
+          await loadTokenList();
+        } catch (e) { toast(e.message, true); }
+      });
+    });
   }
 
   // ---------- 事件 ----------
@@ -1312,6 +1444,7 @@ if (rest.length) {
 
   async function boot() {
     syncSideBtns();
+    await refreshAuthState();   // 先拿角色/门禁状态，决定设置按钮与横幅
     try {
       const list = await api("/api/tasks");
       list.forEach((t) => tasks.set(t.id, t));

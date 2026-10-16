@@ -1,0 +1,91 @@
+# ==============================================================================
+# 国内网络适配版 Dockerfile（原版 Dockerfile 的基础上替换镜像源）
+#   - apt 源：deb.debian.org  ->  mirrors.tuna.tsinghua.edu.cn
+#   - pip 源：  pypi.org       ->  pypi.tuna.tsinghua.edu.cn
+#   - playwright 浏览器：npmmirror（原版已设，国内可达）
+# 用法：
+#   docker build -f Dockerfile.cn -t video2note --build-arg INSTALL_PLAYWRIGHT=0 .
+#   （INSTALL_PLAYWRIGHT=0 可跳过 Chromium 下载，部署更快；需要抖音解析再设为 1 重建）
+# ==============================================================================
+
+# ---------- 构建阶段：只装 Python 依赖，便于分层缓存 ----------
+FROM python:3.11-slim-bookworm AS builder
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_ROOT_USER_ACTION=ignore \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+
+# Debian apt 镜像
+RUN sed -i \
+      -e 's|http://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/debian|g' \
+      -e 's|https://deb.debian.org/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g' \
+      -e 's|http://deb.debian.org/debian-security|http://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+      -e 's|https://deb.debian.org/debian-security|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+      /etc/apt/sources.list.d/debian.sources
+
+WORKDIR /build
+COPY requirements.txt .
+
+RUN python -m venv /opt/venv \
+ && /opt/venv/bin/pip install --upgrade pip setuptools wheel \
+ && /opt/venv/bin/pip install -r requirements.txt
+
+# ---------- 运行阶段 ----------
+FROM python:3.11-slim-bookworm
+
+ARG INSTALL_PLAYWRIGHT=1
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright \
+    V2N_DATA_DIR=/data \
+    SERVER_HOST=0.0.0.0 \
+    SERVER_PORT=8765 \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+
+COPY --from=builder /opt/venv /opt/venv
+
+RUN sed -i \
+      -e 's|http://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/debian|g' \
+      -e 's|https://deb.debian.org/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g' \
+      -e 's|http://deb.debian.org/debian-security|http://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+      -e 's|https://deb.debian.org/debian-security|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+      /etc/apt/sources.list.d/debian.sources
+
+# ffmpeg/ffprobe：合并音视频、抽音频、探测时长都依赖它（core/audio.py）
+# ca-certificates：访问 ASR / LLM / B站等 HTTPS 接口
+# curl：给 HEALTHCHECK 与排障用；tzdata：日志时间戳
+RUN apt-get update && apt-get install --no-install-recommends -y \
+        ffmpeg \
+        ca-certificates \
+        tzdata \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Chromium 仅供抖音解析使用（过 Cloudflare 挑战），B站链路不需要。
+# 想瘦身镜像就构建时传 --build-arg INSTALL_PLAYWRIGHT=0。
+RUN if [ "$INSTALL_PLAYWRIGHT" = "1" ]; then \
+        apt-get update && apt-get install --no-install-recommends -y \
+            libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+            libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 \
+        && rm -rf /var/lib/apt/lists/* \
+        && PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
+           /opt/venv/bin/python -m playwright install chromium ; \
+    fi
+
+WORKDIR /app
+COPY . /app
+
+RUN mkdir -p /data
+
+EXPOSE 8765
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8765/api/health >/dev/null || exit 1
+
+CMD ["sh", "-c", "exec /opt/venv/bin/python -u run.py --host \"${SERVER_HOST}\" --port \"${SERVER_PORT}\""]

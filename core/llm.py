@@ -153,7 +153,12 @@ def _chat_anthropic(cfg: dict, system: str, user: str) -> str:
 
 
 def _chat_openai(cfg: dict, system: str, user: str) -> str:
-    """OpenAI Chat Completions 协议"""
+    """OpenAI Chat Completions 协议（流式）。
+
+    部分中转（如 newapi 类网关）对推理模型的非流式长请求会缓冲完整响应
+    （含 reasoning）直至挂起/超时；改用流式逐 chunk 读取则正常返回。
+    流式只取 delta.content（正文），reasoning_content 忽略，对调用方透明。
+    """
     try:
         from openai import OpenAI
     except ImportError:
@@ -167,13 +172,22 @@ def _chat_openai(cfg: dict, system: str, user: str) -> str:
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": user})
-    r = client.chat.completions.create(
+    stream = client.chat.completions.create(
         model=cfg["model"],
         messages=messages,
         temperature=cfg["temperature"],
         max_tokens=cfg["max_tokens"],
+        stream=True,
     )
-    return (r.choices[0].message.content or "").strip()
+    parts: list[str] = []
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        content = getattr(delta, "content", None)
+        if content:
+            parts.append(content)
+    return "".join(parts).strip()
 
 
 def _request(cfg: dict, system: str, user: str, max_retries: int) -> str:

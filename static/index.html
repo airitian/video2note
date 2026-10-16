@@ -17,6 +17,9 @@
   </div>
   <div class="topbar-right">
     <span id="health" class="health"></span>
+    <!-- 登录/登出入口：未登录时一直显示（否则用户找不到输入令牌的地方，
+         只能等某次请求被 401/402 打回来才弹框）；已登录时显示当前角色，点击可退出。 -->
+    <button id="btn-auth" class="btn ghost hidden">🔑 登录</button>
     <!-- 默认隐藏：只在确实有「已下载但还没备份到云端」的视频时才显示，
          没有待同步项时不该占一个按钮位置。 -->
     <button id="btn-cloud-sync" class="btn ghost hidden" title="把还没备份到云端的视频补传上去">☁ 同步</button>
@@ -25,6 +28,8 @@
     <button id="btn-settings" class="btn ghost">设置</button>
   </div>
 </header>
+<!-- 门禁提示条：达到免费上限或剩余次数时显示 -->
+<div id="gate-banner" class="gate-banner hidden"></div>
 
 <div class="layout">
 <aside id="side-left" class="side">
