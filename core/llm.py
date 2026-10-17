@@ -310,22 +310,61 @@ NOTE_TMPL = """请把下面这份已清洗的视频转写稿整理成一篇高�
 转写稿：
 {cleaned}"""
 
-ARTICLE_TMPL = """请把下面这份已清洗的视频转写稿改写成一篇可直接发布的公众号文章。
+# 公众号文章风格专属 system：与全局 SYSTEM 的区别是放开「修辞自由」，
+# 只锁死「事实必须来自原文」——否则全局铁律会把钩子/过渡/互动全部压掉，写出干巴巴的缩水版
+ARTICLE_SYSTEM = (
+    "你是头部微信公众号的主笔，擅长把视频内容改写成读者愿意读完、愿意转发的推文。"
+    "铁律：事实、数据、案例、观点必须来自转写稿，一个都不能编；"
+    "但标题、开头钩子、过渡句、互动收尾属于修辞，可以自由发挥。"
+    "直接输出 Markdown 文章正文，不要任何解释、前言或后缀。"
+)
 
-视频信息：
+# 公众号爆款文章风格：选题切入 + 爆款标题 + 黄金三段式 + 说人话 + 手机端排版
+ARTICLE_TMPL = """下面是一份视频转写稿（已清洗），请基于它改写一篇公众号文章。
+
+视频信息（仅用于选题参考，不要原样写进正文）：
 - 标题：{title}
 - 作者：{uploader}
-
-输出要求（严格使用 Markdown）：
-1. 首行 `# ` 后面给一个有吸引力的新标题
-2. 开头一段导语（80-150 字），抓住读者
-3. 正文用 4-8 个 `##` 小标题分段，段落简短，多用短句，保留原作者的观点与案例
-4. 结尾一段总结升华
-5. 全文最后用 `## 关键要点` 列出 3-6 条要点
-6. 不要编造原文没有的数据或案例；不要写「这篇文章将带你了解」之类的空洞句式
+- 简介：{description}
 
 转写稿：
-{cleaned}"""
+{cleaned}
+
+==================== 改写规则（逐条执行） ====================
+
+【一、选题与切入】
+- 从读者需求、痛点、好奇心或实用价值出发找切入角度：读者是谁？他正被什么问题困扰？这个视频能帮他什么？
+- 避免自嗨：不要罗列"这个视频讲了什么"，要回答"读者为什么要看下去"
+- 可参考的高传播切入：痛点提问、反常识结论、真实经历复盘、数字承诺
+
+【二、标题（首行输出，只给 1 个）】
+- 用爆款公式：数字+干货 / 反常识或悬念 / 引发共鸣，任选其一或组合
+- 20 字以内为佳，具体、有画面感或冲突感；禁止"浅谈XX""XX的几点思考"这类空泛标题
+- 格式：首行 `# ` + 标题
+
+【三、结构：黄金三段式】
+1. 开头钩子（三选一）：痛点场景（让读者看到自己）/ 反常识金句 / 一句故事悬念。150 字以内，禁止暖场废话
+2. 正文分 3-5 个小节，每节一个 `## ` 一级小标题；内容密的小节可用 `### ` 二级小标题再分
+3. 每节只解决一个具体问题或讲清一个层次，节与节之间有推进感，不重复
+4. 结尾总结升华：回扣开头的钩子，给一句读者能带走的话；也可轻轻抛一个问题引导评论互动
+
+【四、语言风格】
+- 说人话：像朋友聊天，短句为主，一句一个意思，允许口语化表达
+- 去 AI 味：严禁"首先/其次/再者/综上所述/总而言之/值得一提的是/本文将/不仅…更…/赋能/抓手"这类套话
+- 不用排比堆砌、不用空洞形容词、不写"在这个快节奏的时代"式开场
+- 段落要短：一两句一段，读起来有呼吸感
+
+【五、排版规范】
+- 关键结论、金句、数字用 **加粗**
+- 开头金句或实测数据可用 `> ` 引用块突出
+- 多用短段落和列表，避免大段密集文字
+- Markdown 只用这些元素：`# `（仅标题一次）、`## `、`### `、`> `、`**`、`- `
+
+【六、硬性底线】
+- 正文总字数控制在 800-2000 字
+- 不得编造原文没有的数据、案例、观点、引用；修辞性过渡可以写，事实性内容必须来自转写稿
+- 保留原作者的核心观点与关键案例，可以重组结构、换表述
+- 直接输出文章正文，不要任何解释、前后缀或"以下是改写结果"之类的话"""
 
 CLEAN_ONLY_TMPL = """这是视频「{title}」的语音转写稿，请做最保守的润色：
 1. 只删口语填充词（嗯、啊、那个、就是说）和明显重复
@@ -446,7 +485,8 @@ def polish(raw: str, meta: dict, style: str = "note", progress=None,
         tmpl = STYLES.get(style, STYLES[DEFAULT_STYLE])
         if style == "clean":
             return _strip_fence(chat(SYSTEM, tmpl.format(title=title, raw=raw), model=model))
-        return _strip_fence(chat(SYSTEM, tmpl.format(
+        sys_p = ARTICLE_SYSTEM if style == "article" else SYSTEM
+        return _strip_fence(chat(sys_p, tmpl.format(
             title=title, uploader=meta.get("uploader", ""),
             description=meta.get("description", "")[:300], cleaned=raw), model=model))
 
@@ -486,7 +526,8 @@ def polish(raw: str, meta: dict, style: str = "note", progress=None,
         return _strip_fence(chat(SYSTEM, CLEAN_ONLY_TMPL.format(title=title, raw=cleaned),
                                 model=model))
     tmpl = STYLES.get(style, STYLES[DEFAULT_STYLE])
-    return _strip_fence(chat(SYSTEM, tmpl.format(
+    sys_p = ARTICLE_SYSTEM if style == "article" else SYSTEM
+    return _strip_fence(chat(sys_p, tmpl.format(
         title=title, uploader=meta.get("uploader", ""),
         description=meta.get("description", "")[:300], cleaned=cleaned), model=model))
 
