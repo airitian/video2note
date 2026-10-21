@@ -48,6 +48,7 @@ from __future__ import annotations
 import html as _html
 import os
 import re
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -250,6 +251,63 @@ def _chromedriver_exe():
     return None
 
 
+# ---- 浏览器进程泄漏防护（2026-10-21 线上事故修复）----
+# 事故现象：容器内攒了 2305 个活 chrome 进程，容器 pids limit（4665）
+# 被吃掉一半，ffmpeg 默认多线程创建失败报
+# `g thread with return code -11 (Resource temporarily unavailable)`，
+# 用户看到的是「音频转码失败、输出 0 字节空文件」。
+# 泄漏路径：webdriver.Chrome() 先把 chrome 拉起来再做 WebDriver 握手，
+# 握手失败（风控变严、chromedriver 僵死）时函数直接抛异常——
+# 此时还没有 driver 对象可以 quit，chrome 成孤儿进程永久存活。
+# _resolve_direct 每次重试都新建会话，泄漏随之累积。
+# 对策三层：
+#   ① _new_driver 握手失败时按 user-data-dir 反查杀掉刚拉起的 chrome
+#   ② quit 之后再按 datadir 兜底补一刀（chromedriver 僵死时 quit 无效）
+#   ③ 引用计数归零后全局清扫 v2n-chrome- 残留（有活跃 driver 时不动，
+#      避免误杀并发任务的浏览器会话）
+_active_drivers = 0
+_drivers_lock = threading.Lock()
+
+
+def _kill_chrome_by_datadir(datadir: str) -> None:
+    """按 user-data-dir 杀掉对应的 chrome/chromedriver 进程"""
+    try:
+        subprocess.run(["pkill", "-9", "-f", datadir],
+                       capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+def _quit_driver(d) -> None:
+    """退出 driver 并按 user-data-dir 兜底清杀，防孤儿 chrome 泄漏"""
+    global _active_drivers
+    datadir = getattr(d, "_v2n_datadir", None)
+    try:
+        d.quit()
+    except Exception:
+        pass
+    if datadir:
+        _kill_chrome_by_datadir(datadir)
+    with _drivers_lock:
+        _active_drivers = max(0, _active_drivers - 1)
+
+
+def _sweep_chrome_if_idle() -> None:
+    """无活跃 driver 时清扫所有 v2n-chrome- 残留进程（防泄漏兜底）
+
+    引用计数 > 0 说明有任务正握着浏览器会话，此时全局 pkill 会误杀，
+    直接跳过。解析/下载入口各调一次，把上个异常任务漏掉的进程收掉。
+    """
+    with _drivers_lock:
+        if _active_drivers > 0:
+            return
+    try:
+        subprocess.run(["pkill", "-9", "-f", "v2n-chrome-"],
+                       capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
 def _new_driver(timeout_ms: int = 45000):
     # 起一个无头 Chromium（Selenium 驱动）。
     # 分工与旧 Playwright 方案一致：浏览器只负责过 Cloudflare 挑战并发起
@@ -275,7 +333,8 @@ def _new_driver(timeout_ms: int = 45000):
     opts.add_argument("--lang=zh-CN")
     opts.add_argument("--window-size=1440,900")
     # root 下 Chromium 对 user-data-dir 有归属保护，每次给独立临时目录
-    opts.add_argument("--user-data-dir=" + tempfile.mkdtemp(prefix="v2n-chrome-"))
+    datadir = tempfile.mkdtemp(prefix="v2n-chrome-")
+    opts.add_argument("--user-data-dir=" + datadir)
     opts.add_argument("--user-agent=" + UA)
     try:
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -292,10 +351,20 @@ def _new_driver(timeout_ms: int = 45000):
     # _token 是服务端渲染的隐藏域，DOM 就绪时早已在页面里；
     # 而 dlpanda 页面挂着第三方统计，load 事件能拖几十秒。
     opts.page_load_strategy = "eager"
-    driver = webdriver.Chrome(service=Service(drv), options=opts)
-    driver.set_page_load_timeout(max(20, int(timeout_ms / 1000)))
-    driver.set_script_timeout(60)
-    _harden_fingerprint(driver)
+    global _active_drivers
+    try:
+        driver = webdriver.Chrome(service=Service(drv), options=opts)
+        driver.set_page_load_timeout(max(20, int(timeout_ms / 1000)))
+        driver.set_script_timeout(60)
+        _harden_fingerprint(driver)
+    except Exception:
+        # chrome 已拉起但握手失败：没有 driver 对象可 quit，
+        # 按 datadir 反查杀掉，否则孤儿进程越攒越多直到打满 pids。
+        _kill_chrome_by_datadir(datadir)
+        raise
+    driver._v2n_datadir = datadir      # 供 _quit_driver 兜底清杀
+    with _drivers_lock:
+        _active_drivers += 1
     return driver
 
 
@@ -410,7 +479,15 @@ def _resolve_direct(url: str, timeout_ms: int = 60000,
     # 新 cookie、新的指纹随机量）命中放行窗口的几率明显更高。
     last_err = None
     for i in range(max(1, attempts)):
-        d = _new_driver(timeout_ms)
+        d = None
+        try:
+            d = _new_driver(timeout_ms)
+        except Exception as e:
+            # 握手失败时 _new_driver 已按 datadir 清杀 chrome，不会泄漏；
+            # 直接换新会话重试（风控窗口轮转）。
+            last_err = DlpandaError("浏览器启动失败：%s" % str(e).splitlines()[0][:120])
+            time.sleep(2)
+            continue
         seen = set()
         try:
             try:
@@ -442,10 +519,7 @@ def _resolve_direct(url: str, timeout_ms: int = 60000,
         except Exception as e:
             last_err = DlpandaError("直连解析失败：%s" % str(e).splitlines()[0][:120])
         finally:
-            try:
-                d.quit()
-            except Exception:
-                pass
+            _quit_driver(d)
         # 换会话重试；间隔几秒让风控窗口轮转
         if i + 1 < max(1, attempts):
             time.sleep(3.0)
@@ -560,6 +634,10 @@ def resolve(url: str, platform: str = "douyin", timeout_ms: int = 45000,
     if platform != "douyin":
         raise DlpandaError(f"dlpanda 暂不支持 {platform}")
 
+    # 入口兜底：上个任务异常退出漏掉的 chrome 残留清掉。
+    # 无活跃会话时才动手，不会误杀并发任务的浏览器。
+    _sweep_chrome_if_idle()
+
     order = [prefer] if prefer in ("direct", "dlpanda") else []
     if not order:
         dy_ok = _dy_reachable()
@@ -607,7 +685,12 @@ def _resolve_dlpanda(url: str, platform: str = "douyin",
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.ui import WebDriverWait
 
-    driver = _new_driver(timeout_ms)
+    driver = None
+    try:
+        driver = _new_driver(timeout_ms)
+    except Exception as e:
+        # _new_driver 内部已按 datadir 清杀，不会泄漏进程
+        raise DlpandaError("浏览器启动失败：%s" % str(e).splitlines()[0][:120])
     try:
         # 模板 Cookie 必须先注入再加载解析页：selenium 的 add_cookie
         # 要求当前已在该域名下，所以先开一个同域页面。
@@ -683,10 +766,7 @@ def _resolve_dlpanda(url: str, platform: str = "douyin",
     except Exception as e:
         raise DlpandaError("解析失败：%s" % e)
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        _quit_driver(driver)
 
     if not page_html:
         raise DlpandaError("解析请求未返回内容")
@@ -1070,10 +1150,7 @@ def _browser_ready_uncached() -> tuple[bool, str]:
         try:
             d.get("about:blank")
         finally:
-            try:
-                d.quit()
-            except Exception:
-                pass
+            _quit_driver(d)      # quit + 按 datadir 兜底清杀
         return True, ""
     except Exception as e:
         msg = str(e).strip() or type(e).__name__
