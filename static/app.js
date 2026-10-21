@@ -1268,7 +1268,12 @@ if (rest.length) {
     const del = e.target.closest("[data-del]");
     if (del) { e.stopPropagation(); confirmDelete(del.dataset.del); return; }
     const hitem = e.target.closest(".hitem");
-    if (hitem) { selectTask(hitem.dataset.id); return; }
+    if (hitem) {
+      selectTask(hitem.dataset.id);
+      // 手机端选中即收起抽屉，否则浮层盖着结果区还要再点一次遮罩
+      if (isMobile()) closeDrawers();
+      return;
+    }
 
     const chip = e.target.closest(".style-chip");
     if (chip) {
@@ -1303,8 +1308,10 @@ if (rest.length) {
     if (e.target.id === "btn-start") start();
     else if (e.target.id === "btn-polish") polish();
     else if (e.target.id === "btn-retry") retryTask();
-    else if (e.target.id === "btn-history") { $("#side-left").classList.toggle("folded"); syncSideBtns(); }
-    else if (e.target.id === "btn-logs") { $("#side-right").classList.toggle("folded"); syncSideBtns(); }
+    else if (e.target.id === "btn-history") { $("#side-left").classList.toggle("folded"); syncSideBtns(); syncDrawerMask(); }
+    else if (e.target.id === "btn-logs") { $("#side-right").classList.toggle("folded"); syncSideBtns(); syncDrawerMask(); }
+    // 点抽屉遮罩关闭（桌面端遮罩恒隐藏，不会触发）
+    else if (e.target.id === "drawer-mask") closeDrawers();
     else if (e.target.id === "btn-settings") openSettings();
     else if (e.target.id === "btn-close-settings" || e.target.id === "btn-cancel-settings") $("#settings-modal").classList.add("hidden");
     else if (e.target.id === "btn-save-settings") saveSettings();
@@ -1353,6 +1360,7 @@ if (rest.length) {
     if (e.key === "Escape") {
       $("#settings-modal").classList.add("hidden");
       $("#confirm-modal").classList.add("hidden");
+      closeDrawers();
       pendingDeleteId = null;
       if (!$("#auth-modal").classList.contains("hidden")) settleAuth(false);
     }
@@ -1363,6 +1371,31 @@ if (rest.length) {
   // ---------- 启动 ----------
   // 记住文字区滚动位置：转写增量会重建 DOM，重建后要还原回去
   $("#lines").addEventListener("scroll", saveScroll, { passive: true });
+
+  // ---------- 手机端抽屉工具 ----------
+  // ≤720px 时侧栏是浮层抽屉（见 style.css 对应断点）：
+  // 展开要显示遮罩并锁页面滚动，收起则相反；桌面端遮罩恒不显示。
+  const mqMobile = window.matchMedia("(max-width: 720px)");
+  function isMobile() { return mqMobile.matches; }
+  function closeDrawers() {
+    $("#side-left").classList.add("folded");
+    $("#side-right").classList.add("folded");
+    syncSideBtns();
+    syncDrawerMask();
+  }
+  function syncDrawerMask() {
+    const mask = $("#drawer-mask");
+    if (!mask) return;
+    const open = isMobile() && (
+      !$("#side-left").classList.contains("folded") ||
+      !$("#side-right").classList.contains("folded"));
+    mask.classList.toggle("hidden", !open);
+    // 抽屉打开时锁 body 滚动，避免抽屉内滑一下带着背景一起滚
+    document.body.style.overflow = open ? "hidden" : "";
+  }
+  // 跨断点（如横竖屏切换、拉伸窗口）时清理抽屉态：
+  // 回到桌面宽度后遮罩必须消失，否则会挡住整个页面。
+  mqMobile.addEventListener("change", () => syncDrawerMask());
 
   // 顶栏按钮反映两侧栏的折叠状态（默认都展开）
   function syncSideBtns() {
@@ -1443,7 +1476,10 @@ if (rest.length) {
   }
 
   async function boot() {
+    // 手机端默认收起历史栏：抽屉浮层不该在首屏就占住屏幕
+    if (isMobile()) $("#side-left").classList.add("folded");
     syncSideBtns();
+    syncDrawerMask();
     await refreshAuthState();   // 先拿角色/门禁状态，决定设置按钮与横幅
     try {
       const list = await api("/api/tasks");
