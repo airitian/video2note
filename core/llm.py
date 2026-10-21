@@ -67,7 +67,7 @@ def _config(model_override: str | None = None) -> dict:
         "protocol": protocol,
         "base": base,
         "key": key,
-        "model": (model_override or s.get("llm_model") or "").strip() or "deepseek-v4.1-flash",
+        "model": (model_override or s.get("llm_model") or "").strip() or "deepseek-ai/DeepSeek-V4.1-Flash-1017",
         "max_tokens": max_tokens,
         "temperature": temp,
     }
@@ -90,7 +90,7 @@ def _err_message(resp: requests.Response) -> str:
     return f"HTTP {resp.status_code}: {resp.text[:200]}"
 
 
-# 推理模型（如 deepseek-v4.1-flash）默认会先输出一大段 thinking，
+# 推理模型（如 DeepSeek-V4.1-Flash）默认会先输出一大段 thinking，
 # 在 max_tokens 有限时会把正文挤没。这里默认关闭思考；若服务端不支持该参数则自动降级。
 _THINKING_OFF = True
 
@@ -537,7 +537,7 @@ def resolve_model(model_override: str | None = None) -> str:
     """本次调用实际会用到的模型名（任务覆盖值优先，其次配置）"""
     if (model_override or "").strip():
         return model_override.strip()
-    return (load_settings().get("llm_model") or "").strip() or "deepseek-v4.1-flash"
+    return (load_settings().get("llm_model") or "").strip() or "deepseek-ai/DeepSeek-V4.1-Flash-1017"
 
 
 def signature(transcript: str, style: str, model: str | None = None) -> str:
