@@ -161,6 +161,41 @@
     toastTimer = setTimeout(() => el.classList.add("hidden"), ms || 3200);
   }
 
+  // ---- 复制到剪贴板 ------------------------------------------------------
+  // 坑：navigator.clipboard 只在「安全上下文」里存在（HTTPS 或 localhost）。
+  // 本站是 HTTP 部署（http://ip:31773），浏览器里 navigator.clipboard 是
+  // undefined，直接 .writeText() 会抛 TypeError；调用点在 async 点击监听里，
+  // 错误变成未处理的 rejection——不弹任何提示，表现为「复制按钮没反应」。
+  // 所以：能用 async clipboard 就用，不能用/失败了退回 execCommand 方案。
+  function _copyFallback(text) {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");          // 防 iOS 弹键盘
+      ta.style.position = "fixed";
+      ta.style.top = "0";
+      ta.style.left = "0";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length); // iOS Safari 必须显式设置选区
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // 统一返回 Promise<boolean>：true=复制成功。绝不抛错、绝不静默。
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text)
+        .then(() => true, () => _copyFallback(text));
+    }
+    return Promise.resolve(_copyFallback(text));
+  }
+
   // ---- 访问控制 ----------------------------------------------------------
   // 服务端设置 V2N_ACCESS_TOKEN 后，未携带令牌的 /api/* 一律返回 401。
   // 登录成功会写入 httpOnly cookie，同源请求（包括 <video src="/api/media/..">
@@ -1292,8 +1327,13 @@ if (rest.length) {
       if (!currentId) { toast("请先选择或创建任务", true); return; }
       if (a === "copy") {
         const t = tasks.get(currentId);
-        if (!t || !t.note) { toast("还没有可复制的文稿", true); return; }
-        navigator.clipboard.writeText(t.note).then(() => toast("已复制"), () => toast("复制失败", true));
+        // 复制「屏幕上正在显示的」那一版：切过风格时 t.note 只是最后一次
+        // 生成的风格的内容，直接复制它会复制到别的内容，必须按 curStyle 取。
+        const text = noteForStyle(t, curStyle) || (t && t.note) || "";
+        if (!text) { toast("还没有可复制的文稿", true); return; }
+        copyText(text).then((ok) => {
+          toast(ok ? "已复制" : "复制失败，请手动选中文稿复制", !ok);
+        });
       }
       return;
     }
