@@ -129,6 +129,17 @@ SLOW_CDN_MIN_PROBE_SECONDS = 1.5        # 1.5 s
 # 回退总次数上限（video -> audio -> 重新解析×N），防止边缘全慢时无限重试。
 SLOW_CDN_MAX_FALLBACKS = 3
 
+# 解析整轮重试（把 D 方案 direct 通道嵌入重试链）。
+# resolve 单轮内部：direct 已按「换新浏览器会话」重试 3 次、dlpanda 兜底 1 次，
+# 但抖音风控收紧时整轮踩空仍会发生（实测：同一浏览器同一链接有时直接放行、
+# 有时 aweme/detail 返回 200 空 body，属概率性拦截）。每轮 resolve 都会起
+# 全新会话（新 user-data-dir / 新 cookie / 新指纹随机量），命中放行窗口的
+# 概率随轮数显著提升；轮间隔让风控窗口轮转。
+# 与 downloader.download_media 的外层整函数重试分工：这里只重试「解析」，
+# 下载阶段（CDN 取流）的瞬时失败由外层兜底多跑一整轮。
+RESOLVE_ROUNDS = 3
+RESOLVE_BACKOFF = 6.0
+
 
 @dataclass
 class ParseResult:
@@ -995,7 +1006,26 @@ def download_video(url: str, workdir: Path, max_height: int = 1080,
     from . import audio
 
     workdir.mkdir(parents=True, exist_ok=True)
-    result = resolve(url, platform="douyin")
+    # 解析整轮重试（详见 RESOLVE_ROUNDS 注释）：direct 通道过抖音风控是
+    # 概率性的，单轮 direct×3 + dlpanda 全踩空的窗口确实存在；多轮换全新
+    # 浏览器会话可显著提升命中率。失败仍抛 DlpandaError，由上层
+    # download_media 决定再兜一轮或落 yt-dlp。
+    result = None
+    last_resolve_err: Exception | None = None
+    for rnd in range(RESOLVE_ROUNDS):
+        try:
+            result = resolve(url, platform="douyin")
+            break
+        except Exception as e:
+            last_resolve_err = e
+            if rnd + 1 < RESOLVE_ROUNDS:
+                if progress:
+                    progress(4.0, f"解析暂未成功（第 {rnd + 1}/{RESOLVE_ROUNDS} 轮），"
+                                  f"稍后重试…")
+                time.sleep(RESOLVE_BACKOFF)
+    if result is None:
+        raise DlpandaError(f"解析失败（已重试 {RESOLVE_ROUNDS} 轮）："
+                           f"{last_resolve_err}")
 
     if progress:
         progress(8.0, f"解析成功：{result.title[:40]}")

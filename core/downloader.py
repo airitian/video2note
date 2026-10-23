@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -31,6 +32,14 @@ PLATFORMS = [
 ]
 
 SKIP_SUFFIX = {".json", ".part", ".ytdl", ".txt", ".webp", ".jpg", ".png"}
+
+# 抖音解析接口通道（dlpanda 模块：direct 浏览器通道优先 + dlpanda 站兜底
+# + 解析轮重试）的整函数重试。dlpanda.download_video 内部已按「解析轮」
+# 重试覆盖风控，这里再包一层，覆盖**下载阶段**（CDN 取流 / pick_media
+# 探测）的瞬时失败——重跑一轮会重新解析拿到新的边缘直链。
+# 与 dlpanda.RESOLVE_ROUNDS 分工：内层重解析，外层重整个「解析+下载」。
+DOWNLOAD_ROUNDS = 2
+DOWNLOAD_BACKOFF = 8.0
 
 # 分享文案里常带标题、话题标签，需要先从中抠出真正的链接
 URL_RE = re.compile(r"https?://[^\s，。；！？、）】》\"'<>]+", re.I)
@@ -358,17 +367,34 @@ def download_media(url: str, workdir: Path, max_height: int = 1080,
     platform = detect_platform(url)
 
     # ---- 第 1 级：抖音优先走解析接口 ----
-    # 这是目前唯一在云服务器 IP 上实测能拿到抖音视频的路径
+    # 这是目前唯一在云服务器 IP 上实测能拿到抖音视频的路径。
+    # 该路径内部结构（core/dlpanda.py）：direct 浏览器直连抖音（D 方案，
+    # 实测可过风控）优先 -> dlpanda 解析站兜底 -> 解析按轮重试。
+    # 这里再包 DOWNLOAD_ROUNDS 层整函数重试，覆盖下载阶段（CDN 取流）
+    # 的瞬时失败；每轮都会重新解析拿到新的边缘直链。仍失败才落 yt-dlp
+    # （抖音在云 IP 上基本必败，保留只为兜底与 prefer_api=False 对比排查）。
     if platform == "douyin" and prefer_api:
         api_err = None
         try:
             from . import dlpanda
 
             if dlpanda.available():
-                if progress:
-                    progress(2.0, "通过解析接口获取抖音视频…")
-                return dlpanda.download_video(url, workdir, max_height, progress)
-        except Exception as e:
+                for rnd in range(DOWNLOAD_ROUNDS):
+                    try:
+                        tag = (f"（第 {rnd + 1}/{DOWNLOAD_ROUNDS} 轮）"
+                               if DOWNLOAD_ROUNDS > 1 else "")
+                        if progress:
+                            progress(2.0, f"通过解析接口获取抖音视频…{tag}")
+                        return dlpanda.download_video(
+                            url, workdir, max_height, progress)
+                    except Exception as e:
+                        api_err = e
+                        if rnd + 1 < DOWNLOAD_ROUNDS:
+                            if progress:
+                                progress(3.0, f"解析接口未能取得视频"
+                                              f"（{_short(e)}），稍后重试")
+                            time.sleep(DOWNLOAD_BACKOFF)
+        except Exception as e:               # import 失败等前置问题
             api_err = e
             if progress:
                 progress(3.0, f"解析接口未能取得视频（{_short(e)}），改用 yt-dlp")
