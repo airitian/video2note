@@ -72,7 +72,7 @@
   const ORDER = ["upload", "downloading", "extracting", "slicing", "transcribing", "polishing"];
   const STATUS_TEXT = { pending: "排队中", running: "处理中", transcribed: "转写完成", done: "已完成", failed: "失败", canceled: "已取消" };
   const STAGE_TEXT = { queued: "等待开始", downloading: "下载视频", extracting: "提取音频", slicing: "语音切片", transcribing: "语音转写", transcribed: "等待生成文稿", polishing: "AI 生成文稿", done: "完成", failed: "失败" };
-  const STYLE_TEXT = { general: "整理文稿", note: "结构化笔记", article: "公众号文章", clean: "仅清洗润色" };
+  const STYLE_TEXT = { general: "整理文稿", note: "结构化笔记", article: "公众号文章", clean: "仅清洗润色", star: "技术讲解(STAR)" };
   // 默认风格；页面把选择结果记在curStyle 里
   let curStyle = "general";
   // 已生成过文稿的风格集合（当前任务），用于提示与按钮文案

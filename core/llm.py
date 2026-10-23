@@ -377,13 +377,76 @@ CLEAN_ONLY_TMPL = """这是视频「{title}」的语音转写稿，请做最保�
 转写稿：
 {raw}"""
 
+# 技术 STAR 风格专属 system：突破全局「忠实原文」铁律——允许质疑、允许延伸，
+# 但质疑必须有依据、延伸必须标注来源，防止 AI 意见冒充视频原观点
+STAR_SYSTEM = (
+    "你是一名资深技术架构师兼技术评审，擅长把视频里的技术内容讲透、讲对。"
+    "核心任务：先判断视频技术主张是否可靠，再用 STAR 结构讲清楚「这件事到底怎么做」。"
+    "与普通整理不同，你被允许质疑原文、延伸补充，但必须遵守三条铁律："
+    "一、质疑要有依据，从技术常识、逻辑漏洞、事实错误、夸大宣传四方面判断，不得无端否定；"
+    "二、延伸补充（原理、最佳实践、修正方案）必须准确，且显式标注 [AI补充] 或 [AI修正]，"
+    "    视频原观点不标注、默认视为原文，不得让 AI 的意见冒充视频原观点；"
+    "三、事实、代码、数字必须准确，宁缺毋滥。"
+    "直接输出 Markdown 正文，不要任何解释、前言或后缀。"
+)
+
+# 技术讲解风格：可靠性判断 + STAR 结构 + 去无效内容 + AI 可延伸（标注来源）
+STAR_TMPL = """下面是一份技术类视频的转写稿（已清洗），请按以下规则处理。
+
+视频信息（仅用于理解背景，不要原样写进正文）：
+- 标题：{title}
+- 作者：{uploader}
+- 简介：{description}
+
+转写稿：
+{cleaned}
+
+==================== 处理规则（逐条执行） ====================
+
+【一、先质疑：可靠性判断】
+开头固定输出一个 `## 可靠性判断` 小节：
+- 给结论：可靠 / 部分可靠 / 不可靠
+- 给依据：从技术常识、逻辑漏洞、事实错误、夸大宣传几方面简述判断理由
+- 不可靠的部分，明确指出错在哪、正确做法是什么，标注 [AI修正]
+- 若原视频只是观点分享、无严格对错，则判断其「是否成立、有无以偏概全、适用边界」，如实说明
+
+【二、去掉前置无效内容】
+彻底删除：开场寒暄、自我介绍、面试官问答叙事、引流话术（求关注/点赞/加微信/私信领取/留数字口令/报课引导）、无意义语气词。只保留技术事实与观点。
+
+【三、STAR 结构化（灵活，缺则跳过）】
+按需输出以下小节（`## ` 标题），重点在「方案」：
+- `## 背景（Situation）`：这个技术问题出现在什么场景、有什么痛点
+- `## 目标（Task）`：要解决什么问题、达成什么目标
+- `## 方案（Action）`：具体怎么做——这是全文重心，分步骤讲透，含代码、配置、参数、关键细节，让读者能照着做
+- `## 效果（Result）`：效果如何、怎么验证；原文没给就写「原文未提及」，不要编造数据
+若某要素原文确实没有（如纯观点分享），直接省略对应小节，不强凑四段
+
+【四、讲清「怎么处理」】
+全文目标是把这块内容「怎么处理」讲清楚。方案步骤要具体可执行，避免空泛的原则话。
+
+【五、AI 延伸与标注】
+- 可以补充原视频没讲清、但对「照着做」必需的原理、背景、最佳实践、常见坑
+- 所有延伸内容必须标注：`[AI补充]`（补充说明）或 `[AI修正]`（纠正原文错误）
+- 视频原观点不标注（默认视为原文）；拿不准的转写处保留原样或标 [?]
+
+【六、硬性底线】
+- 不得编造原文没有的数据、案例、结论；AI 延伸的内容要准确
+- 代码、命令、配置项、数字、英文原词保持原样
+- 直接输出正文，不要「以下是整理结果」之类的开场白"""
+
 STYLES = {
     "general": GENERAL_TMPL,   # 默认：忠实原文的整理文稿
     "note": NOTE_TMPL,
     "article": ARTICLE_TMPL,
     "clean": CLEAN_ONLY_TMPL,
+    "star": STAR_TMPL,         # 技术讲解：可靠性判断 + STAR
 }
 DEFAULT_STYLE = "general"
+# 各风格专属 system prompt；未列出的风格走全局 SYSTEM（忠实原文铁律）
+STYLE_SYSTEMS = {
+    "article": ARTICLE_SYSTEM,
+    "star": STAR_SYSTEM,
+}
 
 
 def _strip_fence(text: str) -> str:
@@ -485,7 +548,7 @@ def polish(raw: str, meta: dict, style: str = "note", progress=None,
         tmpl = STYLES.get(style, STYLES[DEFAULT_STYLE])
         if style == "clean":
             return _strip_fence(chat(SYSTEM, tmpl.format(title=title, raw=raw), model=model))
-        sys_p = ARTICLE_SYSTEM if style == "article" else SYSTEM
+        sys_p = STYLE_SYSTEMS.get(style, SYSTEM)
         return _strip_fence(chat(sys_p, tmpl.format(
             title=title, uploader=meta.get("uploader", ""),
             description=meta.get("description", "")[:300], cleaned=raw), model=model))
@@ -526,7 +589,7 @@ def polish(raw: str, meta: dict, style: str = "note", progress=None,
         return _strip_fence(chat(SYSTEM, CLEAN_ONLY_TMPL.format(title=title, raw=cleaned),
                                 model=model))
     tmpl = STYLES.get(style, STYLES[DEFAULT_STYLE])
-    sys_p = ARTICLE_SYSTEM if style == "article" else SYSTEM
+    sys_p = STYLE_SYSTEMS.get(style, SYSTEM)
     return _strip_fence(chat(sys_p, tmpl.format(
         title=title, uploader=meta.get("uploader", ""),
         description=meta.get("description", "")[:300], cleaned=cleaned), model=model))

@@ -217,7 +217,7 @@ async def _access_guard(request: Request, call_next):
                 status_code=402)
     return await call_next(request)
 
-STYLES = ("general", "note", "article", "clean")
+STYLES = ("general", "note", "article", "clean", "star")
 
 # 按扩展名给媒体流定Content-Type。
 # 不用固定白名单的原因：上传的本地文件落盘名是 source<原后缀>，
