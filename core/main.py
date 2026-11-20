@@ -72,22 +72,28 @@ def _compute_health(force: bool = False) -> dict:
         yt = True
     except ImportError:
         yt = False
-    pw_msg = ""
+    browser_msg = ""
     try:
         from .dlpanda import browser_ready
 
         # force 时绕过 browser_ready 自身缓存，真正重起一次内核确认
-        pw, pw_msg = browser_ready(max_age=0.0 if force else None)
+        browser_ok, browser_msg = browser_ready(
+            max_age=0.0 if force else None)
     except Exception as e:
-        pw, pw_msg = False, f"检测失败：{e}"
+        browser_ok, browser_msg = False, f"检测失败：{e}"
     try:
         from .dlpanda import available as _dlp_ok
 
-        dy = bool(_dlp_ok()) and pw
+        dy = bool(_dlp_ok()) and browser_ok
     except Exception:
         dy = False
     return {"ffmpeg": ff, "ffmpeg_msg": ffmsg, "yt_dlp": yt,
-            "douyin_api": dy, "playwright": pw, "playwright_msg": pw_msg,
+            "douyin_api": dy,
+            # 浏览器通道现为 Selenium + 系统 Chromium（Playwright 已退场）。
+            # browser/browser_msg 是新字段名；playwright/* 保留为别名，
+            # 兼容仍在读旧字段的前端与监控。
+            "browser": browser_ok, "browser_msg": browser_msg,
+            "playwright": browser_ok, "playwright_msg": browser_msg,
             **_build_info(refresh=force)}
 
 
@@ -617,7 +623,8 @@ async def health(refresh: int = 0):
         # 极冷场景（刚启动还没探完第一次）：返回轻量占位，绝不阻塞；
         # 专属线程已在探测，下一次请求就有数据。
         snap = {"ffmpeg": None, "ffmpeg_msg": "", "yt_dlp": None,
-                "douyin_api": None, "playwright": None, "playwright_msg": "",
+                "douyin_api": None, "browser": None, "browser_msg": "",
+                "playwright": None, "playwright_msg": "",
                 **_build_info()}
     # 显式关掉代理缓冲 + 禁止缓存：预览网关(monkeycode-ai.online)会缓冲
     # 响应，曾导致 SSE 推流到不了浏览器；即便普通 JSON 也带上，双保险。

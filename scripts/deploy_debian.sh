@@ -147,31 +147,24 @@ else
   warn "健康检查未通过（服务可能仍在启动），请看 $LOG"
 fi
 
-# 抖音首选通道 = dlpanda 解析接口，解析那一步必须有浏览器内核
+# 抖音首选通道 = dlpanda 解析接口 + Selenium 驱动系统 Chromium
 #（Cloudflare 挑战只有真实浏览器能过，curl_cffi 带 cf_clearance 也会被 403）
-if "$VPY" -c "from playwright.sync_api import sync_playwright" >/dev/null 2>&1; then
-  ok "Playwright 就绪"
+if "$VPY" -c "import selenium" >/dev/null 2>&1; then
+  ok "Selenium 就绪"
 else
-  warn "未装浏览器内核 —— 抖音将降级到 yt-dlp（服务器 IP 上大概率失败）"
-  warn "  安装：$VPY -m playwright install --with-deps chromium"
-  warn "  国内镜像：PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \\"
-  warn "            $VPY -m playwright install chromium"
+  warn "未装 selenium —— 抖音解析通道不可用：$VPY -m pip install selenium"
 fi
 if "$VPY" -c "import curl_cffi" >/dev/null 2>&1; then
   ok "curl_cffi 就绪（CDN 直链下载）"
 else
   warn "未装 curl_cffi —— 抖音通道不可用：$VPY -m pip install curl_cffi"
 fi
-# 校验内核真的落盘了：库在但内核缺失是服务器上最常见的坑
-if "$VPY" - <<'PY' >/dev/null 2>&1
-from playwright.sync_api import sync_playwright
-with sync_playwright() as p:
-    assert p.chromium.executable_path
-PY
-then
-  ok "Chromium 内核已就位，抖音解析通道可用"
+# 校验浏览器与驱动真的落盘了：库在但内核缺失是服务器上最常见的坑
+if command -v chromium >/dev/null 2>&1 && command -v chromedriver >/dev/null 2>&1; then
+  ok "Chromium + chromedriver 已就位，抖音解析通道可用"
 else
-  warn "Chromium 内核缺失或不可执行 —— 抖音解析通道不可用，请重装内核"
+  warn "Chromium/chromedriver 缺失 —— 抖音解析通道不可用"
+  warn "  安装：sudo apt-get install -y chromium chromium-driver"
 fi
 
 # 密钥是否填了（不显示内容，只看非空）

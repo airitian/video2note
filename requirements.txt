@@ -1,30 +1,23 @@
+# 依赖锁定：以下版本与线上运行环境实测的 pip freeze 对齐（2026-11-21），
+# 全部精确锁定，不再用 >= 任由重建时漂移。升级时请整表复核并跑 CI 冒烟。
+# 抖音主通道是 Selenium + 系统 Chromium/chromedriver（core/dlpanda.py），
+# selenium 必须在列；Playwright 已非主通道，pip 包与浏览器内核均不再安装。
+
 # ========== 核心框架 ==========
-# 仅需 FastAPI 版入口（run.py）。原 Gradio 版入口 app.py 已移除。
-fastapi>=0.110
-uvicorn[standard]>=0.27
-python-multipart>=0.0.9
+fastapi==0.143.1
+uvicorn==0.54.0
+python-multipart==0.0.32
+pydantic==2.14.1
 
 # ========== 业务依赖 ==========
-# 抖音首选通道：dlpanda 解析接口（core/dlpanda.py）
-#   curl_cffi  做 TLS 指纹伪装 + 下载 CDN 直链
-#   playwright 仅用于解析那一步（Cloudflare 挑战必须真实浏览器执行 JS）
-#   缺失时自动降级到 yt-dlp，不影响 B站
-curl_cffi>=0.16.0
-playwright>=1.40
-yt-dlp>=2025.1.1          # B站主力；抖音在无 Cookie 时会被风控拦截（已由 dlpanda 通道前置解决）
-requests>=2.31            # ASR 接口 + Anthropic 协议 LLM 调用
-openai>=1.30              # 仅当 llm_protocol=openai 时需要
-
-# ---- 抖音解析通道（core/dlpanda.py，必需）----
-# 该通道靠浏览器通过 Cloudflare 挑战，服务器上必须装浏览器内核：
-#   python -m playwright install --with-deps chromium
-# 国内网络慢可用镜像：
-#   PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
-#     python -m playwright install chromium
+curl_cffi==0.16.3          # TLS 指纹伪装 + CDN 直链下载
+selenium==4.51.0           # 抖音直连通道（驱动系统 chromium）
+yt-dlp==2026.8.19          # B站主力 + 抖音兜底
+requests==2.34.2           # ASR 接口 + Anthropic 协议 LLM 调用
+openai==3.31.0             # 仅当 llm_protocol=openai 时需要
 
 # ========== 工具库 ==========
-python-dotenv>=1.0        # 本地 .env 支持
-pydantic>=2.0             # FastAPI 接口模型（此前仅靠间接依赖，现显式声明）
-imageio-ffmpeg>=0.4.9     # 本机无系统 ffmpeg 时，用其自带二进制兜底（core/config.py:ff_bin）
-qiniu>=7.18.0
-boto3>=1.34             # 七牛 S3 兼容协议：测试域名被回收后用它生成预签名播放地址（走 s3.cn-south-1.qiniucs.com）
+python-dotenv==1.2.4       # 本地 .env 支持
+imageio-ffmpeg==0.6.0      # 本机无系统 ffmpeg 时的兜底二进制（core/config.py:ff_bin）
+qiniu==7.18.0              # 七牛云归档（官方 SDK）
+boto3==1.44.7              # 七牛 S3 兼容协议预签名播放地址

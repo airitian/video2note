@@ -372,10 +372,10 @@ def _new_driver(timeout_ms: int = 45000):
 
     binary = _chromium_exe()
     if not binary:
-        raise DlpandaError("未找到 Chromium 浏览器，执行：apk add chromium")
+        raise DlpandaError("未找到 Chromium 浏览器，执行：apt-get install -y chromium")
     drv = _chromedriver_exe()
     if not drv:
-        raise DlpandaError("未找到 chromedriver，执行：apk add chromium-chromedriver")
+        raise DlpandaError("未找到 chromedriver，执行：apt-get install -y chromium-driver")
 
     opts = Options()
     opts.binary_location = binary
@@ -1188,24 +1188,15 @@ def _ext_for(url: str) -> str:
 
 def _chromium_exe():
     # 定位 Chromium 可执行文件（只查文件系统，不启动浏览器）。
-    # Alpine 的 chromium 包装在 /usr/lib/chromium/chrome；
-    # 也保留 playwright 的安装位置，便于将来换回该部署形态。
+    # Debian 的 chromium 包在 /usr/bin/chromium，Alpine 包装在
+    # /usr/lib/chromium/chrome，两处都查。
     for c in ("/usr/lib/chromium/chrome", "/usr/bin/chromium",
               "/usr/bin/chromium-browser", "/usr/bin/google-chrome",
               "/usr/bin/google-chrome-stable"):
         if os.path.exists(c):
             return c
-    root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or os.path.expanduser(
-        "~/.cache/ms-playwright")
-    try:
-        entries = sorted(Path(root).glob("chromium*"))
-    except OSError:
-        return None
-    for d in entries:
-        for rel in ("chrome-linux/chrome", "chrome-linux64/chrome"):
-            p = d / rel
-            if p.exists():
-                return str(p)
+    # 只认系统包安装的 Chromium（Dockerfile 的 apt chromium 包）。
+    # 旧的 Playwright 内核目录探测已随 Playwright 通道退场删除。
     return None
 
 
@@ -1216,9 +1207,9 @@ def _browser_ready_uncached() -> tuple[bool, str]:
     except ImportError:
         return False, "未安装 selenium，执行：/opt/venv/bin/pip install selenium"
     if not _chromedriver_exe():
-        return False, "未找到 chromedriver，执行：apk add chromium-chromedriver"
+        return False, "未找到 chromedriver，执行：apt-get install -y chromium-driver"
     if not _chromium_exe():
-        return False, "未找到 Chromium 内核，执行：apk add chromium"
+        return False, "未找到 Chromium 内核，执行：apt-get install -y chromium"
     try:
         d = _new_driver(timeout_ms=15000)
         try:
