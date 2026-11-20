@@ -15,10 +15,10 @@ URL / 文件 → 解析下载(视频轨+音频轨) → ffmpeg(合并 mp4 / 抽 1
 command -v python3 || command -v python
 
 # 1. 安装依赖
-python3 -m python3 -m pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 
-# 2. 装浏览器内核（抖音解析需要，只跑 B站可跳过）
-python3 -m playwright install --with-deps chromium
+# 2. 装浏览器与驱动（抖音解析走 Selenium + 系统 Chromium，只跑 B站可跳过）
+sudo apt-get install -y chromium chromium-driver
 
 # 3. 启动服务
 python3 run.py --port 8765         # 打开 http://127.0.0.1:8765
@@ -104,7 +104,7 @@ whisper-base     Fun-ASR-Nano-2512       GLM-ASR           TeleASR-MultiDialect
 Anthropic 协议要点（已实现）：
 
 - `system` 作为**顶层字段**，不放在 messages 里
-- `max_tokens` 必填，由 `llm_max_tokens` 控制，默认 8192
+- `max_tokens` 必填，由 `llm_max_tokens` 控制，默认 16384
 - 响应体 `content` 是**块数组**，需只取 `type == "text"` 的块（`thinking` / `tool_use` 已自动忽略）
 
 ## 配置方式（三选一，优先级从低到高）
@@ -119,7 +119,7 @@ export V2N_LLM_PROTOCOL=anthropic         # anthropic | openai
 export V2N_LLM_BASE_URL=https://api.pateway.ai/v1
 export V2N_LLM_API_KEY=你的Key            # 别名 PATEWAY_API_KEY 亦可
 export V2N_LLM_MODEL=deepseek-v4.1-flash
-export V2N_LLM_MAX_TOKENS=8192
+export V2N_LLM_MAX_TOKENS=16384
 
 # 方式二：项目根目录 .env（见 .env.example）
 cp .env.example .env
@@ -221,27 +221,23 @@ B站：yt-dlp
 依赖：
 
 ```bash
-# 必需：解析（浏览器过 CF）+ 下载（TLS 指纹）
-python3 -m pip install curl_cffi playwright
-python3 -m playwright install --with-deps chromium
-
-# 国内网络慢，用镜像
-PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
-  python3 -m playwright install chromium
+# 必需：解析（Selenium 驱动系统 Chromium 过 CF）+ 下载（TLS 指纹）
+python3 -m pip install curl_cffi selenium
+sudo apt-get install -y chromium chromium-driver
 ```
 
 健康检查接口会分别报告两项，服务器上排查很方便：
 
 ```bash
 curl -s http://127.0.0.1:8765/api/health
-# {"ffmpeg":true,"yt_dlp":true,"douyin_api":true,"playwright":true}
-#                  ↑ 抖音通道    ↑ 浏览器内核
+# {"ffmpeg":true,"yt_dlp":true,"douyin_api":true,"browser":true}
+#                  ↑ 抖音通道    ↑ 浏览器（另有 playwright 同值别名字段兼容旧监控）
 ```
 
-`playwright` 这一项会**真的启动一次 Chromium** 来判定，不是只看 `import`——
-因为「装了库没装内核」时 `import playwright` 依然成功，
-但一跑任务就会报 `BrowserType.launch: Executable doesn't exist at .../ms-playwright/...`。
-判定为不可用时，`playwright_msg` 字段里会直接给出修复命令。
+`browser` 这一项会**真的启动一次 Chromium** 来判定，不是只看 `import`——
+因为「装了 selenium 库没装浏览器/驱动」时 `import selenium` 依然成功，
+但一跑任务就会报找不到 chromedriver。判定为不可用时，
+`browser_msg` 字段里会直接给出修复命令。
 
 缺任何一项都会**自动降级**到 yt-dlp，不影响 B站。
 
@@ -276,34 +272,23 @@ curl -s http://127.0.0.1:8765/api/health
 
 ### 常见报错
 
-**`BrowserType.launch: Target page, context or browser has been closed`**
+**`chromedriver` / Chromium 启动失败（SessionNotCreated / 未找到 chromedriver）**
 
-这句报错是**结果，不是原因**。playwright 把「缺系统库」「内核与库版本不匹配」
-「内存不足」全汇总成这一句，真正原因在浏览器进程的 stderr 里，而它默认不打印。
+这句报错是**结果，不是原因**：缺浏览器、缺驱动、两者版本不匹配、
+内存不足都会汇总成启动失败。先看健康检查的 `browser_msg`，
+它会直接给出缺哪一项。
 
-直接跑诊断脚本看真因（务必用**跑服务那个解释器**）：
-
-```bash
-readlink -f /proc/$(pgrep -f 'run[.]py' | head -1)/exe   # 查解释器
-/usr/bin/python3.11 verify_chromium.py                   # 再用它跑
-```
-
-它会依次报告：已落盘的内核、`ldd` 缺失的共享库（**并给出对应的 apt 包名**）、
-内核 revision 与库是否匹配、以及带完整 stderr 的真实启动结果。
-
-最常见是**缺系统库**——`pip install playwright` 只装 Python 包，浏览器依赖的
-共享库属于操作系统。脚本会直接给出可复制的命令：
+抖音通道走 Selenium + 系统 Chromium，浏览器与驱动由系统包成对提供，
+版本天然匹配——不要再单独下载 Playwright 内核（已退场）：
 
 ```bash
-apt-get update && apt-get install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
-    libcups2 libxcomposite1 libxdamage1 libatspi2.0-0
-# 或让 playwright 自己装：
-python3 -m playwright install --with-deps chromium
+apt-get update && apt-get install -y chromium chromium-driver
+which chromium chromedriver   # 两条都要有输出
 ```
 
-> **Debian/Ubuntu 上尤其容易踩**：手工装的系统往往没装浏览器依赖。
+> **Debian/Ubuntu 上尤其容易踩**：手工装的系统往往没装浏览器。
 > `scripts/deploy_debian.sh` 与本仓库的 Dockerfile 都已预装这些包，
-> 直接手工`pip install` 的路径则不会——所以脚本会直接把包名列出来。
+> 直接手工 `pip install` 的路径则不会。
 
 **`'latin-1' codec can't encode characters in position N: ordinal not in range(256)`**
 
@@ -321,7 +306,7 @@ yt-dlp 在**发出请求之前**就会抛这个错。
 
 1. 在「⚙️ 设置」页的**代理**栏填一个可用代理（最直接）
 2. 换网络环境（例如手机热点）
-3. 确认解析接口可用：健康检查里 `douyin_api` 与 `playwright` 都应为 `true`
+3. 确认解析接口可用：健康检查里 `douyin_api` 与 `browser` 都应为 `true`
 
 ### Cookie 配置（抖音基本必填）
 
@@ -415,7 +400,7 @@ video2note/
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 -m playwright install --with-deps chromium   # 抖音解析需要，只跑 B站可跳过
+sudo apt-get install -y chromium chromium-driver   # 抖音解析需要，只跑 B站可跳过
 
 python3 run.py --host 0.0.0.0 --port 8765
 ```
@@ -500,8 +485,8 @@ location /v2n/ {
 | 页面能开但样式/接口 404 | 反代前缀问题：启动时加 `--root-path /你的前缀` |
 | 重启后历史记录没了 | 数据目录被清理；用 `V2N_DATA_DIR` 指定持久化路径，并挂卷 |
 | 抖音一直解析失败 | IP 风控（与 Cookie 无关）：在设置页填代理，或换网络环境 |
-| **抖音解析报 `Executable doesn't exist`** | `python3 -m pip install playwright` 只装 Python 包，浏览器内核是另一套。执行 `python3 -m playwright install chromium`（容器里可能还需 `--with-deps`）。健康检查的 `playwright` 字段会真启动一次 Chromium，此项为 false 时 `playwright_msg` 直接给出该命令 |
-| **`playwright_msg` 报「启动即崩溃」** | 内核已装但 Chromium 一启动就退出（`Target page, context or browser has been closed`）。两个原因：内核与库版本不匹配 → `playwright install --force chromium`；系统库缺失 → `playwright install --with-deps chromium`。**命令里的解释器要用服务实际在用的那个**（`readlink -f /proc/<服务PID>/exe`），装到别的环境等于没装 |
+| **抖音解析报找不到 chromedriver / Chromium** | 抖音通道走 Selenium + 系统 Chromium，浏览器与驱动不在 pip 包里。执行 `sudo apt-get install -y chromium chromium-driver`。健康检查的 `browser` 字段会真启动一次 Chromium，此项为 false 时 `browser_msg` 直接给出修复命令 |
+| **`browser_msg` 报「启动即崩溃」** | Chromium 已装但一启动就退出。多为系统共享库缺失或内存不足：按 `browser_msg` 给出的 apt 命令补齐，或换用仓库 Dockerfile（依赖已预装） |
 | 抖音报验证码 / 滑块拦截 | 服务器 IP 被抖音风控，**换 Cookie 无效**。按序尝试：设置页填代理 → 换网络（手机热点）→ 关闭本机代理软件 |
 | **转写时看不到文字陆续出现 / 首句很久才出** | ASR 接口是「整段上传、整段返回」，做不到字节级流式，所以「实时」的粒度就是一个分片。默认已把**首片压到 15 秒**且切片与转写并行（首句约几秒可见）。还想更快：设置页调小「首个分片的时长」；调大则省ASR 调用次数。调`chunk_seconds` 只影响后续分片，对首句速度无帮助 |
 | **设置面板是空的 / 少了某几项** | 多半是「前端新、后端旧」：`git pull` 只更新磁盘文件，运行中的 Python 进程不会重新加载，**必须重启服务**。先看设置面板顶部的自检条，它会直接说明是哪种情况；重启方式见下方「按部署方式重启」 |

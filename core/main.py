@@ -943,12 +943,12 @@ async def create_tasks_batch(request: Request, body: BatchCreateBody):
             results.append({"url": raw, "ok": False, "error": "空行已跳过"})
             continue
         try:
-            t, existing = _create_one(
-                u, body.style, body.language, body.model,
+            r = _create_one(
+                u, body.style, body.language, body.model, False,
                 owner=owner,
                 visible=lambda x: _can_view(request, x))
-            results.append({"url": u, "ok": True, "id": t.id,
-                            "existing": existing})
+            results.append({"url": u, "ok": True, "id": r.get("id"),
+                            "existing": bool(r.get("existing"))})
         except HTTPException as e:
             results.append({"url": u, "ok": False, "error": str(e.detail)})
         except Exception as e:      # noqa: BLE001 - 逐条隔离失败
@@ -986,7 +986,7 @@ async def patch_transcript(request: Request, tid: str, body: TranscriptBody):
     t.error = ""
     t.message = "转写已更新，可重新整理"
     store.save(t)
-    return _task_detail(t)
+    return t.to_dict()
 
 
 @app.post("/api/tasks/upload")
