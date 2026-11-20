@@ -68,25 +68,17 @@ def id_from_url(url: str, platform: str) -> str:
 
 
 def _follow(url: str, timeout: float) -> str:
-    """跟随一次重定向，只取最终 URL（不下载页面正文）"""
-    # 优先 curl_cffi（容器里本来就有，且能过常见风控头部检查）
-    try:
-        from curl_cffi import requests as creq  # type: ignore
+    """跟随重定向，只取最终 URL（不下载页面正文）。
 
-        r = creq.get(url, impersonate="chrome", timeout=timeout,
-                     allow_redirects=True, stream=True)
-        try:
-            return str(r.url or "")
-        finally:
-            r.close()
-    except Exception:
-        pass
+    ★逐跳复检（SSRF）：短链第一跳是公网域名不代表落点安全，
+    302 跳到 169.254/内网地址同样要拦。统一走 ssrf.safe_final_url，
+    它对每一跳 Location 都重做公网校验，任一跳不合法即放弃解析
+    （查重只是增强功能，放弃后还有 URL 规范化比对兜底）。
+    """
     try:
-        import urllib.request
+        from .ssrf import safe_final_url
 
-        req = urllib.request.Request(url, method="GET", headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-            return resp.geturl()
+        return safe_final_url(url, timeout=timeout)
     except Exception:
         return ""
 

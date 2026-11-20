@@ -362,6 +362,12 @@ def download_media(url: str, workdir: Path, max_height: int = 1080,
     url = extract_url(url)
     if not url.startswith("http"):
         raise InvalidURLError(f"未能从输入中识别出有效链接：{url[:80]}")
+    # SSRF 二道防线：即便绕过接口层直调下载，也先做公网校验
+    from .ssrf import validate_public_url
+    try:
+        validate_public_url(url)
+    except ValueError as e:
+        raise InvalidURLError(str(e))
 
     workdir.mkdir(parents=True, exist_ok=True)
     platform = detect_platform(url)

@@ -722,6 +722,13 @@ def _create_one(url_text: str, style: str, language: str, model: str,
     url = extract_url(url_text)
     if not url or not url.startswith("http"):
         raise HTTPException(400, "未识别到有效链接，请粘贴含 http(s):// 的视频链接")
+    # SSRF：协议/主机/DNS 解析后地址全量校验，内网与云元数据地址直接 400，
+    # 不让服务端替提交者去请求内网（重定向落点在 dedupe/下载侧逐跳复检）。
+    from .ssrf import validate_public_url
+    try:
+        validate_public_url(url)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     platform = detect_platform(url)
 
     # 作品 ID 可能要跟随一次短链重定向（≤6s），放在锁外做，

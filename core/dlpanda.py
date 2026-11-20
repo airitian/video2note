@@ -54,6 +54,16 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+def _tls_verify() -> bool:
+    """出站 HTTPS 是否校验证书。默认校验（True）。
+
+    历史上多处写死关闭校验：中间人可以替换 CDN 视频内容与探针结果。
+    仅当部署环境确有自签中间代理时，可用环境变量
+    V2N_ALLOW_INSECURE_TLS=1 显式放行——是部署决策，不是代码默认值。
+    """
+    return (os.getenv("V2N_ALLOW_INSECURE_TLS") or "").strip() != "1"
+
+
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
 
@@ -497,7 +507,7 @@ def _https_ok(u: str, timeout: float = 4.0) -> bool:
     try:
         from curl_cffi import requests as cr
         r = cr.get(u, headers={"User-Agent": UA}, impersonate="chrome136",
-                   timeout=(timeout, timeout), verify=False)
+                   timeout=(timeout, timeout), verify=_tls_verify())
         ok = r.status_code < 500
     except Exception:
         ok = False
@@ -852,7 +862,7 @@ def probe(url: str, referer: str | None = None) -> tuple[bool, str]:
 
         def fetch(h):
             return cr.get(url, headers=h, impersonate="chrome136",
-                          timeout=(10, 45), verify=False)
+                          timeout=(10, 45), verify=_tls_verify())
     except ImportError:
         import requests
 
@@ -936,7 +946,7 @@ def download(url: str, dest: Path, referer: str = "https://www.douyin.com/",
     try:
         from curl_cffi import requests as cr
 
-        session = cr.Session(impersonate="chrome136", verify=False)
+        session = cr.Session(impersonate="chrome136", verify=_tls_verify())
         get = session.get
     except ImportError:
         import requests
