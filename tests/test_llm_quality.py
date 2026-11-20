@@ -18,9 +18,11 @@ def test_style_temperature_defaults():
 
 def test_removed_styles_are_gone():
     # 2026-11-21 按用户要求下线：仅清洗润色（clean）、结构化笔记（note）
-    assert set(llm.STYLES) == {"general", "article", "star"}
+    assert set(llm.STYLES) == {"general", "digest", "article", "star", "proof"}
     # 传入已下线风格时回退到默认模板而不是报错
     assert llm.STYLES.get("clean", llm.STYLES[llm.DEFAULT_STYLE]) is llm.STYLES["general"]
+    assert llm._style_temperature("digest") == 0.3
+    assert llm._style_temperature("proof") == 0.1
 
 
 def test_style_temperature_user_override_wins():
@@ -130,6 +132,31 @@ def test_signature_depends_on_style_temperature():
     # general(0.2) 与 article(0.65) 温度不同 → 同原文签名必须不同
     assert llm.signature("abc", "general") != llm.signature("abc", "article")
     assert llm.signature("abc", "general") == llm.signature("abc", "general")
+
+
+# ---------- 长稿 proof：清洗稿直拼，不走加标题/成稿 ----------
+
+def test_polish_long_proof_is_verbatim_cleaned(monkeypatch):
+    raw = "\n\n".join(
+        f"第{i}段的完整内容，包含具体事实与数字{i}。" + "这里是该段的展开论述，用来把段落撑到足够长度，确保整篇稿子超过短文本阈值，走长稿全链路。" * 2
+        for i in range(30))
+    assert len(raw) > llm.SHORT_LIMIT
+
+    def fake_chat(system, user, **kw):
+        if "提取所有专有名词" in user:
+            return "术语甲、术语乙"
+        if "质检员" in user:
+            return '{"coverage": 100, "fabrications": [], "missing": []}'
+        if "只做一件事" in user:
+            raise AssertionError("proof 不应走加标题环节")
+        return user.split("原始文本：\n", 1)[1].strip()
+
+    monkeypatch.setattr(llm, "chat", fake_chat)
+    out = llm.polish(raw, {"title": "标题"}, style="proof",
+                     progress=lambda m: None)
+    assert out.startswith("# 标题\n\n")
+    for i in range(30):
+        assert f"包含具体事实与数字{i}" in out
 
 
 # ---------- 长稿 general 全链路（假 chat） ----------

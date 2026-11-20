@@ -400,7 +400,7 @@ def _get_visible_task(request: Request, tid: str):
         raise HTTPException(404, "任务不存在")
     return t
 
-STYLES = ("general", "article", "star")
+STYLES = ("general", "digest", "article", "star", "proof")
 
 # 按扩展名给媒体流定Content-Type。
 # 不用固定白名单的原因：上传的本地文件落盘名是 source<原后缀>，

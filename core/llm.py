@@ -28,7 +28,8 @@ PIPELINE_REV = "20261121-q1"
 
 # 分风格温度：忠实类要稳、创作类要放。设置页显式填了温度时以设置页为准
 # （见 _style_temperature），这里只提供未显式设置时的默认值。
-STYLE_TEMPERATURES = {"general": 0.2, "star": 0.35, "article": 0.65}
+STYLE_TEMPERATURES = {"general": 0.2, "digest": 0.3, "star": 0.35,
+                      "article": 0.65, "proof": 0.1}
 # 清洗/术语/质检/加标题这类确定性工序统一用低温
 WORK_TEMP = 0.1
 # 忠实风格：长稿成稿不再整篇再生成，改为分块拼接 + 只加标题（见 _add_headings）
@@ -318,6 +319,45 @@ GENERAL_TMPL = """你是专业的中文文字编辑。用户提供一段语音�
 语音转写原文：
 {cleaned}"""
 
+DIGEST_TMPL = """请把下面这份视频转写稿精简成一篇只保留主要内容的文稿。
+
+删除：
+1. 无意义的内容：寒暄客套、口头禅、语气填充、与主题无关的闲聊跑题
+2. 引流/广告话术：求关注点赞转发、加微信/进群/私信领取、报课与机构课程宣传
+3. 废话与重复：同义反复、绕圈子铺垫、说了一半又重说的部分
+4. 非重点枝节：对主线没有支撑作用的细枝末节与题外举例
+
+保留（主要内容，一条不落）：
+- 核心观点与结论
+- 支撑观点的关键事实、数据、案例与操作步骤
+- 重要的条件、边界与注意事项
+
+规则：
+- 保持原文的叙述顺序与原有表述：保留下来的内容用原文的句子，不要改写成摘要腔、不要换成你自己的概括
+- 不新增原文没有的内容，不替作者下原文没有的结论
+- 数字、单位、代码、英文原词保持原样；无法判断的转写疑难处保留原样或标 [?]
+- 输出 Markdown：首行 `# {title}`，按语义用 `##` 分小节；直接输出正文，不要解释
+
+视频信息（仅作纠错参考，不要写进正文）：
+- 标题：{title}
+- 作者：{uploader}
+
+转写稿：
+{cleaned}"""
+
+PROOF_TMPL = """请对下面这份语音转写稿做校对，只修错、不改写：
+1. 修正转写错别字与同音误识（结合上下文判断，专有名词以视频标题为参考）
+2. 补全明显缺失的文字（被吞掉的字、残缺的半句话）；没有把握的保留原样或标 [?]
+3. 补上标点，按语义分段
+4. 内容一字不删：不删减、不精简、不重组结构、不改变措辞与语气，不新增任何内容
+5. 数字、单位、代码、英文原词保持原样
+6. 直接输出校对后的全文：首行 `# {title}`，正文不要加小标题、不要任何解释
+
+视频标题（纠错参考）：{title}
+
+转写稿：
+{cleaned}"""
+
 CLEAN_TMPL = """下面是视频「{title}」转写稿的第 {idx}/{total} 段原始文本（来自语音识别，可能有同音错字、缺标点、口语冗余）。
 
 已知专有名词：{terms}
@@ -473,8 +513,10 @@ INTERVIEW_TMPL = """下面是一段技术类视频的转写稿（已清洗），
 
 STYLES = {
     "general": GENERAL_TMPL,   # 默认：忠实原文的整理文稿
+    "digest": DIGEST_TMPL,     # 精简文稿：删无意义/引流/废话/非重点，只留主要内容
     "article": ARTICLE_TMPL,
     "star": INTERVIEW_TMPL,    # 面试话术：内容判断 + 口语化回答（键沿用历史 star）
+    "proof": PROOF_TMPL,       # 校对文稿：基于原文只修错别字、补缺失字，一字不删
 }
 DEFAULT_STYLE = "general"
 # 各风格专属 system prompt；未列出的风格走全局 SYSTEM（忠实原文铁律）
@@ -760,7 +802,11 @@ def polish(raw: str, meta: dict, style: str = "general", progress=None,
             cleaned_parts.extend(ex.map(work, batch))
     cleaned = "\n\n".join(p for p in cleaned_parts if p.strip())
 
-    if style in FAITHFUL_STYLES:
+    if style == "proof":
+        # 校对文稿：分块清洗的产物本身就是校对稿，拼接后只加一行标题
+        progress("拼接清洗稿")
+        note = f"# {title}\n\n{cleaned}" if title else cleaned
+    elif style in FAITHFUL_STYLES:
         # 忠实风格：清洗稿即成稿，只加标题（带正文指纹校验），不再整篇再生成
         progress("拼接清洗稿并添加标题")
         note = _add_headings(cleaned, title, model)
