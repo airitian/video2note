@@ -28,12 +28,11 @@ PIPELINE_REV = "20261121-q1"
 
 # 分风格温度：忠实类要稳、创作类要放。设置页显式填了温度时以设置页为准
 # （见 _style_temperature），这里只提供未显式设置时的默认值。
-STYLE_TEMPERATURES = {"clean": 0.1, "general": 0.2, "note": 0.3,
-                      "star": 0.35, "article": 0.65}
+STYLE_TEMPERATURES = {"general": 0.2, "star": 0.35, "article": 0.65}
 # 清洗/术语/质检/加标题这类确定性工序统一用低温
 WORK_TEMP = 0.1
 # 忠实风格：长稿成稿不再整篇再生成，改为分块拼接 + 只加标题（见 _add_headings）
-FAITHFUL_STYLES = {"general", "clean"}
+FAITHFUL_STYLES = {"general"}
 
 # 术语抽样：均匀取 5 段。总量随稿长放大（见 _terms_budget）：
 # 旧实现固定共 8000 字，三万字的稿子中后段第一次出现的术语抽样命不中，
@@ -345,26 +344,6 @@ TERMS_TMPL = """从下面这段视频转写稿（标题：{title}）中提取所
 文本：
 {sample}"""
 
-NOTE_TMPL = """请把下面这份已清洗的视频转写稿整理成一篇高质量的结构化中文笔记。
-
-视频信息：
-- 标题：{title}
-- 作者：{uploader}
-- 简介：{description}
-
-输出要求（严格使用 Markdown）：
-1. 首行用 `# {title}`
-2. `## 一句话摘要` — 2-3 句话说清这个视频讲了什么
-3. `## 核心要点` — 5-8 条要点，用 `-` 列表，每条一句话
-4. `## 正文整理` — 按内容逻辑分成 3-6 个 `##` 章节，每章用段落和要点讲清楚，层次分明
-5. `## 关键术语` — 5-10 个术语，各用一句话解释
-6. `## 行动建议` — 可执行的建议用 `-` 列出；没有就写「无」
-7. 语言精炼，彻底去除废话与客套；不得编造原文没有的信息
-8. 不要输出「以下是整理结果」这类开场白，直接给正文
-
-转写稿：
-{cleaned}"""
-
 # 公众号文章风格专属 system：与全局 SYSTEM 的区别是放开「修辞自由」，
 # 只锁死「事实必须来自原文」——否则全局铁律会把钩子/过渡/互动全部压掉，写出干巴巴的缩水版
 ARTICLE_SYSTEM = (
@@ -420,17 +399,6 @@ ARTICLE_TMPL = """下面是一份视频转写稿（已清洗），请基于它�
 - 不得编造原文没有的数据、案例、观点、引用；修辞性过渡可以写，事实性内容必须来自转写稿
 - 保留原作者的核心观点与关键案例，可以重组结构、换表述
 - 直接输出文章正文，不要任何解释、前后缀或"以下是改写结果"之类的话"""
-
-CLEAN_ONLY_TMPL = """这是视频「{title}」的语音转写稿，请做最保守的润色：
-1. 只删口语填充词（嗯、啊、那个、就是说）和明显重复
-2. 删除与主题无关的引流/广告话术（求关注、点赞、加微信、私信领取 等）
-3. 补标点、按语义分段
-4. 修正明显的同音错字
-5. 不重组结构、不删减信息、不新增内容
-6. 输出 Markdown：首行 `# {title}`，之后按语义用 `##` 分小节（保留原讲述顺序）
-
-转写稿：
-{raw}"""
 
 # 面试话术风格专属 system：突破全局「忠实原文」铁律——允许判断完整性、允许修正不严谨说法，
 # 但修正只能靠技术常识、不得引入原文没有的结论；补充只能写通用方法/常见风险/面试追问并标注。
@@ -505,9 +473,7 @@ INTERVIEW_TMPL = """下面是一段技术类视频的转写稿（已清洗），
 
 STYLES = {
     "general": GENERAL_TMPL,   # 默认：忠实原文的整理文稿
-    "note": NOTE_TMPL,
     "article": ARTICLE_TMPL,
-    "clean": CLEAN_ONLY_TMPL,
     "star": INTERVIEW_TMPL,    # 面试话术：内容判断 + 口语化回答（键沿用历史 star）
 }
 DEFAULT_STYLE = "general"
@@ -580,7 +546,7 @@ JUDGE_TMPL = """你是严格的文稿质检员。对照【原文】检查【成�
 REPAIR_TMPL = """质检发现这篇成稿有以下问题：
 {issues}
 
-请根据质检意见输出修正后的完整成稿：补齐遗漏的重要内容（以原文为准）、删除或改写被指出的编造内容、保持原稿的风格与结构。不要解释修改过程，只输出成稿全文。
+请根据质检意见输出修正后的完整成稿：补齐遗漏的重要内容（以原文为准）、删除或改写被指出的编造内容、保持原稿的风格与结构。原稿的标题与章节标题行（如 `## 内容判断`、`## 优化后的回答`）必须原样保留，不得删除、改名或合并。不要解释修改过程，只输出成稿全文。
 
 【原文】
 {source}
@@ -647,7 +613,14 @@ def _judge_and_repair(source: str, note: str, style: str, title: str,
                                   model=model, temperature=_style_temperature(style)))
     except Exception:
         return note
-    return fixed or note
+    if not fixed:
+        return note
+    # 格式护栏：修订稿把原稿的固定章节修丢了，说明这次修订伤了结构，退回原稿
+    if style == "star":
+        for section in ("内容判断", "优化后的回答"):
+            if section in note and section not in fixed:
+                return note
+    return fixed
 
 
 def _strip_fence(text: str) -> str:
@@ -735,7 +708,7 @@ def _carry_block(done: list[str], limit: int = CARRY_CHARS) -> str:
             f"不要重复输出）：\n{tail}\n")
 
 
-def polish(raw: str, meta: dict, style: str = "note", progress=None,
+def polish(raw: str, meta: dict, style: str = "general", progress=None,
            model: str | None = None) -> str:
     """短文本一次完成；长文本 map-reduce：术语抽取 -> 分块清洗 -> 合并成稿
 
@@ -751,15 +724,11 @@ def polish(raw: str, meta: dict, style: str = "note", progress=None,
     if len(raw) <= SHORT_LIMIT:
         tmpl = STYLES.get(style, STYLES[DEFAULT_STYLE])
         temp = _style_temperature(style)
-        if style == "clean":
-            note = _strip_fence(chat(SYSTEM, tmpl.format(title=title, raw=raw),
-                                     model=model, temperature=temp))
-        else:
-            sys_p = STYLE_SYSTEMS.get(style, SYSTEM)
-            note = _strip_fence(chat(sys_p, tmpl.format(
-                title=title, uploader=meta.get("uploader", ""),
-                description=meta.get("description", "")[:300], cleaned=raw),
-                model=model, temperature=temp))
+        sys_p = STYLE_SYSTEMS.get(style, SYSTEM)
+        note = _strip_fence(chat(sys_p, tmpl.format(
+            title=title, uploader=meta.get("uploader", ""),
+            description=meta.get("description", "")[:300], cleaned=raw),
+            model=model, temperature=temp))
         return _judge_and_repair(raw, note, style, title, model, progress)
 
     progress("抽取专有名词，用于纠错")

@@ -10,12 +10,17 @@ from core import llm
 # ---------- 分风格温度 ----------
 
 def test_style_temperature_defaults():
-    assert llm._style_temperature("clean") == 0.1
     assert llm._style_temperature("general") == 0.2
-    assert llm._style_temperature("note") == 0.3
     assert llm._style_temperature("star") == 0.35
     assert llm._style_temperature("article") == 0.65
     assert llm._style_temperature("unknown-style") == 0.3
+
+
+def test_removed_styles_are_gone():
+    # 2026-11-21 按用户要求下线：仅清洗润色（clean）、结构化笔记（note）
+    assert set(llm.STYLES) == {"general", "article", "star"}
+    # 传入已下线风格时回退到默认模板而不是报错
+    assert llm.STYLES.get("clean", llm.STYLES[llm.DEFAULT_STYLE]) is llm.STYLES["general"]
 
 
 def test_style_temperature_user_override_wins():
@@ -97,6 +102,16 @@ def test_judge_garbage_never_blocks(monkeypatch):
     monkeypatch.setattr(llm, "chat", _judge_chat("不是 JSON"))
     out = llm._judge_and_repair("原文", "成稿", "general", "t", None, lambda m: None)
     assert out == "成稿"
+
+
+def test_repair_must_not_drop_star_sections(monkeypatch):
+    # 修订稿把固定章节修丢了 → 退回原稿，不能为了补内容牺牲格式
+    original = "# 问题\n\n## 内容判断\n\n判断。\n\n## 优化后的回答\n\n回答。"
+    monkeypatch.setattr(llm, "chat", _judge_chat(
+        '{"coverage": 50, "fabrications": [], "missing": ["漏了短版"]}',
+        repaired="# 问题\n\n修订后的自由正文，没有章节了。"))
+    out = llm._judge_and_repair("原文", original, "star", "t", None, lambda m: None)
+    assert out == original
 
 
 def test_judge_can_be_disabled(monkeypatch):

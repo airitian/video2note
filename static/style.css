@@ -226,7 +226,7 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 .logs .warn { color: var(--warn); }
 
 /* 对照区：视频与文字稿同一行，左列吸顶，滚动右侧文字稿时视频始终可见 */
-.ws-grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 5fr); gap: 12px; margin-top: 12px; align-items: start; }
+.ws-grid { display: grid; grid-template-columns: minmax(0, 6fr) minmax(0, 4fr); gap: 12px; margin-top: 12px; align-items: start; }
 .pane { padding: 12px 14px; }
 .pane.sticky-pane { position: sticky; top: 12px; }
 .pane-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 12px; font-weight: 600; color: var(--text-3); letter-spacing: .04em; margin-bottom: 10px; }
@@ -442,7 +442,7 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
    视频吸顶时被顶栏盖住一截，这里让到顶栏下方。 */
 .pane.sticky-pane { top: 76px; }
 /* 竖屏视频（抖音多为 9:16）：限高 + contain，长边不再撑爆版面、画面不变形 */
-.video-host video { object-fit: contain; max-height: min(420px, 62vh); max-height: min(420px, 62dvh); margin: 0 auto; }
+.video-host video { object-fit: contain; max-height: min(560px, 74vh); max-height: min(560px, 74dvh); margin: 0 auto; }
 /* 倍速选择器：与面板头其它小按钮同高 */
 .rate-pick { height: 28px; padding: 0 6px; font-size: 12px; border: 1px solid var(--border-strong); border-radius: 7px; background: #fff; color: var(--text); cursor: pointer; }
 
