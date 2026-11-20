@@ -9,21 +9,39 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
+from difflib import SequenceMatcher
 
 import requests
 
-from .config import get_int_clamped, load_settings
+from .config import SETTINGS_FILE, get_int_clamped, load_settings
 
 SHORT_LIMIT = 3000      # 低于此长度一次性完成
 CHUNK_LIMIT = 3500      # map 阶段每块字符数
 
-# 术语抽样：均匀取 5 段、共 8000 字
-# 旧实现只取「首 3000 + 尾 2000」，正中间（比如 40 分钟处）第一次出现的
-# 产品名/术语会整个漏掉——后面所有块都拿不到这个词的写法，纠错就失效了。
+# 管线版本：生成行为（合并方式/温度/质检）变化时递增，纳入缓存签名，
+# 避免旧逻辑生成的缓存成稿在新逻辑上线后继续被当作有效结果复用。
+PIPELINE_REV = "20261121-q1"
+
+# 分风格温度：忠实类要稳、创作类要放。设置页显式填了温度时以设置页为准
+# （见 _style_temperature），这里只提供未显式设置时的默认值。
+STYLE_TEMPERATURES = {"clean": 0.1, "general": 0.2, "note": 0.3,
+                      "star": 0.35, "article": 0.65}
+# 清洗/术语/质检/加标题这类确定性工序统一用低温
+WORK_TEMP = 0.1
+# 忠实风格：长稿成稿不再整篇再生成，改为分块拼接 + 只加标题（见 _add_headings）
+FAITHFUL_STYLES = {"general", "clean"}
+
+# 术语抽样：均匀取 5 段。总量随稿长放大（见 _terms_budget）：
+# 旧实现固定共 8000 字，三万字的稿子中后段第一次出现的术语抽样命不中，
+# 名单还会被截断在 600 字——对应分块的同音错字就修不回来。
 TERMS_TOTAL_CHARS = 8000
+TERMS_MAX_CHARS = 16000
 TERMS_SAMPLES = 5
+TERMS_LIST_LIMIT = 1500
 
 # 块间前文摘要：传递多少字上一段的清洗结果尾部
 # 解决指代断裂（「他刚才提到的那个方案」里的"他/那个方案"指谁），
@@ -38,7 +56,42 @@ class LLMError(RuntimeError):
     pass
 
 
-def _config(model_override: str | None = None) -> dict:
+def _explicit_temperature() -> float | None:
+    """用户显式设置的温度（环境变量或设置页真填过），没有则 None。
+
+    load_settings() 会用默认值 0.3 兜底，无法区分「默认」与「用户就想要
+    0.3」，所以这里直接看原始 settings.json 是否包含该键。
+    """
+    v = os.environ.get("V2N_LLM_TEMPERATURE")
+    if v:
+        try:
+            return float(v)
+        except ValueError:
+            return None
+    try:
+        raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and "llm_temperature" in raw:
+            return float(raw["llm_temperature"])
+    except Exception:
+        pass
+    return None
+
+
+def _style_temperature(style: str) -> float:
+    """本次生成实际使用的温度：用户显式设置优先，否则按风格取默认。"""
+    explicit = _explicit_temperature()
+    if explicit is not None:
+        return min(max(explicit, 0.0), 2.0)
+    return STYLE_TEMPERATURES.get(style, 0.3)
+
+
+def _terms_budget(n_chars: int) -> int:
+    """术语抽样总字数：短稿维持 8000，长稿按一半长度放大、上限 16000。"""
+    return min(TERMS_MAX_CHARS, max(TERMS_TOTAL_CHARS, n_chars // 2))
+
+
+def _config(model_override: str | None = None,
+            temperature: float | None = None) -> dict:
     """汇总一次调用所需的全部配置（每次读取，保证页面改设置后立即生效）"""
     s = load_settings()
     key = (s.get("llm_api_key") or s.get("asr_api_key") or "").strip()
@@ -55,10 +108,13 @@ def _config(model_override: str | None = None) -> dict:
         protocol = "anthropic" if base.endswith("/messages") else "openai"
 
     max_tokens = get_int_clamped(s, "llm_max_tokens", 16384, 256, 131072)
-    try:
-        temp = float(s.get("llm_temperature") or 0.3)
-    except ValueError:
-        temp = 0.3
+    if temperature is not None:
+        temp = min(max(float(temperature), 0.0), 2.0)
+    else:
+        try:
+            temp = float(s.get("llm_temperature") or 0.3)
+        except ValueError:
+            temp = 0.3
 
     return {
         "protocol": protocol,
@@ -203,19 +259,21 @@ def _request(cfg: dict, system: str, user: str, max_retries: int) -> str:
     raise LLMError(f"LLM 调用失败（已重试 {max_retries} 次）：{last}")
 
 
-def chat(system: str, user: str, max_retries: int = 2, model: str | None = None) -> str:
+def chat(system: str, user: str, max_retries: int = 2, model: str | None = None,
+         temperature: float | None = None) -> str:
     """统一入口。
 
     model 是按任务传入的覆盖值（历史任务可能留存了已下线的旧模型名），
     若该模型报错不存在，自动回退到当前配置里的默认模型。
+    temperature 显式传入时覆盖设置页的全局温度（分风格/分工序用）。
     """
-    cfg = _config(model)
+    cfg = _config(model, temperature)
     try:
         return _request(cfg, system, user, max_retries)
     except LLMError as e:
         default_model = (load_settings().get("llm_model") or "").strip()
         if model and default_model and default_model != cfg["model"] and _is_model_error(str(e)):
-            return _request(_config(None), system, user, max_retries)
+            return _request(_config(None, temperature), system, user, max_retries)
         raise
 
 
@@ -460,6 +518,138 @@ STYLE_SYSTEMS = {
 }
 
 
+HEADINGS_TMPL = """下面是一份已清洗定稿的文稿正文。请只做一件事：为它添加 Markdown 标题结构。
+
+规则：
+1. 首行加 `# {title}`
+2. 按语义在段落之间插入 `## 小标题`（3-8 个，简短准确）
+3. 正文一字不改：不增、不删、不改任何一句话、一个标点；不合并、不拆分段落
+4. 只输出加好标题的全文，不要任何解释
+
+正文：
+{text}"""
+
+
+def _content_fingerprint(md: str) -> str:
+    """去掉标题行与全部空白后的正文指纹，用于校验「只加标题没改正文」。"""
+    lines = [ln for ln in md.splitlines() if not ln.lstrip().startswith("#")]
+    return re.sub(r"\s+", "", "\n".join(lines))
+
+
+def _add_headings(text: str, title: str, model: str | None) -> str:
+    """忠实风格的长稿成稿：分块清洗稿直接拼接，只让模型加标题。
+
+    旧做法把整篇清洗稿再喂给模型按模板「重新成稿」，同一风格下成稿长度
+    在原文的 22%~78% 之间漂移（有时逐句保留、有时重写成概述），忠实度
+    不可预期。这里改为：模型只许加标题，产出后用正文指纹校验——与原文
+    相似度 < 0.99（改动超约 1%）即判不合规，退回确定性拼接，保证正文
+    一字不动。校验通过时允许的微小差异仅限标点/空白级别。
+    """
+    fallback = f"# {title}\n\n{text}" if title else text
+    try:
+        out = _strip_fence(chat(SYSTEM, HEADINGS_TMPL.format(title=title or "文稿", text=text),
+                                model=model, temperature=WORK_TEMP))
+    except Exception:
+        return fallback
+    if not out:
+        return fallback
+    ratio = SequenceMatcher(None, _content_fingerprint(text),
+                            _content_fingerprint(out)).ratio()
+    if ratio < 0.99:
+        return fallback
+    if not out.lstrip().startswith("#"):
+        out = f"# {title}\n\n{out}" if title else out
+    return out
+
+
+JUDGE_TMPL = """你是严格的文稿质检员。对照【原文】检查【成稿】的质量，只输出一行 JSON，不要任何解释。
+
+检查维度：
+1. coverage：原文的关键事实、观点、数据在成稿中的覆盖程度，0-100 的整数
+2. fabrications：成稿中出现的、原文没有的事实性内容（数据、案例、经历、结论），逐条简短列出；标题、修辞性过渡、以及标注了 [补充] 的通用补充内容不算编造
+3. missing：原文里重要但成稿漏掉的内容，逐条简短列出，最多 5 条
+
+输出格式：{{"coverage": 92, "fabrications": [], "missing": []}}
+
+【原文】
+{source}
+
+【成稿】
+{note}"""
+
+REPAIR_TMPL = """质检发现这篇成稿有以下问题：
+{issues}
+
+请根据质检意见输出修正后的完整成稿：补齐遗漏的重要内容（以原文为准）、删除或改写被指出的编造内容、保持原稿的风格与结构。不要解释修改过程，只输出成稿全文。
+
+【原文】
+{source}
+
+【原稿】
+{note}"""
+
+JUDGE_MIN_COVERAGE = 85
+
+
+def _parse_judge(raw: str) -> dict | None:
+    """从质检回复里抠出 JSON；解析不了返回 None（按通过处理，绝不拦交付）。"""
+    m = re.search(r"\{.*\}", raw or "", re.DOTALL)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        coverage = int(data.get("coverage"))
+    except (TypeError, ValueError):
+        return None
+    fabs = data.get("fabrications") or []
+    missing = data.get("missing") or []
+    return {"coverage": coverage,
+            "fabrications": [str(x) for x in fabs] if isinstance(fabs, list) else [],
+            "missing": [str(x) for x in missing] if isinstance(missing, list) else []}
+
+
+def _judge_and_repair(source: str, note: str, style: str, title: str,
+                      model: str | None, progress) -> str:
+    """质检闭环：成稿后对照原文查覆盖与编造，不合格带问题清单重写一次。
+
+    质检本身失败（调用异常/JSON 不合规）一律放行原稿——质检是增益，
+    不能成为新的故障点。环境变量 V2N_POLISH_JUDGE=0 可整体关闭。
+    """
+    if os.environ.get("V2N_POLISH_JUDGE") == "0" or not source or not note:
+        return note
+    progress("质检成稿（覆盖与编造）")
+    try:
+        verdict = _parse_judge(chat(SYSTEM, JUDGE_TMPL.format(source=source, note=note),
+                                    model=model, temperature=WORK_TEMP))
+    except Exception:
+        return note
+    if verdict is None:
+        return note
+    issues = []
+    if verdict["coverage"] < JUDGE_MIN_COVERAGE:
+        issues.append(f"覆盖率只有 {verdict['coverage']}（要求 ≥{JUDGE_MIN_COVERAGE}）")
+    for f in verdict["fabrications"]:
+        issues.append(f"疑似编造：{f}")
+    for mitem in verdict["missing"][:5]:
+        issues.append(f"遗漏：{mitem}")
+    if verdict["coverage"] >= JUDGE_MIN_COVERAGE and not verdict["fabrications"]:
+        return note
+    progress(f"质检未过（覆盖 {verdict['coverage']}），按意见修订一次")
+    try:
+        fixed = _strip_fence(chat(STYLE_SYSTEMS.get(style, SYSTEM),
+                                  REPAIR_TMPL.format(issues="\n".join(f"- {i}" for i in issues),
+                                                     source=source, note=note),
+                                  model=model, temperature=_style_temperature(style)))
+    except Exception:
+        return note
+    return fixed or note
+
+
 def _strip_fence(text: str) -> str:
     text = text.strip()
     text = re.sub(r"^```(?:markdown|md)?\s*\n", "", text)
@@ -518,10 +708,11 @@ def _sample_terms(text: str, total: int = TERMS_TOTAL_CHARS,
 
 
 def _extract_terms(raw: str, title: str, model: str | None = None) -> str:
-    sample = _sample_terms(raw)
+    sample = _sample_terms(raw, total=_terms_budget(len(raw)))
     try:
-        out = chat(SYSTEM, TERMS_TMPL.format(title=title, sample=sample), model=model)
-        return out.replace("\n", " ").strip()[:600]
+        out = chat(SYSTEM, TERMS_TMPL.format(title=title, sample=sample),
+                   model=model, temperature=WORK_TEMP)
+        return out.replace("\n", " ").strip()[:TERMS_LIST_LIMIT]
     except Exception:
         return "无"
 
@@ -554,18 +745,24 @@ def polish(raw: str, meta: dict, style: str = "note", progress=None,
     raw = raw.strip()
     if not raw:
         raise LLMError("转写文本为空，无法整理")
+    if progress is None:
+        progress = lambda _msg: None  # noqa: E731  后续环节统一直接调用
 
     if len(raw) <= SHORT_LIMIT:
         tmpl = STYLES.get(style, STYLES[DEFAULT_STYLE])
+        temp = _style_temperature(style)
         if style == "clean":
-            return _strip_fence(chat(SYSTEM, tmpl.format(title=title, raw=raw), model=model))
-        sys_p = STYLE_SYSTEMS.get(style, SYSTEM)
-        return _strip_fence(chat(sys_p, tmpl.format(
-            title=title, uploader=meta.get("uploader", ""),
-            description=meta.get("description", "")[:300], cleaned=raw), model=model))
+            note = _strip_fence(chat(SYSTEM, tmpl.format(title=title, raw=raw),
+                                     model=model, temperature=temp))
+        else:
+            sys_p = STYLE_SYSTEMS.get(style, SYSTEM)
+            note = _strip_fence(chat(sys_p, tmpl.format(
+                title=title, uploader=meta.get("uploader", ""),
+                description=meta.get("description", "")[:300], cleaned=raw),
+                model=model, temperature=temp))
+        return _judge_and_repair(raw, note, style, title, model, progress)
 
-    if progress:
-        progress("抽取专有名词，用于纠错")
+    progress("抽取专有名词，用于纠错")
     terms = _extract_terms(raw, title, model)
 
     chunks = _split_chunks(raw)
@@ -586,7 +783,7 @@ def polish(raw: str, meta: dict, style: str = "note", progress=None,
         def work(i: int, _prev: str = prev) -> str:
             return chat(SYSTEM, CLEAN_TMPL.format(
                 title=title, idx=i + 1, total=total, terms=terms,
-                prev=_prev, chunk=chunks[i]), model=model)
+                prev=_prev, chunk=chunks[i]), model=model, temperature=WORK_TEMP)
 
         if progress:
             progress(f"清洗第 {batch[0] + 1}-{batch[-1] + 1} 段 / 共 {total} 段")
@@ -594,16 +791,19 @@ def polish(raw: str, meta: dict, style: str = "note", progress=None,
             cleaned_parts.extend(ex.map(work, batch))
     cleaned = "\n\n".join(p for p in cleaned_parts if p.strip())
 
-    if progress:
+    if style in FAITHFUL_STYLES:
+        # 忠实风格：清洗稿即成稿，只加标题（带正文指纹校验），不再整篇再生成
+        progress("拼接清洗稿并添加标题")
+        note = _add_headings(cleaned, title, model)
+    else:
         progress("合并并结构化排版")
-    if style == "clean":
-        return _strip_fence(chat(SYSTEM, CLEAN_ONLY_TMPL.format(title=title, raw=cleaned),
-                                model=model))
-    tmpl = STYLES.get(style, STYLES[DEFAULT_STYLE])
-    sys_p = STYLE_SYSTEMS.get(style, SYSTEM)
-    return _strip_fence(chat(sys_p, tmpl.format(
-        title=title, uploader=meta.get("uploader", ""),
-        description=meta.get("description", "")[:300], cleaned=cleaned), model=model))
+        tmpl = STYLES.get(style, STYLES[DEFAULT_STYLE])
+        sys_p = STYLE_SYSTEMS.get(style, SYSTEM)
+        note = _strip_fence(chat(sys_p, tmpl.format(
+            title=title, uploader=meta.get("uploader", ""),
+            description=meta.get("description", "")[:300], cleaned=cleaned),
+            model=model, temperature=_style_temperature(style)))
+    return _judge_and_repair(cleaned, note, style, title, model, progress)
 
 
 # ========== 幂等键 ==========
@@ -622,9 +822,7 @@ def signature(transcript: str, style: str, model: str | None = None) -> str:
     """
     tmpl = STYLES.get(style, STYLES[DEFAULT_STYLE])
     digest = hashlib.sha1(tmpl.encode("utf-8")).hexdigest()[:8]
-    try:
-        temp = str(float(load_settings().get("llm_temperature") or 0.3))
-    except ValueError:
-        temp = "0.3"
-    raw = "\n".join((digest, style, resolve_model(model), temp, transcript or ""))
+    temp = str(_style_temperature(style))
+    raw = "\n".join((digest, style, resolve_model(model), temp,
+                     PIPELINE_REV, transcript or ""))
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
