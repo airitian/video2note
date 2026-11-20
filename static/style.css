@@ -435,3 +435,39 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
   line-height: 1.7; border: 1px solid var(--border, #ddd); border-radius: 8px;
   background: var(--surface, #fff); color: inherit; resize: vertical; }
 .edit-area:focus { outline: none; border-color: var(--primary); }
+
+/* ============ 2026-11-21 布局与易用性优化（列表 / 播放器 / 笔记区） ============ */
+
+/* —— 播放器：吸顶偏移修正。顶栏同为 sticky 且高约 63px，原 top:12px 会让
+   视频吸顶时被顶栏盖住一截，这里让到顶栏下方。 */
+.pane.sticky-pane { top: 76px; }
+/* 竖屏视频（抖音多为 9:16）：限高 + contain，长边不再撑爆版面、画面不变形 */
+.video-host video { object-fit: contain; max-height: min(420px, 62vh); max-height: min(420px, 62dvh); margin: 0 auto; }
+/* 倍速选择器：与面板头其它小按钮同高 */
+.rate-pick { height: 28px; padding: 0 6px; font-size: 12px; border: 1px solid var(--border-strong); border-radius: 7px; background: #fff; color: var(--text); cursor: pointer; }
+
+/* —— 历史列表：日期分组标题（列表内吸顶）、平台标签、运行中迷你进度条、
+   删除键默认弱化（悬停/选中才醒目，不再每行抢注意力） */
+.hgroup { position: sticky; top: 0; z-index: 1; padding: 6px 14px 4px; font-size: 11px; font-weight: 600; letter-spacing: .06em; color: var(--text-3); background: var(--surface); }
+.htag { font-style: normal; padding: 0 5px; border: 1px solid var(--border-strong); border-radius: 4px; font-size: 10px; color: var(--text-2); white-space: nowrap; }
+.hprog { display: block; height: 4px; margin-top: 5px; background: #eceff3; border-radius: 2px; overflow: hidden; }
+.hprog i { display: block; height: 100%; background: var(--primary); border-radius: 2px; transition: width .3s ease; }
+.hdel { opacity: .3; }
+.hitem:hover .hdel, .hitem.on .hdel { opacity: 1; }
+.hmain b { font-size: 13.5px; }
+/* 宽屏时左栏略放宽，标题少截断几个字 */
+@media (min-width: 1440px) { #side-left .side-card { width: 288px; } }
+
+/* —— 文字稿：阅读字号/行距上调；当前播放行加左侧色条，比整行铺色更易定位 */
+.line { font-size: 13.5px; line-height: 1.75; }
+.line time { width: 46px; }
+.line.active { box-shadow: inset 3px 0 0 var(--primary); }
+
+/* —— 生成区吸顶：读稿滚到页面下部时，选风格 / 生成文稿不用滚回去找按钮。
+   top 让开 sticky 顶栏；手机端顶栏两行、更高，单独给值。 */
+.ai-row { position: sticky; top: 64px; z-index: 20; background: var(--bg); padding: 10px 2px; margin: 6px 0 10px; border-bottom: 1px solid var(--border); }
+.ai-tip { margin-top: 0; }
+@media (max-width: 720px) { .ai-row { top: 116px; } }
+
+/* —— AI 文稿限宽：整幅长行不利阅读，正文收在约 800px 内 */
+.note { max-width: 800px; }

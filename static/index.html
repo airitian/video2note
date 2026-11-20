@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#7c3aed">
 <title>抖音 / B站 视频转文字</title>
-<link rel="stylesheet" href="/static/style.css?v=20261121a">
+<link rel="stylesheet" href="/static/style.css?v=20261121c">
 </head>
 <body>
 <header class="topbar">
@@ -88,7 +88,18 @@
 
   <section class="ws-grid">
     <div class="card pane sticky-pane">
-      <div class="pane-head">视频预览</div>
+      <div class="pane-head">视频预览
+        <span class="tools">
+          <select id="rate-pick" class="rate-pick" title="播放速度">
+            <option value="0.75">0.75×</option>
+            <option value="1" selected>1×</option>
+            <option value="1.25">1.25×</option>
+            <option value="1.5">1.5×</option>
+            <option value="2">2×</option>
+          </select>
+          <button class="btn small" id="btn-pip" title="画中画：小窗悬浮播放，边看边读稿">画中画</button>
+        </span>
+      </div>
       <div id="video-host" class="video-host"><div class="empty">暂无视频</div></div>
     </div>
     <div class="card pane">
@@ -116,6 +127,7 @@
       <span class="tools">
         <span id="note-meta" class="count-meta"></span>
         <button class="btn small" data-act="copy">复制</button>
+        <button class="btn small" data-act="download">下载 .md</button>
       </span>
     </div>
     <div id="note-body" class="note"><div class="empty">转写完成后，在上方选一种风格点「生成文稿」</div></div>
@@ -198,6 +210,6 @@
 
 <div id="toast" class="toast hidden"></div>
 
-<script src="/static/app.js?v=20261121a"></script>
+<script src="/static/app.js?v=20261121c"></script>
 </body>
 </html>

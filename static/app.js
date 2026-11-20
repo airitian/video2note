@@ -409,12 +409,34 @@
       box.scrollTop = keepTop;
       return;
     }
+    // 日期分组（今天 / 昨天 / 更早）：长列表里先定位到天，再找条目；
+    // 组标题在列表滚动时吸顶。平台做成小标签，比混在文本里好认。
+    const nowD = new Date();
+    const dayStart = new Date(nowD.getFullYear(), nowD.getMonth(), nowD.getDate()).getTime() / 1000;
+    const yStart = dayStart - 86400;
+    const bucketOf = (ts) => (ts >= dayStart ? "今天" : ts >= yStart ? "昨天" : "更早");
+    const PLAT = { douyin: "抖音", bilibili: "B站", local: "本地" };
+    let lastBucket = null;
     box.innerHTML = list.map((t) => {
       const when = new Date((t.created_at || 0) * 1000);
       const time = isNaN(when.getTime()) ? "" : when.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-      return '<div class="hitem' + (t.id === currentId ? " on" : "") + '" data-id="' + t.id + '">' +
+      let head = "";
+      const b = bucketOf(t.created_at || 0);
+      if (b !== lastBucket) { lastBucket = b; head = '<div class="hgroup">' + b + "</div>"; }
+      const parts = [];
+      if (time) parts.push(esc(time));
+      const plat = PLAT[t.platform];
+      if (plat) parts.push('<i class="htag">' + plat + "</i>");
+      if (t.meta && t.meta.duration) parts.push(fmtTime(Number(t.meta.duration) || 0));
+      if (t.meta && t.meta.uploader) parts.push(esc(t.meta.uploader));
+      const running = t.status === "running" || t.status === "pending";
+      const pct = Math.max(0, Math.min(100, Math.round(t.percent || t.spercent || 0)));
+      return head +
+        '<div class="hitem' + (t.id === currentId ? " on" : "") + '" data-id="' + t.id + '">' +
         '<div class="hmain"><b>' + esc((t.meta && t.meta.title) || t.url || "(无标题)") + '</b>' +
-        '<span>' + esc(time) + " · " + esc((t.meta && t.meta.uploader) || t.platform || "") + '</span></div>' +
+        '<span>' + parts.join(" · ") + '</span>' +
+        (running ? '<span class="hprog"><i style="width:' + pct + '%"></i></span>' : "") +
+        '</div>' +
         '<span class="hstatus ' + esc(t.status) + '">' + esc(STATUS_TEXT[t.status] || t.status) + '</span>' +
         '<button class="icon hdel" data-del="' + t.id + '" title="删除">×</button>' +
         "</div>";
@@ -541,6 +563,9 @@
       + currentId + "/" + encodeURIComponent(fname) + '"></' + kind + '>';
     ws.videoEl = host.querySelector(kind);
     if (kind === "video" && ws.videoEl) {
+      // 恢复上次的倍速选择（倍速控件在视频面板头部）
+      const savedRate = parseFloat(localStorage.getItem("v2n_rate") || "1");
+      if (savedRate && savedRate !== 1) ws.videoEl.playbackRate = savedRate;
       ws.videoEl.addEventListener("timeupdate", () => syncActive(ws.videoEl.currentTime));
       ws.videoEl.addEventListener("seeked", () => syncActive(ws.videoEl.currentTime, true));
     } else {
@@ -1464,6 +1489,23 @@ if (rest.length) {
           toast(ok ? "已复制" : "复制失败，请手动选中文稿复制", !ok);
         });
       }
+      if (a === "download") {
+        const t = tasks.get(currentId);
+        const text = noteForStyle(t, curStyle) || (t && t.note) || "";
+        if (!text) { toast("还没有可下载的文稿", true); return; }
+        // 直接用内存里当前展示的这一版生成文件，不走后端导出：
+        // 与「复制」同源，保证下到的就是屏幕上看到的风格与内容。
+        const title = ((t && t.meta && t.meta.title) || "文稿").replace(/[\\/:*?"<>|]/g, "_").slice(0, 60);
+        const blob = new Blob([text], { type: "text/markdown;charset=utf-8" });
+        const aEl = document.createElement("a");
+        aEl.href = URL.createObjectURL(blob);
+        aEl.download = title + ".md";
+        document.body.appendChild(aEl);
+        aEl.click();
+        aEl.remove();
+        setTimeout(() => URL.revokeObjectURL(aEl.href), 4000);
+        toast("已下载 .md");
+      }
       return;
     }
     if (e.target.closest("#health")) {
@@ -1541,6 +1583,23 @@ if (rest.length) {
   // 转写编辑弹窗
   const editBtn = $("#btn-edit-transcript");
   if (editBtn) editBtn.addEventListener("click", openTranscriptEdit);
+  // 播放器倍速：选择即生效并记住（localStorage），换任务时 ensureVideo 恢复
+  const ratePick = $("#rate-pick");
+  if (ratePick) {
+    ratePick.value = localStorage.getItem("v2n_rate") || "1";
+    ratePick.addEventListener("change", () => {
+      localStorage.setItem("v2n_rate", ratePick.value);
+      if (ws.videoEl) ws.videoEl.playbackRate = parseFloat(ratePick.value) || 1;
+    });
+  }
+  // 画中画：小窗悬浮播放，边看边往下读稿（仅视频元素支持）
+  const pipBtn = $("#btn-pip");
+  if (pipBtn) pipBtn.addEventListener("click", async () => {
+    const v = ws.videoEl;
+    if (!v || v.tagName !== "VIDEO") { toast("当前没有可画中画的视频", true); return; }
+    try { await v.requestPictureInPicture(); }
+    catch (e) { toast("画中画不可用（浏览器限制）", true); }
+  });
   const saveEditBtn = $("#btn-save-edit");
   if (saveEditBtn) saveEditBtn.addEventListener("click", saveTranscriptEdit);
   ["#btn-close-edit", "#btn-cancel-edit"].forEach((sel) => {
