@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-from .config import load_settings
+from .config import get_int_clamped, load_settings
 
 SHORT_LIMIT = 3000      # 低于此长度一次性完成
 CHUNK_LIMIT = 3500      # map 阶段每块字符数
@@ -54,10 +54,7 @@ def _config(model_override: str | None = None) -> dict:
         # 自动判断：地址以 /messages 结尾视为 Anthropic，其余按 OpenAI 处理
         protocol = "anthropic" if base.endswith("/messages") else "openai"
 
-    try:
-        max_tokens = int(float(s.get("llm_max_tokens") or 8192))
-    except ValueError:
-        max_tokens = 8192
+    max_tokens = get_int_clamped(s, "llm_max_tokens", 16384, 256, 131072)
     try:
         temp = float(s.get("llm_temperature") or 0.3)
     except ValueError:
@@ -573,7 +570,7 @@ def polish(raw: str, meta: dict, style: str = "note", progress=None,
 
     chunks = _split_chunks(raw)
     total = len(chunks)
-    maxw = max(min(int(load_settings().get("max_concurrency") or 4), 8), 1)
+    maxw = get_int_clamped(load_settings(), "max_concurrency", 4, 1, 8)
 
     if progress:
         progress(f"分 {total} 块清洗文本")

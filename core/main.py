@@ -542,7 +542,11 @@ def post_settings(body: SettingsIn):
             curl_summary = summarize(parse_curl(raw_curl))
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"curl 模板无法识别：{e}")
-    save_settings(body.values, clear_secrets=set(body.clear))
+    try:
+        save_settings(body.values, clear_secrets=set(body.clear))
+    except ValueError as e:
+        # 数值配置非法（类型/范围）：明确 400，而不是把坏值写进配置文件
+        raise HTTPException(status_code=400, detail=str(e))
     # Cookie 文本有变化时立刻落盘，供后续下载使用。
     # 即使被清空也要调一次——ensure_cookie_file 内部会删掉残留文件，
     # 否则页面显示「未配置」、下载却仍在用旧 Cookie。

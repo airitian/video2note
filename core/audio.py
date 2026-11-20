@@ -19,9 +19,29 @@ _ffmpeg_cache: tuple[float, bool, str] | None = None
 _FFMPEG_TTL = 60.0
 
 
+def _ffmpeg_timeout() -> float:
+    """ffmpeg/ffprobe 子进程总超时（秒），环境变量 V2N_FFMPEG_TIMEOUT 覆盖。
+
+    没有墙钟超时时，一个挂死的 ffmpeg 就能永久占住仅有的转写 worker
+    之一（历史上死锁事故的同构触发点）。默认 1800 秒足够任何正常转码。
+    """
+    import os
+    try:
+        v = float((os.getenv("V2N_FFMPEG_TIMEOUT") or "").strip() or 1800)
+    except ValueError:
+        v = 1800.0
+    return max(10.0, v)
+
+
 def _run(args: list[str]) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+        return subprocess.run(args, capture_output=True, text=True,
+                              encoding="utf-8", errors="ignore",
+                              timeout=_ffmpeg_timeout())
+    except subprocess.TimeoutExpired:
+        # 明确异常而不是静默失败：调用方据此把任务标失败并释放 worker
+        raise AudioError(
+            f"ffmpeg 执行超时（>{_ffmpeg_timeout():.0f}s），已终止子进程：{args[0]}")
     except FileNotFoundError:
         # 可执行文件不存在（例如只装了 ffmpeg 没有 ffprobe），交由调用方走兜底逻辑
         return subprocess.CompletedProcess(args, 127, "", f"executable not found: {args[0]}")
@@ -100,15 +120,21 @@ def check_ffmpeg() -> None:
 
 
 def probe_duration(path: Path) -> float:
-    r = _run([ff_bin("ffprobe"), "-v", "quiet", "-print_format", "json",
-              "-show_format", str(path)])
+    try:
+        r = _run([ff_bin("ffprobe"), "-v", "quiet", "-print_format", "json",
+                  "-show_format", str(path)])
+    except AudioError:
+        return 0.0     # 超时/不可用：按探测不到处理，调用方会走校验失败分支
     if r.returncode == 0:
         try:
             return float(json.loads(r.stdout)["format"]["duration"])
         except Exception:
             pass
     # 没有 ffprobe 时，用 ffmpeg -i 的 Duration 行兜底
-    r2 = _run([ff_bin("ffmpeg"), "-hide_banner", "-i", str(path)])
+    try:
+        r2 = _run([ff_bin("ffmpeg"), "-hide_banner", "-i", str(path)])
+    except AudioError:
+        return 0.0
     m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", r2.stderr or "")
     if m:
         return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))

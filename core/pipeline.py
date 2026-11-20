@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import asr, audio, downloader, llm, store
-from .config import MEDIA_DIR, load_settings
+from .config import MEDIA_DIR, get_int_clamped, load_settings
 
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="v2n")
 
@@ -168,24 +168,20 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
         _set(t, "extracting", 1.0, "音频提取完成", emit=emit)
 
     _set(t, "slicing", 0.0, "音频标准化与切片", emit=emit)
-    try:
-        chunk_seconds = int(s.get("chunk_seconds") or 180)
-    except ValueError:
-        chunk_seconds = 180
+    # 数值一律走钳制读取：chunk_seconds=0 曾能让切片原地打转、
+    # max_concurrency 非数字曾让每个新任务抛 ValueError 全站失败。
+    chunk_seconds = get_int_clamped(s, "chunk_seconds", 180, 10, 600)
     # 首片单独取短，让第一句话尽快出现。ASR 耗时与音频长度近似成正比，
     # 180 秒的片要等 30~60 秒才出第一句；首片压到 15 秒则约 3~6 秒。
     # 代价是多几次调用，但切片与转写并行后总时长反而更短。
-    try:
-        first_seconds = int(s.get("first_chunk_seconds") or 15)
-    except ValueError:
-        first_seconds = 15
-    first_seconds = max(5, min(first_seconds, chunk_seconds))
+    first_seconds = get_int_clamped(s, "first_chunk_seconds", 15, 5, 600)
+    first_seconds = min(first_seconds, chunk_seconds)
 
     _check_cancel(t)
     _set(t, "transcribing", 0.0, "开始语音转写", emit=emit)
     lang = t.options.get("language") or "auto"
     model = t.options.get("asr_model") or None
-    maxw = min(int(s.get("max_concurrency") or 4), 8)
+    maxw = get_int_clamped(s, "max_concurrency", 4, 1, 8)
 
     segments: list[dict] = []
     done = 0
