@@ -13,7 +13,6 @@ import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
-from difflib import SequenceMatcher
 
 import requests
 
@@ -28,12 +27,10 @@ PIPELINE_REV = "20261121-q1"
 
 # 分风格温度：忠实类要稳、创作类要放。设置页显式填了温度时以设置页为准
 # （见 _style_temperature），这里只提供未显式设置时的默认值。
-STYLE_TEMPERATURES = {"general": 0.2, "digest": 0.3, "star": 0.35,
-                      "article": 0.65, "proof": 0.1}
-# 清洗/术语/质检/加标题这类确定性工序统一用低温
+STYLE_TEMPERATURES = {"general": 0.1, "digest": 0.3, "star": 0.35,
+                      "article": 0.65}
+# 清洗/术语/质检这类确定性工序统一用低温
 WORK_TEMP = 0.1
-# 忠实风格：长稿成稿不再整篇再生成，改为分块拼接 + 只加标题（见 _add_headings）
-FAITHFUL_STYLES = {"general"}
 
 # 术语抽样：均匀取 5 段。总量随稿长放大（见 _terms_budget）：
 # 旧实现固定共 8000 字，三万字的稿子中后段第一次出现的术语抽样命不中，
@@ -294,29 +291,18 @@ SYSTEM = (
 )
 
 # 默认风格：忠实原文的「整理文稿」，不额外提炼摘要/要点板块
-GENERAL_TMPL = """你是专业的中文文字编辑。用户提供一段语音转写原文，请整理成便于阅读的文稿：
-1) 去除口头语、重复、无意义的语气词和废话；
-2) 去除引流/广告类与主题无关的引导性内容；
-3) 修正错别字与明显的转写错误；
-4) 按语义分段，必要时用 Markdown 小标题组织；
-5) 严格保留原意与全部事实信息，不添加原文没有的内容；
-6) 直接输出整理后的 Markdown 正文，不要任何解释、前言或后缀。
+GENERAL_TMPL = """请对下面这份语音转写稿做校对整理，只修错、不改写：
+1. 修正转写错别字与同音误识（结合上下文判断，专有名词以视频标题为参考）
+2. 补全明显缺失的文字（被吞掉的字、残缺的半句话）；没有把握的保留原样或标 [?]
+3. 删除纯语气填充与引流话术（嗯、啊、求关注点赞、加微信私信领取等无信息内容）
+4. 补上标点，按语义分段
+5. 其余内容一字不删：不精简、不重组结构、不改变措辞与语气，不新增任何内容
+6. 数字、单位、代码、英文原词保持原样
+7. 直接输出整理后的全文：首行 `# {title}`，正文不要加小标题、不要任何解释
 
-补充约束：
-- 引流/广告包括：求关注点赞转发、加微信/进群/私信领取、评论区置顶链接、报课引导，
-  以及具体机构或课程的宣传话术（师资、助教、接单渠道、收益承诺等）；
-  作者自述的经历、收入数字、操作步骤不属于广告，必须保留
-- 数字、单位、金额、代码、英文原词保持原样
-- 保持原有叙述顺序与人称，不要改变作者的观点与语气
-- 无法判断的转写疑难处保留原样或标 [?]，不要臆测
-- 文首可加一个 `# ` 标题，不要写「以下是整理结果」之类的话
-- 下面的视频信息仅用于纠错参考，不要写进正文
+视频标题（纠错参考）：{title}
 
-视频信息：
-- 标题：{title}
-- 作者：{uploader}
-
-语音转写原文：
+转写稿：
 {cleaned}"""
 
 DIGEST_TMPL = """请把下面这份视频转写稿精简成一篇只保留主要内容的文稿。
@@ -341,19 +327,6 @@ DIGEST_TMPL = """请把下面这份视频转写稿精简成一篇只保留主要
 视频信息（仅作纠错参考，不要写进正文）：
 - 标题：{title}
 - 作者：{uploader}
-
-转写稿：
-{cleaned}"""
-
-PROOF_TMPL = """请对下面这份语音转写稿做校对，只修错、不改写：
-1. 修正转写错别字与同音误识（结合上下文判断，专有名词以视频标题为参考）
-2. 补全明显缺失的文字（被吞掉的字、残缺的半句话）；没有把握的保留原样或标 [?]
-3. 补上标点，按语义分段
-4. 内容一字不删：不删减、不精简、不重组结构、不改变措辞与语气，不新增任何内容
-5. 数字、单位、代码、英文原词保持原样
-6. 直接输出校对后的全文：首行 `# {title}`，正文不要加小标题、不要任何解释
-
-视频标题（纠错参考）：{title}
 
 转写稿：
 {cleaned}"""
@@ -512,11 +485,10 @@ INTERVIEW_TMPL = """下面是一段技术类视频的转写稿（已清洗），
 - 直接输出正文，不要「以下是改写结果」之类的开场白"""
 
 STYLES = {
-    "general": GENERAL_TMPL,   # 默认：忠实原文的整理文稿
+    "general": GENERAL_TMPL,   # 整理文稿（默认，第一位）：基于原文校对，只修错补缺、一字不删
     "digest": DIGEST_TMPL,     # 精简文稿：删无意义/引流/废话/非重点，只留主要内容
     "article": ARTICLE_TMPL,
     "star": INTERVIEW_TMPL,    # 面试话术：内容判断 + 口语化回答（键沿用历史 star）
-    "proof": PROOF_TMPL,       # 校对文稿：基于原文只修错别字、补缺失字，一字不删
 }
 DEFAULT_STYLE = "general"
 # 各风格专属 system prompt；未列出的风格走全局 SYSTEM（忠实原文铁律）
@@ -524,50 +496,6 @@ STYLE_SYSTEMS = {
     "article": ARTICLE_SYSTEM,
     "star": INTERVIEW_SYSTEM,
 }
-
-
-HEADINGS_TMPL = """下面是一份已清洗定稿的文稿正文。请只做一件事：为它添加 Markdown 标题结构。
-
-规则：
-1. 首行加 `# {title}`
-2. 按语义在段落之间插入 `## 小标题`（3-8 个，简短准确）
-3. 正文一字不改：不增、不删、不改任何一句话、一个标点；不合并、不拆分段落
-4. 只输出加好标题的全文，不要任何解释
-
-正文：
-{text}"""
-
-
-def _content_fingerprint(md: str) -> str:
-    """去掉标题行与全部空白后的正文指纹，用于校验「只加标题没改正文」。"""
-    lines = [ln for ln in md.splitlines() if not ln.lstrip().startswith("#")]
-    return re.sub(r"\s+", "", "\n".join(lines))
-
-
-def _add_headings(text: str, title: str, model: str | None) -> str:
-    """忠实风格的长稿成稿：分块清洗稿直接拼接，只让模型加标题。
-
-    旧做法把整篇清洗稿再喂给模型按模板「重新成稿」，同一风格下成稿长度
-    在原文的 22%~78% 之间漂移（有时逐句保留、有时重写成概述），忠实度
-    不可预期。这里改为：模型只许加标题，产出后用正文指纹校验——与原文
-    相似度 < 0.99（改动超约 1%）即判不合规，退回确定性拼接，保证正文
-    一字不动。校验通过时允许的微小差异仅限标点/空白级别。
-    """
-    fallback = f"# {title}\n\n{text}" if title else text
-    try:
-        out = _strip_fence(chat(SYSTEM, HEADINGS_TMPL.format(title=title or "文稿", text=text),
-                                model=model, temperature=WORK_TEMP))
-    except Exception:
-        return fallback
-    if not out:
-        return fallback
-    ratio = SequenceMatcher(None, _content_fingerprint(text),
-                            _content_fingerprint(out)).ratio()
-    if ratio < 0.99:
-        return fallback
-    if not out.lstrip().startswith("#"):
-        out = f"# {title}\n\n{out}" if title else out
-    return out
 
 
 JUDGE_TMPL = """你是严格的文稿质检员。对照【原文】检查【成稿】的质量，只输出一行 JSON，不要任何解释。
@@ -802,14 +730,11 @@ def polish(raw: str, meta: dict, style: str = "general", progress=None,
             cleaned_parts.extend(ex.map(work, batch))
     cleaned = "\n\n".join(p for p in cleaned_parts if p.strip())
 
-    if style == "proof":
-        # 校对文稿：分块清洗的产物本身就是校对稿，拼接后只加一行标题
+    if style == "general":
+        # 整理文稿：分块清洗的产物本身就是校对稿，拼接后只加一行标题，
+        # 不再整篇再生成——避免同一风格下成稿长度大幅漂移、内容被重写
         progress("拼接清洗稿")
         note = f"# {title}\n\n{cleaned}" if title else cleaned
-    elif style in FAITHFUL_STYLES:
-        # 忠实风格：清洗稿即成稿，只加标题（带正文指纹校验），不再整篇再生成
-        progress("拼接清洗稿并添加标题")
-        note = _add_headings(cleaned, title, model)
     else:
         progress("合并并结构化排版")
         tmpl = STYLES.get(style, STYLES[DEFAULT_STYLE])
