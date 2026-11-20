@@ -5,6 +5,7 @@ import asyncio
 import hmac
 import json
 import logging
+import os
 import re
 import shutil
 import threading
@@ -115,12 +116,22 @@ def _archive_loop() -> None:
     """每天跑一次归档清理，回收冷任务的源视频占用。
 
     独立于请求线程：即便某轮上传很慢，也不会拖慢任何页面操作。
+    两条清理线并行：
+    - 七牛归档 cleanup：已备份且超保留期的源文件删本地（需配七牛）；
+    - 本地 TTL 清理 local_ttl_cleanup：不依赖七牛，终态任务媒体超过
+      V2N_MEDIA_TTL_DAYS（默认 7 天）直接删——启动时先跑一次，之后每轮都跑。
     """
-    from .qiniu_archive import cleanup
+    from .qiniu_archive import cleanup, local_ttl_cleanup
     time.sleep(90)          # 服务刚起来，先别抢占资源
     log = logging.getLogger("uvicorn.error")
+    first = True
     while not _ARCHIVE_STOP.is_set():
         try:
+            lt = local_ttl_cleanup()
+            if lt.get("removed"):
+                log.info(f"本地 TTL 清理{'（启动首跑）' if first else ''}："
+                         f"删除 {lt['removed']} 个过期媒体文件，"
+                         f"释放 {(lt.get('freed') or 0) / 1048576:.1f} MB")
             s = cleanup()
             # 未配置凭据只是「功能没开」，天天写日志很吵，静默即可
             if not s.get("reason"):
@@ -131,6 +142,7 @@ def _archive_loop() -> None:
                              f"{len(skipped)} 个因校验未通过保留本地")
         except Exception as e:      # noqa: BLE001 - 后台线程不该把进程带崩
             logging.getLogger("uvicorn.error").warning(f"媒体归档异常：{e}")
+        first = False
         _ARCHIVE_STOP.wait(86400)
 
 
@@ -779,6 +791,32 @@ def create_task(body: CreateIn, request: Request):
                        visible=lambda t: _can_view(request, t))
 
 
+def _max_upload_bytes() -> int:
+    """上传体积上限（字节），环境变量 V2N_MAX_UPLOAD_MB，默认 500MB。
+
+    旧实现无上限：未鉴权时代任何人都能写满磁盘；现在有令牌也仍需
+    给单个文件封顶。非法配置回退默认。
+    """
+    raw = (os.getenv("V2N_MAX_UPLOAD_MB") or "").strip()
+    try:
+        mb = float(raw) if raw else 500.0
+    except ValueError:
+        mb = 500.0
+    return int(max(1.0, mb) * 1048576)
+
+
+def _check_content_length(request: Request) -> None:
+    """Content-Length 预检：声明就超限的请求不落盘直接 413。"""
+    cl = request.headers.get("content-length")
+    if cl:
+        try:
+            if int(cl) > _max_upload_bytes():
+                raise HTTPException(
+                    413, f"文件超过上传上限 {_max_upload_bytes() // 1048576} MB")
+        except ValueError:
+            pass
+
+
 @app.post("/api/tasks/upload")
 async def upload_task(
     request: Request,
@@ -790,16 +828,25 @@ async def upload_task(
     name = (file.filename or "").strip()
     if not name:
         raise HTTPException(400, "请选择要上传的文件")
+    _check_content_length(request)
     t = store.create(name, "local", _task_options(style, language, model),
                      owner=token_identity(_extract_token(request)))
     suffix = Path(name).suffix.lower() or ".bin"
     dest = MEDIA_DIR / t.id / f"source{suffix}"
     dest.parent.mkdir(parents=True, exist_ok=True)
     size = 0
-    with dest.open("wb") as out:
-        while chunk := await file.read(1024 * 1024):
-            out.write(chunk)
-            size += len(chunk)
+    limit = _max_upload_bytes()
+    try:
+        with dest.open("wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > limit:    # 流式计数：声明与实际不符也拦得住
+                    raise HTTPException(413, f"文件超过上传上限 {limit // 1048576} MB")
+                out.write(chunk)
+    except BaseException:
+        store.remove(t.id)
+        shutil.rmtree(MEDIA_DIR / t.id, ignore_errors=True)
+        raise
     if size == 0:
         store.remove(t.id)
         shutil.rmtree(MEDIA_DIR / t.id, ignore_errors=True)
@@ -827,17 +874,21 @@ async def upload_task_raw(
     """
     # 文件名只取 basename，剥掉任何路径成分，防止怪名字写出目录
     name = Path(name.replace("\\", "/")).name.strip() or "upload.bin"
+    _check_content_length(request)
     t = store.create(name, "local", _task_options(style, language, model),
                      owner=token_identity(_extract_token(request)))
     suffix = Path(name).suffix.lower() or ".bin"
     dest = MEDIA_DIR / t.id / f"source{suffix}"
     dest.parent.mkdir(parents=True, exist_ok=True)
     size = 0
+    limit = _max_upload_bytes()
     try:
         with dest.open("wb") as out:
             async for chunk in request.stream():
-                out.write(chunk)
                 size += len(chunk)
+                if size > limit:    # 超限立即中止并删半成品（下方统一清理）
+                    raise HTTPException(413, f"文件超过上传上限 {limit // 1048576} MB")
+                out.write(chunk)
     except BaseException:
         store.remove(t.id)
         shutil.rmtree(MEDIA_DIR / t.id, ignore_errors=True)

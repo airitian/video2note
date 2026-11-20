@@ -37,8 +37,12 @@ from pathlib import Path
 
 _log = logging.getLogger("uvicorn.error")
 
-# 归档目标文件的后缀（用户选定：只归档源视频 source.*）
-_SOURCE_GLOBS = ("source.*",)
+# 归档/清理目标：任务的全部媒体文件。旧实现只管 source.*（上传任务的
+# 源文件），链接任务的大头 video.mp4 / audio.mp3 永远不在范围内、
+# 永不释放——磁盘不闭环的主因。现在统一覆盖全部媒体产物；
+# atrack.*/vtrack.* 含下载时的 *.info.json 元数据文件。
+_SOURCE_GLOBS = ("source.*", "video.mp4", "video_h264.mp4", "audio.mp3",
+                 "atrack.*", "vtrack.*")
 
 _UPLOAD_TOKEN_TTL = 3600
 _STAT_RETRY = 3
@@ -128,10 +132,11 @@ def stat_size(key: str, c: dict) -> int | None:
 
 
 def _source_files(media_dir: Path) -> list[Path]:
+    """任务目录内的全部媒体文件（归档、清理、状态统计共用同一口径）。"""
     out = []
     for pat in _SOURCE_GLOBS:
         out.extend(p for p in media_dir.glob(pat) if p.is_file())
-    return sorted(out)
+    return sorted(set(out))
 
 
 def _human(n: int) -> str:
@@ -190,9 +195,10 @@ def backup_source(t, *, c: dict | None = None) -> dict:
             continue
         key = object_key(t.id, f.name, c["prefix"])
         prev = known.get(f.name)
-        # 已记过且云端大小仍对得上，就不重复传（幂等，省流量）
+        # 已记过且云端大小仍对得上，就不重复传（幂等，省流量）。
+        # 归属记录认 key（新）或 url（旧数据兼容）任一存在即可。
         if isinstance(prev, dict) and int(prev.get("size") or 0) == size \
-                and (prev.get("url") or "").startswith("http"):
+                and (prev.get("key") or prev.get("url")):
             continue
         remote = stat_size(key, c)
         okay = (remote == size)
@@ -207,8 +213,9 @@ def backup_source(t, *, c: dict | None = None) -> dict:
             res["skipped"] = (f"{f.name} 云端校验不一致 "
                               f"(本地 {size} / 云端 {remote})，稍后重试")
             continue
-        url = public_url(key, c["domain"])
-        info = {"url": url, "key": key, "size": size, "at": int(time.time())}
+        # meta 只存对象 key，不存任何 URL：签名 URL 会过期、公开 URL
+        # 可由 key + domain 现算，落盘存 URL 只会留下长期有效的凭证。
+        info = {"key": key, "size": size, "at": int(time.time())}
         fresh[f.name] = info
         res["archived"].append(info)
         res["state"] = "ok"
@@ -343,7 +350,8 @@ def archive_task(t, *, dry_run: bool = False, c: dict | None = None
             continue
 
         url = public_url(key, c["domain"])
-        archived_map[f.name] = {"url": url, "size": size, "at": int(time.time())}
+        # 持久化只存 key（url 仅用于本次响应/日志，不进 meta）
+        archived_map[f.name] = {"key": key, "size": size, "at": int(time.time())}
 
         if dry_run:
             res["archived"].append({"name": f.name, "key": key, "url": url,
@@ -425,11 +433,93 @@ def cleanup(days: int | None = None, *, dry_run: bool = False,
 
 
 def remote_info(t, name: str) -> dict | None:
-    """该文件在云端的归档信息（含 url / size / key），没有则 None。"""
+    """该文件在云端的归档信息（key / size + 按需现生成的 url），没有则 None。
+
+    meta 里只存 key：播放用的 URL 在这里现算——优先 S3 预签名（短时效），
+    失败则回退公开域名直链或旧数据里存过的 url（仅作兼容，新数据不再写）。
+    """
     m = ((t.meta or {}).get("archived") or {}).get(name)
-    if isinstance(m, dict) and (m.get("url") or "").startswith("http"):
-        return m
-    return None
+    if not isinstance(m, dict):
+        return None
+    key = s3_key_from(m)
+    if not key:
+        return None
+    url = s3_presign_url(m) or (m.get("url") or "") \
+        or public_url(key, cfg()["domain"])
+    if not url.startswith("http"):
+        return None
+    return {"key": key, "size": m.get("size"), "url": url}
+
+
+# ============================ 本地 TTL 清理（不依赖七牛） ============================
+
+def media_ttl_days() -> int:
+    """本地媒体保留天数，环境变量 V2N_MEDIA_TTL_DAYS，默认 7；<=0 关闭。"""
+    import os
+    raw = (os.getenv("V2N_MEDIA_TTL_DAYS") or "").strip()
+    if not raw:
+        return 7
+    try:
+        return int(float(raw))
+    except ValueError:
+        return 7
+
+
+def local_ttl_cleanup(ttl_days: int | None = None, *,
+                      dry_run: bool = False) -> dict:
+    """纯本地清理：终态任务的媒体超过 TTL 一律删除（不依赖七牛配置）。
+
+    旧形态下未配七牛 = 一个字节都不删，磁盘只涨不跌。这里与云端归档
+    并行：归档管「有云端副本才删」，TTL 管「太老了本地直接删」——
+    任务记录与成稿文本（在 TASK_DIR 的 JSON 里）保留，只删 MEDIA_DIR
+    下的媒体文件。删前校验每个文件的真实路径必须落在 media 目录内。
+    """
+    from .config import MEDIA_DIR
+    from . import store
+
+    if ttl_days is None:
+        ttl_days = media_ttl_days()
+    summary = {"ttl_days": ttl_days, "dry_run": dry_run, "scanned": 0,
+               "matched": 0, "removed": 0, "freed": 0, "reason": ""}
+    if ttl_days <= 0:
+        summary["reason"] = "V2N_MEDIA_TTL_DAYS <= 0，本地 TTL 清理已关闭"
+        return summary
+    media_root = MEDIA_DIR.resolve()
+    cutoff = time.time() - ttl_days * 86400
+    final_ok = {"done", "transcribed", "failed", "canceled"}
+    for t in store.list_tasks():
+        summary["scanned"] += 1
+        if t.status not in final_ok:
+            continue
+        last = float(getattr(t, "updated_at", 0) or 0)
+        if last <= 0 or last > cutoff:
+            continue
+        mdir = MEDIA_DIR / t.id
+        if not mdir.is_dir():
+            continue
+        files = _source_files(mdir)
+        if not files:
+            continue
+        summary["matched"] += 1
+        for f in files:
+            try:
+                rp = f.resolve()
+            except Exception:
+                continue
+            if media_root not in rp.parents:
+                continue    # 路径不在 media 内：绝不删（防符号链接逃逸）
+            try:
+                size = f.stat().st_size
+            except OSError:
+                continue
+            if not dry_run:
+                try:
+                    f.unlink()
+                except OSError:
+                    continue
+            summary["removed"] += 1
+            summary["freed"] += size
+    return summary
 
 
 # 七牛 S3 兼容服务的区域与域名。测试域名（*.clouddn.com）会被七牛 30 天回收，
@@ -437,7 +527,24 @@ def remote_info(t, name: str) -> dict | None:
 # API 入口，不受测试域名回收影响，必须带签名访问（七牛不支持匿名）。
 # 该 bucket 实测位于华南 cn-south-1；如迁移区域，改设置里的 qiniu_s3_region。
 S3_REGION_DEFAULT = "cn-south-1"
-S3_EXPIRES = 7200  # 预签名有效期 2 小时，足够看完一条视频；拖动进度会重新请求并刷新
+
+
+def _url_expires() -> int:
+    """签名 URL 有效期（秒），环境变量 V2N_QINIU_URL_EXPIRES，默认 3600。
+
+    签名 URL 是 bearer 凭证：谁拿到谁能下。旧值动辄 2 小时（播放）、
+    成稿更是 10 年——一律收短到默认 1 小时，播放拖动会重新请求刷新。
+    """
+    import os
+    raw = (os.getenv("V2N_QINIU_URL_EXPIRES") or "").strip()
+    try:
+        v = int(float(raw)) if raw else 3600
+    except ValueError:
+        v = 3600
+    return max(60, min(v, 86400))
+
+
+S3_EXPIRES = 3600  # 兼容旧引用；实际取值以 _url_expires() 为准
 
 
 def _s3_client(c: dict):
@@ -479,7 +586,7 @@ def s3_key_from(info: dict) -> str | None:
 
 
 def s3_presign_url(info: dict, c: dict | None = None,
-                   expires: int = S3_EXPIRES) -> str | None:
+                   expires: int | None = None) -> str | None:
     """把归档记录转成 S3 预签名 GET 地址；失败返回 None（调用方回退旧逻辑）。
 
     旧 CDN 测试域名被回收后已不可用，这条通道用独立的 S3 API 域名 + AK/SK 签名，
@@ -491,6 +598,8 @@ def s3_presign_url(info: dict, c: dict | None = None,
     key = s3_key_from(info)
     if not key:
         return None
+    if expires is None:
+        expires = _url_expires()
     try:
         client = _s3_client(c)
         return client.generate_presigned_url(
@@ -533,6 +642,12 @@ def resolve_missing(t, name: str) -> str | None:
         u = (m.get("url") or "").strip()
         if u.startswith("http"):
             return u
+        # 新数据只存 key：用公开域名现拼（公开桶可直读，私有桶走上面的预签名）
+        key = s3_key_from(m)
+        if key:
+            pub = public_url(key, cfg()["domain"])
+            if pub.startswith("http"):
+                return pub
     return None
 
 
@@ -575,20 +690,21 @@ def upload_note(t, style, text):
                 t.log("warn", "note cloud size mismatch (local %s / remote %s), keep url" % (size, remote))
             except Exception:
                 pass
-        base = public_url(key, c["domain"])
-        # 私有空间：直链会 401，生成带下载令牌的签名 URL（长期有效）
-        url = _auth(c).private_download_url(base, expires=3600 * 24 * 365 * 10)
+        # meta 只存对象 key，绝不持久化签名 URL：旧实现生成 10 年有效的
+        # 私有下载 URL 写进任务 meta，而任务详情接口曾可未授权读取，
+        # 等于成稿的长期下载凭证对访客可见。需要 URL 时按 key 现生成
+        # （_url_expires 短时效），成稿正文本身也在任务 JSON 里可直接读。
         from . import store
         t.meta = dict(t.meta or {})
         notes = dict(t.meta.get("qiniu_notes") or {})
-        notes[style] = {"url": url, "key": key, "size": size, "at": int(_t.time())}
+        notes[style] = {"key": key, "size": size, "at": int(_t.time())}
         t.meta["qiniu_notes"] = notes
         store.save(t)
         try:
-            t.log("info", "note uploaded to qiniu: %s" % url)
+            t.log("info", "note uploaded to qiniu: %s" % key)
         except Exception:
             pass
-        return url
+        return key
     except Exception as e:
         try:
             t.log("warn", "note upload exception: %s" % e)
