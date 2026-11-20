@@ -8,11 +8,16 @@
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
+import logging
 import os
 import re
+import threading
 from pathlib import Path
+
+_log = logging.getLogger("v2n.config")
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -80,7 +85,47 @@ def load_tokens() -> list[dict]:
 
 
 def save_tokens(toks: list[dict]) -> None:
-    _write_json(TOKENS_FILE, {"tokens": toks})
+    # 令牌等价密码：明文落盘也必须 0600 + 原子写（见 _write_json）
+    _write_json(TOKENS_FILE, {"tokens": toks}, private=True)
+
+
+def token_identity(tok: str | None) -> str:
+    """令牌的稳定标识（用于任务归属 owner），不含令牌明文。
+
+    引导管理员令牌 -> "admin"；已登记令牌 -> "u<sha1 前 10 位>"；
+    无令牌 / 无效令牌 -> ""（无归属）。
+    """
+    if not tok:
+        return ""
+    if ADMIN_TOKEN and hmac.compare_digest(tok, ADMIN_TOKEN):
+        return "admin"
+    for t in load_tokens():
+        if hmac.compare_digest(tok, t["token"]):
+            if t["role"] == "admin":
+                return "admin"
+            return "u" + hashlib.sha1(tok.encode("utf-8")).hexdigest()[:10]
+    return ""
+
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def startup_guard_error(host: str) -> str | None:
+    """启动守卫：绑定非回环地址且未配置任何令牌时返回错误说明，否则 None。
+
+    无令牌 + 公网监听 = 任何人可读全部转写稿、删任务、改设置截获 API Key，
+    这种形态不允许只靠一行警告放行，必须拒绝启动（run.py 据此退出）。
+    回环开发模式不受影响（见 main._access_guard 的回环放行）。
+    """
+    h = (host or "").strip().lower()
+    if h in _LOOPBACK_HOSTS:
+        return None
+    if all_valid_tokens():
+        return None
+    return (f"拒绝启动：监听地址 {host} 不是回环地址，但未配置任何访问令牌"
+            "（环境变量 V2N_ADMIN_TOKEN / V2N_ACCESS_TOKEN 与 data/tokens.json 均为空）。"
+            "无令牌对外提供服务等于把全部笔记、视频与设置接口公开。"
+            "请先设置 V2N_ADMIN_TOKEN，或改用 --host 127.0.0.1 仅本机访问。")
 
 
 def _stored_token_set() -> set[str]:
@@ -111,21 +156,18 @@ def is_admin(tok: str | None) -> bool:
     """是否拥有管理员权限。
 
     - 引导 ADMIN_TOKEN 命中 -> admin
-    - 已登记 admin 令牌命中 -> admin
-    - 既无 ADMIN_TOKEN 又无任何已登记令牌 -> 开发模式，配置全开放（视为 admin）
-    - 否则（已有令牌体系但没有 admin 凭据）-> 否
+    - 已登记 admin 角色令牌命中 -> admin（add_token 在无引导令牌时会自动把
+      第一个登记令牌提升为 admin 角色并落盘，所以不需要额外的「首令牌」后门）
+    - 其余一律否——包括「未配置任何令牌」时：不再有开发模式全开放，
+      无令牌时 is_admin 恒为 False。回环开发模式的可用性由
+      main._access_guard 按「无令牌 + 回环来源」单独放行，不靠这里造假。
     """
     if not tok:
-        return (not ADMIN_TOKEN) and (not load_tokens())
+        return False
     if ADMIN_TOKEN and hmac.compare_digest(tok, ADMIN_TOKEN):
         return True
     for t in load_tokens():
         if t["role"] == "admin" and hmac.compare_digest(tok, t["token"]):
-            return True
-    # 引导 admin 未设、且尚无任何 admin 令牌时，第一个已登记令牌作为引导 admin
-    if not ADMIN_TOKEN:
-        toks = load_tokens()
-        if toks and hmac.compare_digest(tok, toks[0]["token"]):
             return True
     return False
 
@@ -160,10 +202,7 @@ USAGE_FILE = DATA_DIR / "usage.json"
 
 
 def pro_free_limit() -> int:
-    try:
-        return max(0, int((load_settings().get("pro_free_limit") or "3").strip() or "3"))
-    except Exception:
-        return 3
+    return get_int_clamped(load_settings(), "pro_free_limit", 3, 0, 10000)
 
 
 def pro_gate_enabled() -> bool:
@@ -404,15 +443,54 @@ def _read_json(path: Path) -> dict:
     return {}
 
 
-def _write_json(path: Path, data: dict, private: bool = False) -> None:
-    """写 JSON 文件。private=True 时把权限收紧到仅属主可读写（Windows 上忽略）"""
+def write_text_atomic(path: Path, text: str, mode: int = 0o644) -> None:
+    """原子写文本：同目录临时文件 -> fsync -> os.replace -> 定权限。
+
+    直接 write_text 在进程被 kill -9 / 断电时会留下半截文件，读回时解析失败
+    导致配置/任务静默丢失。临时文件与目标同目录保证 replace 是同文件系统
+    的原子重命名。mode 在 replace 前就在临时文件上定好，避免出现
+    「新内容已生效但权限还是宽松」的窗口。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    if private:
-        try:
-            os.chmod(path, 0o600)
-        except Exception:
-            pass
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.chmod(tmp, mode)
+    except Exception:
+        pass
+    os.replace(tmp, path)
+
+
+def _write_json(path: Path, data: dict, private: bool = False) -> None:
+    """写 JSON 文件（原子写）。private=True 时权限 0600（Windows 上忽略）。"""
+    write_text_atomic(path, json.dumps(data, ensure_ascii=False, indent=2),
+                      0o600 if private else 0o644)
+
+
+def get_int_clamped(s: dict | None, key: str, default: int,
+                    lo: int, hi: int) -> int:
+    """统一的数值配置读取：非法值回退默认并记日志，越界钳到 [lo, hi]。
+
+    历史上消费点各自裸 int()：填个「4.5」或中文就能让每个新任务在转写
+    阶段抛 ValueError 全站失败；chunk_seconds=0 更能让切片原地打转。
+    所有数值配置一律走这里，不再在消费点单独兜底。
+    """
+    raw = (s or {}).get(key)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return default
+    try:
+        v = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        _log.warning("配置 %s=%r 不是合法整数，回退默认 %d", key, raw, default)
+        return default
+    clamped = max(lo, min(hi, v))
+    if clamped != v:
+        _log.warning("配置 %s=%d 越界，已钳制到 [%d, %d] -> %d",
+                     key, v, lo, hi, clamped)
+    return clamped
 
 
 def load_settings() -> dict[str, str]:
@@ -452,7 +530,7 @@ def migrate_secrets() -> bool:
     _write_json(SECRETS_FILE, secrets, private=True)
     for k in moving:
         stored.pop(k, None)
-    _write_json(SETTINGS_FILE, stored)
+    _write_json(SETTINGS_FILE, stored, private=True)
     return True
 
 
@@ -466,6 +544,33 @@ def _env_names(key: str) -> tuple[str, ...]:
         "llm_protocol": ("LLM_PROTOCOL",),
     }
     return (base,) + alias.get(key, ())
+
+
+# 数值型配置的合法范围：保存入口先校验，消费点再用 get_int_clamped 钳制，
+# 双保险堵住「一个坏配置打死全站」（chunk_seconds=0、max_concurrency 非数字等）。
+_NUMERIC_RANGES: dict[str, tuple[float, float]] = {
+    "chunk_seconds": (10, 600),
+    "first_chunk_seconds": (5, 600),
+    "max_concurrency": (1, 8),
+    "llm_max_tokens": (256, 131072),
+    "llm_temperature": (0, 2),
+    "pro_free_limit": (0, 10000),
+    "qiniu_archive_days": (0, 3650),
+}
+
+
+def _validate_numeric(key: str, val: str) -> None:
+    """数值配置类型/范围校验，不合法抛 ValueError（接口层转 400）。"""
+    rng = _NUMERIC_RANGES.get(key)
+    if rng is None or val == "":
+        return
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        raise ValueError(f"配置 {key} 必须是数字，收到：{val!r}")
+    lo, hi = rng
+    if not (lo <= v <= hi):
+        raise ValueError(f"配置 {key} 必须在 [{lo:g}, {hi:g}] 之间，收到：{val!r}")
 
 
 def save_settings(patch: dict, clear_secrets: set[str] | None = None) -> dict[str, str]:
@@ -485,6 +590,7 @@ def save_settings(patch: dict, clear_secrets: set[str] | None = None) -> dict[st
         if k not in DEFAULTS or v is None:
             continue
         val = str(v).strip()
+        _validate_numeric(k, val)   # 非法数值直接拒绝，不写坏配置
         if k in SECRET_KEYS:
             # 空值不覆盖已有密钥：前端不持有密钥，「清空」必须走 clear_secrets
             if val:
@@ -496,10 +602,12 @@ def save_settings(patch: dict, clear_secrets: set[str] | None = None) -> dict[st
         if k in SECRET_KEYS:
             secret[k] = ""
 
-    # 普通配置：整份重写，剔除任何敏感项残留
+    # 普通配置：整份重写，剔除任何敏感项残留。
+    # settings.json 与 secrets/tokens 同级收紧到 0600：它紧挨着密钥文件存放，
+    # 且历史上密钥曾残留在里面，没有理由比 secrets 更宽松。
     stored = {k: v for k, v in _read_json(SETTINGS_FILE).items() if k not in SECRET_KEYS}
     stored.update(normal)
-    _write_json(SETTINGS_FILE, stored)
+    _write_json(SETTINGS_FILE, stored, private=True)
 
     # 敏感配置：独立文件 + 0600
     secrets = {k: v for k, v in _read_json(SECRETS_FILE).items() if k in SECRET_KEYS}
@@ -680,11 +788,15 @@ def ensure_cookie_file(platform: str = "douyin") -> str:
         return ""
     try:
         if path.exists() and path.read_text("utf-8", errors="ignore") == content:
+            try:
+                os.chmod(path, 0o600)   # 存量文件也收紧：Cookie 等同登录凭证
+            except Exception:
+                pass
             return str(path)
     except Exception:
         pass
     try:
-        path.write_text(content, encoding="utf-8")
+        write_text_atomic(path, content, 0o600)
     except Exception:
         return ""
     return str(path)

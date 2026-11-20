@@ -26,7 +26,7 @@ from .config import (ACCESS_TOKEN, ADMIN_TOKEN, HELP, MEDIA_DIR, ROOT, SECRET_KE
                      ensure_dirs, free_remaining, gate_active, is_admin,
                      load_settings, load_tokens, migrate_secrets, normalize_browser,
                      pro_free_limit, pro_gate_enabled, pro_used, public_settings,
-                     reset_pro_usage, save_settings, token_role,
+                     reset_pro_usage, save_settings, token_identity, token_role,
                      add_token as cfg_add_token, remove_token as cfg_remove_token)
 from .pipeline import (_apply_variant, _mark_idempotent_hit, _sync_variant_meta,
                        polish_needed, retry as pipeline_retry,
@@ -192,30 +192,104 @@ def _is_protected_create(request: Request) -> bool:
     if request.method != "POST":
         return False
     p = request.url.path
-    if p in ("/api/tasks", "/api/tasks/upload", "/api/tasks/upload-raw"):
+    if p in ("/api/tasks", "/api/tasks/upload", "/api/tasks/upload-raw",
+             "/api/tasks/batch"):
         return True
-    return bool(re.fullmatch(r"/api/tasks/[^/]+/(polish|retry)", p))
+    return bool(re.fullmatch(r"/api/tasks/[^/]+/(polish|retry|cancel)", p))
+
+
+def _tokens_configured() -> bool:
+    """是否配置了任何令牌（引导令牌或已登记令牌）。"""
+    return bool(all_valid_tokens())
+
+
+def _client_loopback(request: Request) -> bool:
+    """请求来源是否为本机回环（含 TestClient 的虚拟来源）。
+
+    只在「未配置任何令牌」的开发形态下用于放行：此时服务按 run.py 的
+    启动守卫只能绑回环地址，来源回环即本人使用。
+    """
+    host = (request.client.host if request.client else "") or ""
+    return host in ("127.0.0.1", "::1", "localhost", "testclient")
+
+
+def _is_token_required_endpoint(request: Request) -> bool:
+    """必须持有效令牌的接口（配置了令牌时）：读数据面 + 删除 + 归档执行。
+
+    列表/详情/导出/媒体/SSE 能读到全部转写与成稿，DELETE 能删数据，
+    过去在任何配置下都不设防，是鉴权覆盖面的主要缺口（知道地址即可
+    遍历、下载、删除全部任务）。创建类不在此列：它沿用门禁语义
+    （免费次数内可匿名创建，门禁激活后才要求令牌，见守卫第 3 条），
+    否则「前 N 次免费」的产品设计会被一并堵死。
+    """
+    p, m = request.url.path, request.method
+    if p in ("/api/archive/sync", "/api/archive/run"):
+        return True
+    if m == "GET" and p == "/api/tasks":
+        return True
+    if m == "DELETE" and re.fullmatch(r"/api/tasks/[^/]+", p):
+        return True
+    if m == "GET" and re.fullmatch(r"/api/tasks/[^/]+(/export|/events)?", p):
+        return True
+    if m == "GET" and p.startswith("/api/media/"):
+        return True
+    return False
 
 
 @app.middleware("http")
 async def _access_guard(request: Request, call_next):
     path = request.url.path
     tok = _extract_token(request)
-    # 1) 配置 / 管理员令牌管理：仅管理员（或开发模式全开）
+    # 1) 配置 / 管理员令牌管理：仅管理员。
+    #    例外：未配置任何令牌且来源回环（本地开发形态）放行——此时
+    #    is_admin 恒为 False，若不放行，本地开发连设置页都打不开；
+    #    非回环绑定在 run.py 启动守卫处已被拒绝，不会走到这里。
     if path.startswith("/api/settings") or path.startswith("/api/admin/"):
-        if not is_admin(tok):
-            return JSONResponse(
-                {"detail": "需要管理员令牌", "code": "NEED_ADMIN"},
-                status_code=401 if not tok else 403)
-        return await call_next(request)
-    # 2) 任务创建类：门禁激活且未持有效令牌 -> 拒绝（后端强制校验）
+        if is_admin(tok) or (not _tokens_configured()
+                             and _client_loopback(request)):
+            return await call_next(request)
+        return JSONResponse(
+            {"detail": "需要管理员令牌", "code": "NEED_ADMIN"},
+            status_code=401 if not tok else 403)
+    # 2) 读/删数据面：只要配置了令牌，一律要求持任意有效令牌（含 cookie）。
+    #    未配置令牌时不拦（回环开发形态；非回环已被启动守卫拒绝）。
+    #    前端 api() 收到 401 会弹令牌框并自动重试，登录流程不受影响。
+    if _is_token_required_endpoint(request) and _tokens_configured() \
+            and token_role(tok) is None:
+        return JSONResponse(
+            {"detail": "需要访问令牌", "code": "NEED_TOKEN"},
+            status_code=401)
+    # 3) 创建类：沿用门禁语义——门禁激活（免费次数用完）后要求令牌。
     if gate_active() and _is_protected_create(request):
         if token_role(tok) is None:
             return JSONResponse(
                 {"detail": "免费次数已用完，请提供访问令牌后继续",
                  "code": "TOKEN_REQUIRED"},
                 status_code=402)
+    # 4) 其余（/、/static、/api/health、/api/auth/*、归档状态）保持公开
     return await call_next(request)
+
+
+# ---- 任务归属隔离 ------------------------------------------------------
+# owner 是创建时所持令牌的标识（config.token_identity）。可见性规则：
+#   admin 角色 -> 全部；普通令牌 -> 自己的 + 历史无归属（owner="")；
+#   未配置令牌（回环开发）-> 全部。不可见的任务一律按 404 处理，不泄露存在性。
+
+def _can_view(request: Request, t) -> bool:
+    tok = _extract_token(request)
+    if token_role(tok) == "admin" or not _tokens_configured():
+        return True
+    owner = getattr(t, "owner", "") or ""
+    if not owner:
+        return True
+    return owner == token_identity(tok)
+
+
+def _get_visible_task(request: Request, tid: str):
+    t = store.get(tid)
+    if not t or not _can_view(request, t):
+        raise HTTPException(404, "任务不存在")
+    return t
 
 STYLES = ("general", "note", "article", "clean", "star")
 
@@ -403,16 +477,18 @@ def _task_options(style: str, language: str, model: str) -> dict:
 
 
 @app.get("/api/tasks/{tid}/export")
-def export_task(tid: str, fmt: str = "md"):
-    t = store.get(tid)
-    if not t:
-        raise HTTPException(404, "任务不存在")
+def export_task(tid: str, request: Request, fmt: str = "md"):
+    t = _get_visible_task(request, tid)
     if fmt not in exporters.FORMATS:
         raise HTTPException(400, "不支持的格式")
     content, name, mime = exporters.render(t, fmt)
-    tmp = Path(store.TASK_DIR) / f"{tid}.{uuid.uuid4().hex[:6]}.export"
-    tmp.write_text(content, encoding="utf-8")
-    return FileResponse(str(tmp), filename=name, media_type=mime)
+    # 直接内存响应，不再落 .export 临时文件（旧实现每次导出都在
+    # TASK_DIR 留一个永不删除的临时文件，长期单调累积）。
+    from urllib.parse import quote
+    disposition = (f'attachment; filename="export.{fmt}"; '
+                   f"filename*=UTF-8''{quote(name)}")
+    return Response(content=content.encode("utf-8"), media_type=mime,
+                    headers={"Content-Disposition": disposition})
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -616,11 +692,20 @@ def _build_info(refresh: bool = False) -> dict:
 
 
 @app.get("/api/tasks")
-def list_tasks():
+def list_tasks(request: Request, q: str = ""):
     # 只返回摘要（不含 segments/transcript/note/variants 等正文）。
     # 这些重字段曾让 39 条任务的列表膨胀到 2.17MB，公网传输 45 秒；
     # 前端本就是「列表给摘要、点开再拉 /api/tasks/<id> 取全文」的设计。
-    return [t.to_dict(with_events=False, brief=True) for t in store.list_tasks()]
+    # q：按标题 / 转写文本过滤（在完整任务对象上匹配，返回仍是摘要）。
+    items = [t for t in store.list_tasks() if _can_view(request, t)]
+    q = (q or "").strip().lower()
+    if q:
+        def _hit(t) -> bool:
+            title = str((t.meta or {}).get("title") or "").lower()
+            return q in title or q in (t.transcript or "").lower() \
+                or q in (t.url or "").lower()
+        items = [t for t in items if _hit(t)]
+    return [t.to_dict(with_events=False, brief=True) for t in items]
 
 
 # 查重 + 创建必须原子：两个请求几乎同时贴同一条链接时，
@@ -628,10 +713,13 @@ def list_tasks():
 _create_lock = threading.Lock()
 
 
-@app.post("/api/tasks")
-def create_task(body: CreateIn):
+def _create_one(url_text: str, style: str, language: str, model: str,
+                force: bool, owner: str, visible=None) -> dict:
+    """创建单个任务的完整逻辑（单条与批量共用）。返回结果 dict，
+    失败抛 HTTPException（批量入口逐条捕获）。visible 是查重命中的
+    可见性谓词：别人名下的任务不能借查重把存在性与标题泄露出来。"""
     # 分享文案常带标题/话题，先抠出真正的链接
-    url = extract_url(body.url)
+    url = extract_url(url_text)
     if not url or not url.startswith("http"):
         raise HTTPException(400, "未识别到有效链接，请粘贴含 http(s):// 的视频链接")
     platform = detect_platform(url)
@@ -639,20 +727,20 @@ def create_task(body: CreateIn):
     # 作品 ID 可能要跟随一次短链重定向（≤6s），放在锁外做，
     # 免得一个慢链接把其它任务的创建也堵住。
     vid = ""
-    if not body.force:
+    if not force:
         try:
             vid = dedupe.resolve_id(url, platform)
         except Exception:
             vid = ""
 
     with _create_lock:
-        if not body.force:
+        if not force:
             dup, how = None, ""
             try:
                 dup, how = dedupe.find_reusable(url, platform, vid=vid)
             except Exception as e:      # 查重是增强功能，任何异常都不能挡住正常创建
                 logging.getLogger("uvicorn.error").warning(f"查重失败（已忽略）：{e}")
-            if dup is not None:
+            if dup is not None and (visible is None or visible(dup)):
                 # 已有同一作品的记录：不再下载/转写，直接把记录交给前端跳转
                 logging.getLogger("uvicorn.error").info(
                     f"重复链接已跳过：{url} -> 任务 {dup.id}（命中方式 {how}）")
@@ -664,15 +752,25 @@ def create_task(body: CreateIn):
                     "status": dup.status,
                 }
 
-        t = store.create(url, platform, _task_options(body.style, body.language, body.model))
+        t = store.create(url, platform,
+                         _task_options(style, language, model), owner=owner)
         t.log("info", f"任务创建：{url}")
         store.save(t)
         submit(t)
         return {"id": t.id}
 
 
+@app.post("/api/tasks")
+def create_task(body: CreateIn, request: Request):
+    owner = token_identity(_extract_token(request))
+    return _create_one(body.url, body.style, body.language, body.model,
+                       body.force, owner,
+                       visible=lambda t: _can_view(request, t))
+
+
 @app.post("/api/tasks/upload")
 async def upload_task(
+    request: Request,
     file: UploadFile = File(...),
     language: str = Form("auto"),
     model: str = Form(""),
@@ -681,7 +779,8 @@ async def upload_task(
     name = (file.filename or "").strip()
     if not name:
         raise HTTPException(400, "请选择要上传的文件")
-    t = store.create(name, "local", _task_options(style, language, model))
+    t = store.create(name, "local", _task_options(style, language, model),
+                     owner=token_identity(_extract_token(request)))
     suffix = Path(name).suffix.lower() or ".bin"
     dest = MEDIA_DIR / t.id / f"source{suffix}"
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -717,7 +816,8 @@ async def upload_task_raw(
     """
     # 文件名只取 basename，剥掉任何路径成分，防止怪名字写出目录
     name = Path(name.replace("\\", "/")).name.strip() or "upload.bin"
-    t = store.create(name, "local", _task_options(style, language, model))
+    t = store.create(name, "local", _task_options(style, language, model),
+                     owner=token_identity(_extract_token(request)))
     suffix = Path(name).suffix.lower() or ".bin"
     dest = MEDIA_DIR / t.id / f"source{suffix}"
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -748,10 +848,8 @@ class PolishIn(BaseModel):
 
 
 @app.post("/api/tasks/{tid}/polish")
-def polish_task(tid: str, body: PolishIn):
-    t = store.get(tid)
-    if not t:
-        raise HTTPException(404, "任务不存在")
+def polish_task(tid: str, body: PolishIn, request: Request):
+    t = _get_visible_task(request, tid)
     if not t.transcript:
         raise HTTPException(400, "该任务还没有转写文本")
     style = _clean_style(body.style)
@@ -772,14 +870,15 @@ def polish_task(tid: str, body: PolishIn):
 
 
 @app.post("/api/tasks/{tid}/retry")
-def retry_task(tid: str):
-    """从失败处重试：整理阶段失败只重跑 LLM，其余阶段重跑整条流程"""
-    t = store.get(tid)
-    if not t:
-        raise HTTPException(404, "任务不存在")
+def retry_task(tid: str, request: Request, force_media: int = 0):
+    """从失败处重试：整理阶段失败只重跑 LLM，其余阶段重跑整条流程。
+
+    force_media=1：先清掉本地媒体再重跑（媒体损坏、复用校验不过时用）。
+    """
+    t = _get_visible_task(request, tid)
     if t.status not in ("failed", "canceled"):
         raise HTTPException(400, "只有失败或已取消的任务才能重试")
-    action = pipeline_retry(t)
+    action = pipeline_retry(t, force_media=bool(force_media))
     if action == "busy":
         raise HTTPException(400, "任务正在处理中，请稍后再试")
     return {"ok": True, "action": action,
@@ -877,16 +976,20 @@ def archive_run(days: int = 0, dry_run: int = 1, limit: int = 0):
 
 
 @app.get("/api/tasks/{tid}")
-def get_task(tid: str):
-    t = store.get(tid)
-    if not t:
-        raise HTTPException(404, "任务不存在")
-    return t.to_dict()
+def get_task(tid: str, request: Request):
+    return _get_visible_task(request, tid).to_dict()
 
 
 @app.delete("/api/tasks/{tid}")
-def delete_task(tid: str):
+def delete_task(tid: str, request: Request):
     _safe_tid(tid)          # 先校验，再拼路径（拼错会删掉整个 data 目录）
+    t = store.get(tid)
+    if t is not None and not _can_view(request, t):
+        raise HTTPException(404, "任务不存在")
+    # 先发取消信号并立墓碑，再删记录与媒体：运行中的 worker 收到取消后
+    # 会在检查点中止，且 store.save 见墓碑不再落盘，任务不会「复活」。
+    if t is not None and t.status in ("running", "pending"):
+        store.request_cancel(tid)
     ok = store.remove(tid)
     # 同时释放该任务的视频/音频，避免磁盘占用累积
     shutil.rmtree(MEDIA_DIR / tid, ignore_errors=True)
@@ -894,12 +997,18 @@ def delete_task(tid: str):
 
 
 @app.post("/api/tasks/{tid}/cancel")
-def cancel_task(tid: str):
+def cancel_task(tid: str, request: Request):
+    t = store.get(tid)
+    if t is not None and not _can_view(request, t):
+        raise HTTPException(404, "任务不存在")
     return {"ok": store.request_cancel(tid)}
 
 
 @app.get("/api/tasks/{tid}/events")
-async def task_events(tid: str):
+async def task_events(tid: str, request: Request):
+    t0 = store.get(tid)
+    if t0 is not None and not _can_view(request, t0):
+        raise HTTPException(404, "任务不存在")
     async def gen():
         last = 0
         idle = 0
@@ -1100,6 +1209,9 @@ def _cloud_playback(tid: str, name: str, request: Request):
 def media(tid: str, name: str, request: Request, download: int = 0):
     """视频/音频流式服务，支持 HTTP Range（浏览器拖动进度条必需）"""
     _safe_tid(tid)          # 与 delete 同理：tid 参与路径拼接，必须先过白名单
+    _t = store.get(tid)
+    if _t is not None and not _can_view(request, _t):
+        raise HTTPException(404, "媒体文件不存在")
     mt = _media_type(name)
     if not mt:
         raise HTTPException(404, "不支持的媒体文件")
