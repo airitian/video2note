@@ -48,6 +48,7 @@ from __future__ import annotations
 import html as _html
 import os
 import re
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -127,6 +128,17 @@ SLOW_CDN_MIN_PROBE_BYTES = 2 << 20      # 2 MB
 SLOW_CDN_MIN_PROBE_SECONDS = 1.5        # 1.5 s
 # 回退总次数上限（video -> audio -> 重新解析×N），防止边缘全慢时无限重试。
 SLOW_CDN_MAX_FALLBACKS = 3
+
+# 解析整轮重试（把 D 方案 direct 通道嵌入重试链）。
+# resolve 单轮内部：direct 已按「换新浏览器会话」重试 3 次、dlpanda 兜底 1 次，
+# 但抖音风控收紧时整轮踩空仍会发生（实测：同一浏览器同一链接有时直接放行、
+# 有时 aweme/detail 返回 200 空 body，属概率性拦截）。每轮 resolve 都会起
+# 全新会话（新 user-data-dir / 新 cookie / 新指纹随机量），命中放行窗口的
+# 概率随轮数显著提升；轮间隔让风控窗口轮转。
+# 与 downloader.download_media 的外层整函数重试分工：这里只重试「解析」，
+# 下载阶段（CDN 取流）的瞬时失败由外层兜底多跑一整轮。
+RESOLVE_ROUNDS = 3
+RESOLVE_BACKOFF = 6.0
 
 
 @dataclass
@@ -250,6 +262,95 @@ def _chromedriver_exe():
     return None
 
 
+# ---- 浏览器进程泄漏防护（2026-10-21 线上事故修复）----
+# 事故现象：容器内攒了 2305 个活 chrome 进程，容器 pids limit（4665）
+# 被吃掉一半，ffmpeg 默认多线程创建失败报
+# `g thread with return code -11 (Resource temporarily unavailable)`，
+# 用户看到的是「音频转码失败、输出 0 字节空文件」。
+# 泄漏路径：webdriver.Chrome() 先把 chrome 拉起来再做 WebDriver 握手，
+# 握手失败（风控变严、chromedriver 僵死）时函数直接抛异常——
+# 此时还没有 driver 对象可以 quit，chrome 成孤儿进程永久存活。
+# _resolve_direct 每次重试都新建会话，泄漏随之累积。
+# 对策三层：
+#   ① _new_driver 握手失败时按 user-data-dir 反查杀掉刚拉起的 chrome
+#   ② quit 之后再按 datadir 兜底补一刀（chromedriver 僵死时 quit 无效）
+#   ③ 引用计数归零后全局清扫 v2n-chrome- 残留（有活跃 driver 时不动，
+#      避免误杀并发任务的浏览器会话）
+_active_drivers = 0
+_drivers_lock = threading.Lock()
+
+
+def _kill_chrome_by_datadir(datadir: str) -> None:
+    """按 user-data-dir 杀掉对应的 chrome/chromedriver 进程"""
+    try:
+        subprocess.run(["pkill", "-9", "-f", datadir],
+                       capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+def _remove_datadir(datadir: str | None) -> None:
+    """删除一次会话的 chrome user-data-dir 临时目录。
+
+    pkill 只杀进程、不删目录，v2n-chrome-* 会在 /tmp 一路累积，
+    2026-11-20 实测攒到 2516 个 / 5.2G，把 29G 系统盘撑满，
+    任务全部卡在排队。这里在会话收尾时把目录真正删掉。
+
+    安全约束：只删 /tmp 下、前缀严格匹配 v2n-chrome- 的目录，绝不碰其它路径。
+    """
+    if not datadir:
+        return
+    try:
+        import shutil
+        import os
+        p = os.path.normpath(datadir)
+        # 只删 /tmp 直属、前缀严格匹配的目录，绝不碰其它路径
+        if (os.path.basename(p).startswith("v2n-chrome-")
+                and os.path.dirname(p) == "/tmp"
+                and os.path.isdir(p)):
+            shutil.rmtree(p, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _quit_driver(d) -> None:
+    """退出 driver、按 user-data-dir 兜底清杀并删除临时目录"""
+    global _active_drivers
+    datadir = getattr(d, "_v2n_datadir", None)
+    try:
+        d.quit()
+    except Exception:
+        pass
+    if datadir:
+        _kill_chrome_by_datadir(datadir)
+        _remove_datadir(datadir)
+    with _drivers_lock:
+        _active_drivers = max(0, _active_drivers - 1)
+
+
+def _sweep_chrome_if_idle() -> None:
+    """无活跃 driver 时清扫残留的 v2n-chrome- 进程和临时目录（防泄漏兜底）
+
+    引用计数 > 0 说明有任务正握着浏览器会话，此时全局 pkill / 删目录会误伤，
+    直接跳过。解析/下载入口各调一次，把上个异常任务漏掉的收掉。
+    """
+    with _drivers_lock:
+        if _active_drivers > 0:
+            return
+    try:
+        subprocess.run(["pkill", "-9", "-f", "v2n-chrome-"],
+                       capture_output=True, timeout=5)
+    except Exception:
+        pass
+    # 同步清掉历史遗留的 user-data-dir（进程可能早已不在，pkill 收不到）
+    try:
+        import glob
+        for d in glob.glob("/tmp/v2n-chrome-*"):
+            _remove_datadir(d)
+    except Exception:
+        pass
+
+
 def _new_driver(timeout_ms: int = 45000):
     # 起一个无头 Chromium（Selenium 驱动）。
     # 分工与旧 Playwright 方案一致：浏览器只负责过 Cloudflare 挑战并发起
@@ -275,7 +376,8 @@ def _new_driver(timeout_ms: int = 45000):
     opts.add_argument("--lang=zh-CN")
     opts.add_argument("--window-size=1440,900")
     # root 下 Chromium 对 user-data-dir 有归属保护，每次给独立临时目录
-    opts.add_argument("--user-data-dir=" + tempfile.mkdtemp(prefix="v2n-chrome-"))
+    datadir = tempfile.mkdtemp(prefix="v2n-chrome-")
+    opts.add_argument("--user-data-dir=" + datadir)
     opts.add_argument("--user-agent=" + UA)
     try:
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -292,10 +394,22 @@ def _new_driver(timeout_ms: int = 45000):
     # _token 是服务端渲染的隐藏域，DOM 就绪时早已在页面里；
     # 而 dlpanda 页面挂着第三方统计，load 事件能拖几十秒。
     opts.page_load_strategy = "eager"
-    driver = webdriver.Chrome(service=Service(drv), options=opts)
-    driver.set_page_load_timeout(max(20, int(timeout_ms / 1000)))
-    driver.set_script_timeout(60)
-    _harden_fingerprint(driver)
+    global _active_drivers
+    try:
+        driver = webdriver.Chrome(service=Service(drv), options=opts)
+        driver.set_page_load_timeout(max(20, int(timeout_ms / 1000)))
+        driver.set_script_timeout(60)
+        _harden_fingerprint(driver)
+    except Exception:
+        # chrome 已拉起但握手失败：没有 driver 对象可 quit，
+        # 按 datadir 反查杀掉并删目录，否则孤儿进程+临时目录越攒越多，
+        # 进程打满 pids、目录撑爆磁盘（2026-11-20 事故）。
+        _kill_chrome_by_datadir(datadir)
+        _remove_datadir(datadir)
+        raise
+    driver._v2n_datadir = datadir      # 供 _quit_driver 兜底清杀
+    with _drivers_lock:
+        _active_drivers += 1
     return driver
 
 
@@ -410,7 +524,15 @@ def _resolve_direct(url: str, timeout_ms: int = 60000,
     # 新 cookie、新的指纹随机量）命中放行窗口的几率明显更高。
     last_err = None
     for i in range(max(1, attempts)):
-        d = _new_driver(timeout_ms)
+        d = None
+        try:
+            d = _new_driver(timeout_ms)
+        except Exception as e:
+            # 握手失败时 _new_driver 已按 datadir 清杀 chrome，不会泄漏；
+            # 直接换新会话重试（风控窗口轮转）。
+            last_err = DlpandaError("浏览器启动失败：%s" % str(e).splitlines()[0][:120])
+            time.sleep(2)
+            continue
         seen = set()
         try:
             try:
@@ -442,10 +564,7 @@ def _resolve_direct(url: str, timeout_ms: int = 60000,
         except Exception as e:
             last_err = DlpandaError("直连解析失败：%s" % str(e).splitlines()[0][:120])
         finally:
-            try:
-                d.quit()
-            except Exception:
-                pass
+            _quit_driver(d)
         # 换会话重试；间隔几秒让风控窗口轮转
         if i + 1 < max(1, attempts):
             time.sleep(3.0)
@@ -560,6 +679,10 @@ def resolve(url: str, platform: str = "douyin", timeout_ms: int = 45000,
     if platform != "douyin":
         raise DlpandaError(f"dlpanda 暂不支持 {platform}")
 
+    # 入口兜底：上个任务异常退出漏掉的 chrome 残留清掉。
+    # 无活跃会话时才动手，不会误杀并发任务的浏览器。
+    _sweep_chrome_if_idle()
+
     order = [prefer] if prefer in ("direct", "dlpanda") else []
     if not order:
         dy_ok = _dy_reachable()
@@ -607,7 +730,12 @@ def _resolve_dlpanda(url: str, platform: str = "douyin",
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.ui import WebDriverWait
 
-    driver = _new_driver(timeout_ms)
+    driver = None
+    try:
+        driver = _new_driver(timeout_ms)
+    except Exception as e:
+        # _new_driver 内部已按 datadir 清杀，不会泄漏进程
+        raise DlpandaError("浏览器启动失败：%s" % str(e).splitlines()[0][:120])
     try:
         # 模板 Cookie 必须先注入再加载解析页：selenium 的 add_cookie
         # 要求当前已在该域名下，所以先开一个同域页面。
@@ -683,10 +811,7 @@ def _resolve_dlpanda(url: str, platform: str = "douyin",
     except Exception as e:
         raise DlpandaError("解析失败：%s" % e)
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        _quit_driver(driver)
 
     if not page_html:
         raise DlpandaError("解析请求未返回内容")
@@ -915,7 +1040,26 @@ def download_video(url: str, workdir: Path, max_height: int = 1080,
     from . import audio
 
     workdir.mkdir(parents=True, exist_ok=True)
-    result = resolve(url, platform="douyin")
+    # 解析整轮重试（详见 RESOLVE_ROUNDS 注释）：direct 通道过抖音风控是
+    # 概率性的，单轮 direct×3 + dlpanda 全踩空的窗口确实存在；多轮换全新
+    # 浏览器会话可显著提升命中率。失败仍抛 DlpandaError，由上层
+    # download_media 决定再兜一轮或落 yt-dlp。
+    result = None
+    last_resolve_err: Exception | None = None
+    for rnd in range(RESOLVE_ROUNDS):
+        try:
+            result = resolve(url, platform="douyin")
+            break
+        except Exception as e:
+            last_resolve_err = e
+            if rnd + 1 < RESOLVE_ROUNDS:
+                if progress:
+                    progress(4.0, f"解析暂未成功（第 {rnd + 1}/{RESOLVE_ROUNDS} 轮），"
+                                  f"稍后重试…")
+                time.sleep(RESOLVE_BACKOFF)
+    if result is None:
+        raise DlpandaError(f"解析失败（已重试 {RESOLVE_ROUNDS} 轮）："
+                           f"{last_resolve_err}")
 
     if progress:
         progress(8.0, f"解析成功：{result.title[:40]}")
@@ -1070,10 +1214,7 @@ def _browser_ready_uncached() -> tuple[bool, str]:
         try:
             d.get("about:blank")
         finally:
-            try:
-                d.quit()
-            except Exception:
-                pass
+            _quit_driver(d)      # quit + 按 datadir 兜底清杀
         return True, ""
     except Exception as e:
         msg = str(e).strip() or type(e).__name__

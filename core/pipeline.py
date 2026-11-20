@@ -382,11 +382,18 @@ def polish_signature(t: store.Task, style: str) -> str:
     return llm.signature(t.transcript, style, t.options.get("llm_model") or None)
 
 
+# 同一风格两次 LLM 整理之间的最短间隔（秒）。输入没变化时，
+# 命中缓存不再永久复用，而是允许「重新生成」，但 10 分钟内重复点只复用旧稿，避免刷额度。
+POLISH_COOLDOWN = 10 * 60
+
+
 def polish_needed(t: store.Task, style: str, force: bool = False) -> tuple[bool, str]:
     """是否需要真的调用 LLM。返回 (需要整理, 原因说明)。
 
-    命中幂等（该风格已有成稿 + 输入签名一致）时返回 False，调用方应直接复用旧稿，
-    既不重复花钱也不覆盖已有结果。换风格则视为新输入，会重新生成一份。
+    命中幂等（该风格已有成稿 + 输入签名一致）时的策略：
+    - 距上次生成不足 10 分钟 → 复用旧稿（省额度、防连点）；
+    - 距上次生成超过 10 分钟 → 允许重新生成一份（同风格、同输入也可重出稿）。
+    换风格 / 换模型 / 换模板 / 重转写（签名变化）则无论间隔都直接重新生成。
     """
     if force:
         return True, "已强制重新整理"
@@ -399,9 +406,21 @@ def polish_needed(t: store.Task, style: str, force: bool = False) -> tuple[bool,
         return True, "缺少成稿签名（旧数据），重新生成"
     if cached["sig"] != polish_signature(t, style):
         return True, "风格 / 模型 / 转写原文已变化，重新整理"
+
     info = cached.get("info") or {}
-    return False, (f"「{info.get('style', style)}」风格已于{info.get('at', '上次')}生成过"
-                   f"（{info.get('chars', 0)} 字），直接复用，无需重复调用")
+    style_name = info.get("style", style)
+    last_ts = info.get("ts")
+    if isinstance(last_ts, (int, float)):
+        elapsed = time.time() - float(last_ts)
+        if elapsed < POLISH_COOLDOWN:
+            remain_min = int((POLISH_COOLDOWN - elapsed + 59) // 60)
+            return False, (f"「{style_name}」风格 {remain_min} 分钟内已生成过"
+                           f"（{info.get('chars', 0)} 字），同一风格两次生成需间隔 10 分钟，"
+                           f"当前直接复用旧稿")
+        return True, f"距上次生成「{style_name}」已超过 10 分钟，重新生成"
+    # 没有时间戳的旧数据：无法判断生成时间，保守复用
+    return False, (f"「{style_name}」风格已生成过（{info.get('chars', 0)} 字），"
+                   f"直接复用，无需重复调用")
 
 
 def _apply_variant(t: store.Task, style: str) -> None:
@@ -473,6 +492,7 @@ def _polish_body(t: store.Task, style: str, emit: EmitFn = None, force: bool = F
         "model": llm.resolve_model(model),
         "chars": len(text),
         "at": datetime.now().strftime("%m-%d %H:%M"),
+        "ts": time.time(),
         "src_hash": src_hash(t),
     }
     t.variants = t.variants or {}

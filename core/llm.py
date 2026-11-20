@@ -67,7 +67,7 @@ def _config(model_override: str | None = None) -> dict:
         "protocol": protocol,
         "base": base,
         "key": key,
-        "model": (model_override or s.get("llm_model") or "").strip() or "deepseek-v4.1-flash",
+        "model": (model_override or s.get("llm_model") or "").strip() or "deepseek-ai/DeepSeek-V4.1-Flash-1017",
         "max_tokens": max_tokens,
         "temperature": temp,
     }
@@ -90,7 +90,7 @@ def _err_message(resp: requests.Response) -> str:
     return f"HTTP {resp.status_code}: {resp.text[:200]}"
 
 
-# 推理模型（如 deepseek-v4.1-flash）默认会先输出一大段 thinking，
+# 推理模型（如 DeepSeek-V4.1-Flash）默认会先输出一大段 thinking，
 # 在 max_tokens 有限时会把正文挤没。这里默认关闭思考；若服务端不支持该参数则自动降级。
 _THINKING_OFF = True
 
@@ -377,13 +377,90 @@ CLEAN_ONLY_TMPL = """这是视频「{title}」的语音转写稿，请做最保�
 转写稿：
 {raw}"""
 
+# 面试话术风格专属 system：突破全局「忠实原文」铁律——允许判断完整性、允许修正不严谨说法，
+# 但修正只能靠技术常识、不得引入原文没有的结论；补充只能写通用方法/常见风险/面试追问并标注。
+# 风格键沿用 star（历史键名，避免旧任务缓存失效与前端/接口兼容问题），展示名已改为「面试话术」。
+INTERVIEW_SYSTEM = (
+    "你是一名资深技术面试官兼面试回答编辑，把视频里的技术回答重组为自然、准确、可口述的面试话术。"
+    "核心：优先保留作者自己的观点、经验和技术细节，不改成空泛的标准答案。铁律："
+    "一、保留原回答的核心观点、技术深度和个人表达；"
+    "二、修正绝对化、过度简化、概念边界混淆，只能靠技术常识，不引入原文没有的结论；"
+    "三、不凭空编造作者的项目经历、指标结果、工具经验或数据，"
+    "    新增内容只作为通用测试维度、常见风险或面试追问提出，并标注 [补充]。"
+    "成文用第一人称口语、自然过渡（可用「先说结论/另外/最后」，分层讲透但过渡用人话，不用套话）；"
+    "信息顺序「先给结论→再解释原因→最后补测试方法、例子、边界与闭环」；"
+    "指标要和验证方法对应、并说明失效场景，不只罗列名词。"
+    "直接输出 Markdown 正文，不要任何解释、前言或后缀。"
+)
+
+# 面试话术风格：完整性判断 + 准确性修正 + 口语化改写 + 技术准确性检查（固定两段 + 可选短版）
+INTERVIEW_TMPL = """下面是一段技术类视频的转写稿（已清洗），视频里是作者针对某个技术问题的口述回答。请以资深技术面试官兼面试回答编辑的身份，把它重组为自然、准确、能在现场说出来的面试话术。
+
+视频信息（仅用于理解背景，不要原样写进正文）：
+- 标题：{title}
+- 作者：{uploader}
+- 简介：{description}
+
+转写稿：
+{cleaned}
+
+==================== 处理规则（逐条执行） ====================
+
+【一、先判断完整性】
+- 判断原回答是否完整：已经覆盖的关键点、最值得保留的优点、明显缺失或容易被追问的部分
+- 只在「内容判断」里用一小段话说清，不要逐句挑错、不要列清单
+
+【二、修正技术表述】
+- 重点修正：绝对化、过度简化、概念边界混淆
+- 只改「说错/不严谨」的地方，不推翻作者观点和表达；只能靠技术常识，不引入原文没有的结论
+
+【三、调整信息顺序】
+- 保留技术深度，但顺序改为：先给结论/判断 → 再解释原因 → 最后补测试方法、例子、边界和闭环
+
+【四、口语化改写】
+- 第一人称口语、专业但不背稿：多用「我会先确认……」「这里我会重点看……」「如果出现问题，我会先判断……」
+- 句子长短交替，保留必要技术名词，避免连续堆砌术语
+- 可用「先说结论」「另外」「最后」做自然路标；可以分层讲解，每层要讲透、层与层分开是必须的，
+  但过渡用人话、不用套话
+- 名词第一次出现用人话解释一句，能举例就举真例子，重点结论加粗，去掉「首先/其次/综上所述」这类 AI 腔
+- 不用夸张总结、营销话术、空泛价值判断、明显 AI 套话
+
+【五、不编造（严守）】
+- 不得凭空增加作者的项目经历、指标结果、工具经验或数据
+- 需要新增时，只写通用测试维度/常见风险，或作为面试追问提出，并标注 [补充]
+
+【六、技术准确性检查（按题目领域做针对性检查）】
+- 不把传统测试和大模型测试简单概括成「对不对」「好不好」：说明预期结果是否固定、输出是否开放、评价是否要多维指标
+- 不把模型/检索/生成/应用编排混为一层：区分模型层、数据层、检索层、生成层、应用工程层
+- 不把所有链路都当确定性逻辑：OCR、向量化、排序模型、生成模型可能有波动，说明哪些部分能单独验证
+- 指标要和验证方法对应：检索可谈 Recall@K / MRR / nDCG，生成可谈正确性、相关性、忠实度、拒答、引用、幻觉；但不只罗列名词，要说清怎么测
+- 说明指标/方法的失效场景：规则可能漏掉语义等价，评分模型可能有偏差，人工评审难规模化，单一指标不代表整体质量
+- 面向真实产品补边界：权限隔离、数据新鲜度、越权、敏感信息、超时降级、流式中断、成本、长尾时延
+
+【七、输出格式（固定）】
+- 首行 `# ` 后是标题：从转写稿里提炼「面试要回答的核心问题」作标题，不要照搬原视频标题（{title} 仅作背景参考）
+  - 标题要精简：控制在一句话内（一般不超过 20 字），只点出核心问题，不复述内容、不带引流话术
+  - 不能遗漏：若原回答覆盖了多个问题，标题要把主要问题都概括进去（可用顿号/斜杠并排），不能只挑一个、漏掉其余
+  - 若原文没明说问题、只是观点陈述，则提炼「作者要回答的核心主题」作标题
+- `## 内容判断`：一小段话（见【一】）
+- `## 优化后的回答`：完整、连贯的口述稿，通常包含：先确认目标/用户/边界/通过标准 → 按业务链路或风险拆测试重点 → 关键指标说明怎么测 → 补异常/非功能/安全场景 → 最后说明上线门禁、监控、bad case 回流或问题定位闭环
+- `## 可选短版`：仅当完整回答超过现场可控长度时，补一版约一分钟的口述版，保留主线、不塞细节
+- 结尾保留两三个自然的追问入口（如问题定位方式、指标选择依据、业务权重确定），不要为了显得全面而无限扩展
+- 直接输出正文，不要「以下是改写结果」之类的开场白"""
+
 STYLES = {
     "general": GENERAL_TMPL,   # 默认：忠实原文的整理文稿
     "note": NOTE_TMPL,
     "article": ARTICLE_TMPL,
     "clean": CLEAN_ONLY_TMPL,
+    "star": INTERVIEW_TMPL,    # 面试话术：内容判断 + 口语化回答（键沿用历史 star）
 }
 DEFAULT_STYLE = "general"
+# 各风格专属 system prompt；未列出的风格走全局 SYSTEM（忠实原文铁律）
+STYLE_SYSTEMS = {
+    "article": ARTICLE_SYSTEM,
+    "star": INTERVIEW_SYSTEM,
+}
 
 
 def _strip_fence(text: str) -> str:
@@ -485,7 +562,7 @@ def polish(raw: str, meta: dict, style: str = "note", progress=None,
         tmpl = STYLES.get(style, STYLES[DEFAULT_STYLE])
         if style == "clean":
             return _strip_fence(chat(SYSTEM, tmpl.format(title=title, raw=raw), model=model))
-        sys_p = ARTICLE_SYSTEM if style == "article" else SYSTEM
+        sys_p = STYLE_SYSTEMS.get(style, SYSTEM)
         return _strip_fence(chat(sys_p, tmpl.format(
             title=title, uploader=meta.get("uploader", ""),
             description=meta.get("description", "")[:300], cleaned=raw), model=model))
@@ -526,7 +603,7 @@ def polish(raw: str, meta: dict, style: str = "note", progress=None,
         return _strip_fence(chat(SYSTEM, CLEAN_ONLY_TMPL.format(title=title, raw=cleaned),
                                 model=model))
     tmpl = STYLES.get(style, STYLES[DEFAULT_STYLE])
-    sys_p = ARTICLE_SYSTEM if style == "article" else SYSTEM
+    sys_p = STYLE_SYSTEMS.get(style, SYSTEM)
     return _strip_fence(chat(sys_p, tmpl.format(
         title=title, uploader=meta.get("uploader", ""),
         description=meta.get("description", "")[:300], cleaned=cleaned), model=model))
@@ -537,7 +614,7 @@ def resolve_model(model_override: str | None = None) -> str:
     """本次调用实际会用到的模型名（任务覆盖值优先，其次配置）"""
     if (model_override or "").strip():
         return model_override.strip()
-    return (load_settings().get("llm_model") or "").strip() or "deepseek-v4.1-flash"
+    return (load_settings().get("llm_model") or "").strip() or "deepseek-ai/DeepSeek-V4.1-Flash-1017"
 
 
 def signature(transcript: str, style: str, model: str | None = None) -> str:

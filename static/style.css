@@ -17,9 +17,14 @@
   --wb-font-mono: "Source Code Pro", ui-monospace, Consolas, Monaco, monospace;
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.6 var(--wb-font); }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.6 var(--wb-font);
+  /* 移动端：禁止 iOS 横屏自动放大正文；点按不闪灰色块 */
+  -webkit-text-size-adjust: 100%; text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent; }
 /* 表单控件在部分浏览器下不继承 body 字体，这里统一纠正 */
 input, textarea, select, button { font-family: var(--wb-font); }
+/* 触控元素：去掉双击缩放 300ms 延迟（比 viewport maximum-scale 更友好，不牺牲缩放功能） */
+.btn, .style-chip, .hitem, .line, .icon, .drop, .health, a { touch-action: manipulation; }
 code, pre, .mono { font-family: var(--wb-font-mono); }
 .hidden { display: none !important; }
 
@@ -57,7 +62,7 @@ code, pre, .mono { font-family: var(--wb-font-mono); }
 /* 侧栏宽度放在卡片上：折叠(display:none)时 auto 轨道自动收为 0，不留空白 */
 #side-left .side-card { width: 272px; }
 #side-right .side-card { width: 300px; }
-.side-card { display: flex; flex-direction: column; max-height: calc(100vh - 100px); padding: 14px 12px; }
+.side-card { display: flex; flex-direction: column; max-height: calc(100vh - 100px); max-height: calc(100dvh - 100px); padding: 14px 12px; }
 .side.folded { display: none; }
 /* grid item 默认 min-width:auto，内容一多就把列撑宽导致横向滚动 */
 .layout > * { min-width: 0; }
@@ -74,11 +79,81 @@ code, pre, .mono { font-family: var(--wb-font-mono); }
   #side-left .side-card { width: 168px; }
   #side-right .side-card { width: 196px; }
 }
-/* 只有极窄屏（<720px，手机竖屏）才允许堆叠 */
+/* ============ 手机竖屏（≤720px）专项适配 ============
+   桌面端三栏在手机上放不下，改造点：
+   1) 两侧栏改为浮层抽屉（默认收起，从左/右滑出，遮罩可关），
+      不再占文档流把主工作区推走；
+   2) 顶栏压缩：品牌行变小、按钮保持可点面积但不换行爆炸；
+   3) iOS 输入框聚焦自动缩放修复（font-size≥16px）；
+   4) 触控目标 ≥36px、去掉点按高亮闪烁、去 300ms 双击延迟；
+   5) notch 安全区（viewport-fit=cover 后必须补 padding）；
+   6) 100vh → 100dvh，修移动端浏览器工具栏引起的高度跳动。 */
 @media (max-width: 720px) {
-  .layout { grid-template-columns: minmax(0, 1fr); }
-  .side { position: static; }
-  .side-card { max-height: 300px; }
+  /* —— 抽屉 —— */
+  .side {
+    position: fixed; top: 0; bottom: 0; left: 0; z-index: 41;
+    width: min(86vw, 340px); padding: 12px;
+    background: var(--bg); overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    transform: translateX(-105%);
+    transition: transform .25s ease;
+  }
+  #side-right { left: auto; right: 0; transform: translateX(105%); }
+  .side:not(.folded) { transform: translateX(0); }
+  /* 桌面端靠 display:none 折叠，抽屉模式必须保持 display 才能播放滑出动画 */
+  .side.folded { display: block; }
+  #side-left .side-card, #side-right .side-card { width: 100%; }
+  .side-card { max-height: none; }
+  .drawer-mask { position: fixed; inset: 0; z-index: 40; background: rgba(16,20,26,.38); }
+  .drawer-mask.hidden { display: none; }
+
+  .layout { grid-template-columns: minmax(0, 1fr); padding: 12px 12px 40px; padding-bottom: max(40px, env(safe-area-inset-bottom)); gap: 12px; }
+
+  /* —— 顶栏 —— */
+  .topbar { padding: 10px 14px; padding-top: max(10px, env(safe-area-inset-top)); gap: 10px; flex-wrap: wrap; }
+  .topbar h1 { font-size: 15px; }
+  .topbar p { font-size: 11px; }
+  .topbar-right { gap: 6px; }
+  .topbar-right .btn { height: 36px; padding: 0 12px; font-size: 13px; }
+  .gate-banner { padding: 8px 14px; }
+
+  /* —— 触控目标与点按反馈 —— */
+  .btn { height: 40px; }
+  .btn.small { height: 32px; }
+  .btn.ai { height: 44px; }
+  .btn.big { height: 42px; }
+  .style-chip { height: 40px; }
+  .icon { padding: 8px; }
+  .hitem { padding: 12px 12px; }
+  .line { padding: 8px; }
+  .drop { min-height: 128px; }
+
+  /* —— iOS 聚焦自动缩放修复：表单元素字号 ≥16px —— */
+  input, textarea, select { font-size: 16px; }
+  .field input, .field select, .field textarea, .inp { font-size: 16px; }
+  textarea#url { font-size: 16px; line-height: 1.6; }
+
+  /* —— 内容区高度：dvh 避免工具栏抖动手幅 —— */
+  .lines { max-height: 60vh; max-height: 60dvh; }
+  .video-host { min-height: 220px; }
+
+  /* —— 弹窗：小屏时自身内部滚动，别让「保存」按钮滚出屏幕 —— */
+  .modal { padding: 20px 12px; padding-top: max(20px, env(safe-area-inset-top)); }
+  .modal-body { max-height: calc(100vh - 40px); max-height: calc(100dvh - 40px); overflow-y: auto; }
+
+  /* —— toast 避让 iPhone 底部横条 —— */
+  .toast { bottom: max(32px, calc(env(safe-area-inset-bottom) + 12px)); max-width: calc(100vw - 32px); }
+}
+
+/* 小手机（≤560px）：顶栏收成两行、品牌标语隐藏、进度条列宽收紧 */
+@media (max-width: 560px) {
+  .topbar { padding: 10px 12px; padding-top: max(10px, env(safe-area-inset-top)); }
+  .topbar p { display: none; }
+  .topbar-right { width: 100%; justify-content: flex-start; }
+  .gate-banner { padding: 8px 12px; text-align: left; }
+  .prow { grid-template-columns: 64px 1fr 38px; gap: 8px; }
+  .note h1 { font-size: 18px; }
+  .modal-foot .btn { flex: 1; }
 }
 
 .history-list { overflow: auto; flex: 1; min-height: 120px; }
@@ -230,7 +305,7 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 /* 手机窄屏才让按钮换到输入框下面（再窄横向就放不下了） */
 @media (max-width: 560px) {
   .url-row { flex-direction: column; }
-  .url-row .btn.big { width: 100%; height: 36px; }
+  .url-row .btn.big { width: 100%; height: 42px; }
   .field select { width: 100%; }
   .btn.big { width: 100%; }
   .ai-row { flex-direction: column; }

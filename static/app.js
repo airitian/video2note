@@ -72,7 +72,7 @@
   const ORDER = ["upload", "downloading", "extracting", "slicing", "transcribing", "polishing"];
   const STATUS_TEXT = { pending: "排队中", running: "处理中", transcribed: "转写完成", done: "已完成", failed: "失败", canceled: "已取消" };
   const STAGE_TEXT = { queued: "等待开始", downloading: "下载视频", extracting: "提取音频", slicing: "语音切片", transcribing: "语音转写", transcribed: "等待生成文稿", polishing: "AI 生成文稿", done: "完成", failed: "失败" };
-  const STYLE_TEXT = { general: "整理文稿", note: "结构化笔记", article: "公众号文章", clean: "仅清洗润色" };
+  const STYLE_TEXT = { general: "整理文稿", note: "结构化笔记", article: "公众号文章", clean: "仅清洗润色", star: "面试话术" };
   // 默认风格；页面把选择结果记在curStyle 里
   let curStyle = "general";
   // 已生成过文稿的风格集合（当前任务），用于提示与按钮文案
@@ -159,6 +159,41 @@
     el.className = "toast" + (isErr ? " err" : "");
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => el.classList.add("hidden"), ms || 3200);
+  }
+
+  // ---- 复制到剪贴板 ------------------------------------------------------
+  // 坑：navigator.clipboard 只在「安全上下文」里存在（HTTPS 或 localhost）。
+  // 本站是 HTTP 部署（http://ip:31773），浏览器里 navigator.clipboard 是
+  // undefined，直接 .writeText() 会抛 TypeError；调用点在 async 点击监听里，
+  // 错误变成未处理的 rejection——不弹任何提示，表现为「复制按钮没反应」。
+  // 所以：能用 async clipboard 就用，不能用/失败了退回 execCommand 方案。
+  function _copyFallback(text) {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");          // 防 iOS 弹键盘
+      ta.style.position = "fixed";
+      ta.style.top = "0";
+      ta.style.left = "0";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length); // iOS Safari 必须显式设置选区
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // 统一返回 Promise<boolean>：true=复制成功。绝不抛错、绝不静默。
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text)
+        .then(() => true, () => _copyFallback(text));
+    }
+    return Promise.resolve(_copyFallback(text));
   }
 
   // ---- 访问控制 ----------------------------------------------------------
@@ -859,12 +894,31 @@
     if (!url) { toast("请先上传文件或粘贴链接", true); return; }
     try {
       uploadPct = null;                 // 链接任务没有上传这一步
-      const r = await api("/api/tasks", { method: "POST", body: JSON.stringify({ url: url, style: curStyle }) });
+      const r = await api("/api/tasks", {
+        method: "POST",
+        body: JSON.stringify({ url: url, style: curStyle })
+      });
+      // 后端按作品 ID 查重命中：不新建任务、不重复下载，直接跳到已有记录
+      if (r && r.existing) {
+        await openExisting(r);
+        return;                         // 保留输入框内容，用户可继续粘贴下一条
+      }
       $("#url").value = "";
       afterCreate(r.id, false);
     } catch (e) {
       toast(e.message, true);
     }
+  }
+
+  // 命中已有记录：直接打开那条记录（不下载、不弹窗）
+  async function openExisting(r) {
+    const title = r.title ? "「" + r.title + "」" : "这条视频";
+    const busy = r.status === "pending" || r.status === "running";
+    if (!tasks.has(r.id)) await refreshOne(r.id);
+    selectTask(r.id);
+    toast(title + (busy ? "正在处理中，已打开该记录"
+                        : "已经下载转写过了，已打开历史记录（未重复下载）"),
+          false, 6000);
   }
 
   function afterCreate(id, isUpload) {
@@ -1268,7 +1322,12 @@ if (rest.length) {
     const del = e.target.closest("[data-del]");
     if (del) { e.stopPropagation(); confirmDelete(del.dataset.del); return; }
     const hitem = e.target.closest(".hitem");
-    if (hitem) { selectTask(hitem.dataset.id); return; }
+    if (hitem) {
+      selectTask(hitem.dataset.id);
+      // 手机端选中即收起抽屉，否则浮层盖着结果区还要再点一次遮罩
+      if (isMobile()) closeDrawers();
+      return;
+    }
 
     const chip = e.target.closest(".style-chip");
     if (chip) {
@@ -1287,8 +1346,13 @@ if (rest.length) {
       if (!currentId) { toast("请先选择或创建任务", true); return; }
       if (a === "copy") {
         const t = tasks.get(currentId);
-        if (!t || !t.note) { toast("还没有可复制的文稿", true); return; }
-        navigator.clipboard.writeText(t.note).then(() => toast("已复制"), () => toast("复制失败", true));
+        // 复制「屏幕上正在显示的」那一版：切过风格时 t.note 只是最后一次
+        // 生成的风格的内容，直接复制它会复制到别的内容，必须按 curStyle 取。
+        const text = noteForStyle(t, curStyle) || (t && t.note) || "";
+        if (!text) { toast("还没有可复制的文稿", true); return; }
+        copyText(text).then((ok) => {
+          toast(ok ? "已复制" : "复制失败，请手动选中文稿复制", !ok);
+        });
       }
       return;
     }
@@ -1303,8 +1367,10 @@ if (rest.length) {
     if (e.target.id === "btn-start") start();
     else if (e.target.id === "btn-polish") polish();
     else if (e.target.id === "btn-retry") retryTask();
-    else if (e.target.id === "btn-history") { $("#side-left").classList.toggle("folded"); syncSideBtns(); }
-    else if (e.target.id === "btn-logs") { $("#side-right").classList.toggle("folded"); syncSideBtns(); }
+    else if (e.target.id === "btn-history") { $("#side-left").classList.toggle("folded"); syncSideBtns(); syncDrawerMask(); }
+    else if (e.target.id === "btn-logs") { $("#side-right").classList.toggle("folded"); syncSideBtns(); syncDrawerMask(); }
+    // 点抽屉遮罩关闭（桌面端遮罩恒隐藏，不会触发）
+    else if (e.target.id === "drawer-mask") closeDrawers();
     else if (e.target.id === "btn-settings") openSettings();
     else if (e.target.id === "btn-close-settings" || e.target.id === "btn-cancel-settings") $("#settings-modal").classList.add("hidden");
     else if (e.target.id === "btn-save-settings") saveSettings();
@@ -1353,6 +1419,7 @@ if (rest.length) {
     if (e.key === "Escape") {
       $("#settings-modal").classList.add("hidden");
       $("#confirm-modal").classList.add("hidden");
+      closeDrawers();
       pendingDeleteId = null;
       if (!$("#auth-modal").classList.contains("hidden")) settleAuth(false);
     }
@@ -1363,6 +1430,31 @@ if (rest.length) {
   // ---------- 启动 ----------
   // 记住文字区滚动位置：转写增量会重建 DOM，重建后要还原回去
   $("#lines").addEventListener("scroll", saveScroll, { passive: true });
+
+  // ---------- 手机端抽屉工具 ----------
+  // ≤720px 时侧栏是浮层抽屉（见 style.css 对应断点）：
+  // 展开要显示遮罩并锁页面滚动，收起则相反；桌面端遮罩恒不显示。
+  const mqMobile = window.matchMedia("(max-width: 720px)");
+  function isMobile() { return mqMobile.matches; }
+  function closeDrawers() {
+    $("#side-left").classList.add("folded");
+    $("#side-right").classList.add("folded");
+    syncSideBtns();
+    syncDrawerMask();
+  }
+  function syncDrawerMask() {
+    const mask = $("#drawer-mask");
+    if (!mask) return;
+    const open = isMobile() && (
+      !$("#side-left").classList.contains("folded") ||
+      !$("#side-right").classList.contains("folded"));
+    mask.classList.toggle("hidden", !open);
+    // 抽屉打开时锁 body 滚动，避免抽屉内滑一下带着背景一起滚
+    document.body.style.overflow = open ? "hidden" : "";
+  }
+  // 跨断点（如横竖屏切换、拉伸窗口）时清理抽屉态：
+  // 回到桌面宽度后遮罩必须消失，否则会挡住整个页面。
+  mqMobile.addEventListener("change", () => syncDrawerMask());
 
   // 顶栏按钮反映两侧栏的折叠状态（默认都展开）
   function syncSideBtns() {
@@ -1443,7 +1535,10 @@ if (rest.length) {
   }
 
   async function boot() {
+    // 手机端默认收起历史栏：抽屉浮层不该在首屏就占住屏幕
+    if (isMobile()) $("#side-left").classList.add("folded");
     syncSideBtns();
+    syncDrawerMask();
     await refreshAuthState();   // 先拿角色/门禁状态，决定设置按钮与横幅
     try {
       const list = await api("/api/tasks");

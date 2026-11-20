@@ -2,9 +2,10 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#7c3aed">
 <title>抖音 / B站 视频转文字</title>
-<link rel="stylesheet" href="/static/style.css?v=20261011ag">
+<link rel="stylesheet" href="/static/style.css?v=20261118c4">
 </head>
 <body>
 <header class="topbar">
@@ -100,6 +101,7 @@
       <button class="style-chip" data-style="note" role="tab">结构化笔记</button>
       <button class="style-chip" data-style="article" role="tab">公众号文章</button>
       <button class="style-chip" data-style="clean" role="tab">仅清洗润色</button>
+      <button class="style-chip" data-style="star" role="tab">面试话术</button>
     </div>
     <button id="btn-polish" class="btn ai" disabled>✨ 生成文稿</button>
   </div>
@@ -123,6 +125,9 @@
   </div>
 </aside>
 </div>
+
+<!-- 手机端抽屉遮罩：侧栏以浮层形式滑出时，点这里关闭（桌面端不显示） -->
+<div id="drawer-mask" class="drawer-mask hidden"></div>
 
 <div id="settings-modal" class="modal hidden">
   <div class="modal-body">
@@ -174,6 +179,6 @@
 
 <div id="toast" class="toast hidden"></div>
 
-<script src="/static/app.js?v=20261011ag"></script>
+<script src="/static/app.js?v=20261118c4"></script>
 </body>
 </html>

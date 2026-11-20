@@ -53,7 +53,12 @@ class Task:
             self.events = self.events[-500:]
         self.updated_at = time.time()
 
-    def to_dict(self, with_events: bool = True) -> dict:
+    # 列表接口专用的重字段：segments/transcript/note/variants 动辄几十 KB，
+    # 全量塞进 /api/tasks 列表曾把响应撑到 2.17MB，公网传输要 45 秒。
+    # 前端设计本就是「列表给摘要，点开再拉 /api/tasks/<id> 详情」，此处对齐。
+    _HEAVY_FIELDS = ("segments", "transcript", "note", "note_sig", "variants")
+
+    def to_dict(self, with_events: bool = True, brief: bool = False) -> dict:
         d = {
             "id": self.id,
             "url": self.url,
@@ -76,6 +81,9 @@ class Task:
             "note_info": self.note_info,
             "variants": self.variants,
         }
+        if brief:
+            for k in self._HEAVY_FIELDS:
+                d.pop(k, None)
         if with_events:
             d["events"] = self.events
         return d

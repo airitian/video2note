@@ -19,7 +19,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import audio, downloader, exporters, store
+from . import audio, dedupe, downloader, exporters, store
 from .downloader import detect_platform, extract_url
 from .config import (ACCESS_TOKEN, ADMIN_TOKEN, HELP, MEDIA_DIR, ROOT, SECRET_KEYS,
                      SETTINGS_GROUPS, all_valid_tokens, ensure_cookie_file,
@@ -217,7 +217,7 @@ async def _access_guard(request: Request, call_next):
                 status_code=402)
     return await call_next(request)
 
-STYLES = ("general", "note", "article", "clean")
+STYLES = ("general", "note", "article", "clean", "star")
 
 # 按扩展名给媒体流定Content-Type。
 # 不用固定白名单的原因：上传的本地文件落盘名是 source<原后缀>，
@@ -243,6 +243,8 @@ class CreateIn(BaseModel):
     style: str = "general"
     language: str = "auto"
     model: str = ""
+    # 跳过查重、强制重新下载（用户明确要求再转一份时用）
+    force: bool = False
 
 
 class LoginIn(BaseModel):
@@ -615,7 +617,15 @@ def _build_info(refresh: bool = False) -> dict:
 
 @app.get("/api/tasks")
 def list_tasks():
-    return [t.to_dict(with_events=False) for t in store.list_tasks()]
+    # 只返回摘要（不含 segments/transcript/note/variants 等正文）。
+    # 这些重字段曾让 39 条任务的列表膨胀到 2.17MB，公网传输 45 秒；
+    # 前端本就是「列表给摘要、点开再拉 /api/tasks/<id> 取全文」的设计。
+    return [t.to_dict(with_events=False, brief=True) for t in store.list_tasks()]
+
+
+# 查重 + 创建必须原子：两个请求几乎同时贴同一条链接时，
+# 若不串行化会双双查空、各建一个任务，等于没去重。
+_create_lock = threading.Lock()
 
 
 @app.post("/api/tasks")
@@ -625,11 +635,40 @@ def create_task(body: CreateIn):
     if not url or not url.startswith("http"):
         raise HTTPException(400, "未识别到有效链接，请粘贴含 http(s):// 的视频链接")
     platform = detect_platform(url)
-    t = store.create(url, platform, _task_options(body.style, body.language, body.model))
-    t.log("info", f"任务创建：{url}")
-    store.save(t)
-    submit(t)
-    return {"id": t.id}
+
+    # 作品 ID 可能要跟随一次短链重定向（≤6s），放在锁外做，
+    # 免得一个慢链接把其它任务的创建也堵住。
+    vid = ""
+    if not body.force:
+        try:
+            vid = dedupe.resolve_id(url, platform)
+        except Exception:
+            vid = ""
+
+    with _create_lock:
+        if not body.force:
+            dup, how = None, ""
+            try:
+                dup, how = dedupe.find_reusable(url, platform, vid=vid)
+            except Exception as e:      # 查重是增强功能，任何异常都不能挡住正常创建
+                logging.getLogger("uvicorn.error").warning(f"查重失败（已忽略）：{e}")
+            if dup is not None:
+                # 已有同一作品的记录：不再下载/转写，直接把记录交给前端跳转
+                logging.getLogger("uvicorn.error").info(
+                    f"重复链接已跳过：{url} -> 任务 {dup.id}（命中方式 {how}）")
+                return {
+                    "id": dup.id,
+                    "existing": True,
+                    "matched_by": how,
+                    "title": str((dup.meta or {}).get("title") or ""),
+                    "status": dup.status,
+                }
+
+        t = store.create(url, platform, _task_options(body.style, body.language, body.model))
+        t.log("info", f"任务创建：{url}")
+        store.save(t)
+        submit(t)
+        return {"id": t.id}
 
 
 @app.post("/api/tasks/upload")
@@ -989,7 +1028,7 @@ def _cloud_playback(tid: str, name: str, request: Request):
       1 → 服务端代拉再转发：部署机出网受限、或空间设为私有时只能这样
     """
     from . import store
-    from .qiniu_archive import remote_info, open_remote
+    from .qiniu_archive import remote_info, open_remote, s3_presign_url
 
     t = store.get(tid)
     if t is None:
@@ -999,7 +1038,11 @@ def _cloud_playback(tid: str, name: str, request: Request):
         # 没记过归档信息不代表云端一定没有——下载完就备份那一步还没跑时
         # 本地就被删了才会走到这里，只能如实告诉调用方没有。
         return None
-    url = info["url"]
+    # 旧 CDN 测试域名（*.clouddn.com）会被七牛 30 天回收，回收后解析到
+    # 127.0.0.1，302 跳过去必然失败。优先改用 S3 兼容协议的预签名地址：
+    # 独立的 s3.<region>.qiniucs.com 域名 + AK/SK 签名，不受回收影响，
+    # 且原生支持 Range。生成失败（如没配密钥）才回退到旧的 url。
+    url = s3_presign_url(info) or info["url"]
 
     if not _proxy_mode():
         return RedirectResponse(url, status_code=302)

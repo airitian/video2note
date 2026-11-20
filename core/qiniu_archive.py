@@ -432,6 +432,76 @@ def remote_info(t, name: str) -> dict | None:
     return None
 
 
+# 七牛 S3 兼容服务的区域与域名。测试域名（*.clouddn.com）会被七牛 30 天回收，
+# 回收后域名解析到 127.0.0.1，所有历史归档视频都播不了；S3 域名是独立的存储
+# API 入口，不受测试域名回收影响，必须带签名访问（七牛不支持匿名）。
+# 该 bucket 实测位于华南 cn-south-1；如迁移区域，改设置里的 qiniu_s3_region。
+S3_REGION_DEFAULT = "cn-south-1"
+S3_EXPIRES = 7200  # 预签名有效期 2 小时，足够看完一条视频；拖动进度会重新请求并刷新
+
+
+def _s3_client(c: dict):
+    """按需创建 boto3 S3 客户端（七牛 S3 兼容，path-style）。"""
+    import boto3
+    from botocore.config import Config
+    from .config import load_settings
+    region = (str(load_settings().get("qiniu_s3_region") or "").strip()
+              or S3_REGION_DEFAULT)
+    return boto3.client(
+        "s3",
+        aws_access_key_id=c["ak"],
+        aws_secret_access_key=c["sk"],
+        region_name=region,
+        endpoint_url=f"https://s3.{region}.qiniucs.com",
+        config=Config(signature_version="s3v4",
+                      s3={"addressing_style": "path"},
+                      connect_timeout=8, read_timeout=15,
+                      retries={"max_attempts": 2}),
+    )
+
+
+def s3_key_from(info: dict) -> str | None:
+    """从归档记录推断云端 object key。
+
+    归档 url 形如 https://<域名>/video2note/<tid>/<name>，其中第一段是上传时
+    的 prefix（qiniu_prefix）。取路径去掉开头斜杠即为 key。老记录若直接带
+    key 字段则优先用 key。
+    """
+    k = (info.get("key") or "").strip()
+    if k:
+        return k.lstrip("/")
+    url = (info.get("url") or "").strip()
+    if not url.startswith("http"):
+        return None
+    from urllib.parse import urlparse, unquote
+    path = unquote(urlparse(url).path).lstrip("/")
+    return path or None
+
+
+def s3_presign_url(info: dict, c: dict | None = None,
+                   expires: int = S3_EXPIRES) -> str | None:
+    """把归档记录转成 S3 预签名 GET 地址；失败返回 None（调用方回退旧逻辑）。
+
+    旧 CDN 测试域名被回收后已不可用，这条通道用独立的 S3 API 域名 + AK/SK 签名，
+    浏览器/服务端都能凭预签名地址读取对象，且原生支持 HTTP Range 拖进度。
+    """
+    c = c or cfg()
+    if not c["ak"] or not c["sk"] or not c["bucket"]:
+        return None
+    key = s3_key_from(info)
+    if not key:
+        return None
+    try:
+        client = _s3_client(c)
+        return client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": c["bucket"], "Key": key},
+            ExpiresIn=expires,
+        )
+    except Exception:
+        return None
+
+
 def open_remote(url: str, start: int | None = None, end: int | None = None,
                 timeout: tuple = (8, 30)):
     """服务器端代拉取云端的某一段字节（Range 透传，支持拖进度条）。
@@ -456,6 +526,10 @@ def resolve_missing(t, name: str) -> str | None:
     """
     m = ((t.meta or {}).get("archived") or {}).get(name)
     if isinstance(m, dict):
+        # 优先 S3 预签名（测试域名被回收后旧 url 已不可用）
+        s3 = s3_presign_url(m)
+        if s3:
+            return s3
         u = (m.get("url") or "").strip()
         if u.startswith("http"):
             return u

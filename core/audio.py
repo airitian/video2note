@@ -27,6 +27,53 @@ def _run(args: list[str]) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(args, 127, "", f"executable not found: {args[0]}")
 
 
+def _is_thread_starvation(stderr: str) -> bool:
+    """识别 ffmpeg 因线程/进程数或内存耗尽、创建不出线程的失败
+
+    典型报错：`g thread with return code -11 (Resource temporarily
+    unavailable)`。容器里僵尸 chromedriver/chrome 进程堆积把
+    threads-max / pids 打满，或内存耗尽时都会中招。
+    """
+    s = stderr or ""
+    return ("return code -11" in s
+            or "Resource temporarily unavailable" in s
+            or "pthread_create" in s
+            or "Cannot allocate memory" in s)
+
+
+def _run_ffmpeg(args: list[str], dst: Path | None = None,
+                retries: int = 1) -> subprocess.CompletedProcess:
+    """跑 ffmpeg，带「输出非空」校验和 EAGAIN 退避重试
+
+    dst 传入时要求文件存在且大小 > 0——ffmpeg 线程创建失败时
+    也会留下一个 0 字节的空文件（`Output file is empty`），
+    只查 exists 会把失败当成功。
+    """
+    last: subprocess.CompletedProcess | None = None
+    for attempt in range(retries + 1):
+        r = _run(args)
+        last = r
+        if r.returncode == 0 and (dst is None or (dst.exists() and dst.stat().st_size > 0)):
+            return r
+        if attempt < retries and _is_thread_starvation(r.stderr or ""):
+            time.sleep(1.5 * (attempt + 1))  # 瞬时资源紧张，退避后重试
+            continue
+        break
+    return last
+
+
+def _thread_starvation_hint(stderr: str) -> str:
+    """线程耗尽类失败附排查命令，其他错误原样返回"""
+    if not _is_thread_starvation(stderr):
+        return stderr
+    return (stderr + "\n[排查] 系统线程/进程数或内存已耗尽（常见原因：僵尸 "
+            "chromedriver/chrome 进程堆积）。服务器可执行："
+            "`ps aux | grep -c chrome`；`free -m`；"
+            "`cat /proc/sys/kernel/threads-max`；"
+            "`docker stats --no-stream`。清理僵尸："
+            "`pkill -9 -f chromedriver; pkill -9 -f chrome`")
+
+
 def check_ffmpeg() -> None:
     # ffmpeg 装没装在进程生命周期内不会变，而 check_ffmpeg 在健康检查里
     # 会被前端每次打开页面都调一次。不缓存的话每次都要 fork 一个
@@ -80,10 +127,11 @@ def extract_audio(src: Path, dst: Path) -> Path:
     """从视频文件中抽出 16k 单声道 mp3，供 ASR 使用"""
     check_ffmpeg()
     dst.parent.mkdir(parents=True, exist_ok=True)
-    r = _run([ff_bin("ffmpeg"), "-hide_banner", "-y", "-i", str(src),
-              "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "64k", str(dst)])
-    if r.returncode != 0 or not dst.exists():
-        raise AudioError(f"从视频提取音频失败：{(r.stderr or '')[-400:]}")
+    r = _run_ffmpeg([ff_bin("ffmpeg"), "-hide_banner", "-y", "-i", str(src),
+                     "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "64k",
+                     "-threads", "1", str(dst)], dst)
+    if r.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
+        raise AudioError(f"从视频提取音频失败：{_thread_starvation_hint((r.stderr or '')[-400:])}")
     return dst
 
 
@@ -101,12 +149,13 @@ def mux(video: Path, audio: Path, out: Path) -> Path:
     common = ["-map", "0:v:0", "-map", "1:a:0", "-shortest", "-movflags", "+faststart"]
     attempts = [
         ["-c", "copy"],
-        ["-c:v", "copy", "-c:a", "aac", "-b:a", "128k"],
-        ["-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-c:a", "aac", "-b:a", "128k"],
+        ["-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-threads", "1"],
+        ["-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-c:a", "aac", "-b:a", "128k",
+         "-threads", "2"],
     ]
     last = ""
     for i, enc in enumerate(attempts):
-        r = _run([ff, "-hide_banner", "-y", "-i", str(video), "-i", str(audio)] + enc + common + [str(out)])
+        r = _run_ffmpeg([ff, "-hide_banner", "-y", "-i", str(video), "-i", str(audio)] + enc + common + [str(out)], out)
         last = (r.stderr or "")[-400:]
         if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
             c = audio_codec(out)
@@ -152,12 +201,12 @@ def to_h264(src: Path, dst: Path, crf: int = 26) -> Path:
     check_ffmpeg()
     dst.parent.mkdir(parents=True, exist_ok=True)
     ff = ff_bin("ffmpeg")
-    r = _run([ff, "-hide_banner", "-y", "-i", str(src),
-              "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
-              "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-              "-movflags", "+faststart", str(dst)])
+    r = _run_ffmpeg([ff, "-hide_banner", "-y", "-i", str(src),
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf),
+                     "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                     "-movflags", "+faststart", "-threads", "2", str(dst)], dst)
     if r.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
-        raise AudioError(f"转码为 H.264 失败：{(r.stderr or '')[-400:]}")
+        raise AudioError(f"转码为 H.264 失败：{_thread_starvation_hint((r.stderr or '')[-400:])}")
     return dst
 
 
@@ -358,7 +407,12 @@ def _transcode(src: Path, dst: Path, start: float | None = None, dur: float | No
     args += ["-i", str(src)]
     if dur is not None:
         args += ["-t", f"{dur:.3f}"]
-    args += ["-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "64k", str(dst)]
-    r = _run(args)
-    if r.returncode != 0 or not dst.exists():
-        raise AudioError(f"音频转码失败：{(r.stderr or '')[-400:]}")
+    # -threads 1：16k 单声道 mp3 是极轻量转码，libmp3lame 本身单线程，
+    # 完全不需要 ffmpeg 的编码线程池。容器内线程/进程数打满时
+    # （僵尸 chrome 进程堆积、pids limit、内存耗尽），默认多线程会
+    # 创建失败并报 `g thread with return code -11`，输出 0 字节空文件。
+    args += ["-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "64k",
+             "-threads", "1", str(dst)]
+    r = _run_ffmpeg(args, dst)
+    if r.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
+        raise AudioError(f"音频转码失败：{_thread_starvation_hint((r.stderr or '')[-400:])}")
