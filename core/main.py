@@ -887,7 +887,10 @@ def retry_task(tid: str, request: Request, force_media: int = 0):
     force_media=1：先清掉本地媒体再重跑（媒体损坏、复用校验不过时用）。
     """
     t = _get_visible_task(request, tid)
-    if t.status not in ("failed", "canceled"):
+    # 整理失败的任务状态是 transcribed（原文还在），靠 failed_stage 分流，
+    # 也必须放行——旧条件只认 failed/canceled，整理失败永远点不了重试。
+    polish_failed = t.status == "transcribed" and t.failed_stage == "polishing"
+    if t.status not in ("failed", "canceled") and not polish_failed:
         raise HTTPException(400, "只有失败或已取消的任务才能重试")
     action = pipeline_retry(t, force_media=bool(force_media))
     if action == "busy":

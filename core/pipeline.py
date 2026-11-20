@@ -97,6 +97,16 @@ def _check_cancel(t: store.Task) -> None:
         raise InterruptedError("任务已取消")
 
 
+def _check_alive(t: store.Task) -> None:
+    """删除墓碑检查：任务已被删除时立即中止，不再继续落盘/推进。
+
+    与 store.save 的墓碑拦截互为双保险：save 拦截保证记录不复活，
+    这里保证 worker 不再白白下载/转写一个用户已经删掉的任务。
+    """
+    if store.is_deleted(t.id):
+        raise InterruptedError("任务已被删除")
+
+
 def _run_and_catch(t: store.Task, body: Callable[[], None]) -> bool:
     """统一的异常收敛：线程版与同步版共用一套终态语义"""
     try:
@@ -154,6 +164,7 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
 
         meta = downloader.download_media(t.url, workdir, progress=prog)
 
+    _check_alive(t)          # 下载期间被删除：到此为止，不再往下跑
     t.meta = meta
     if meta.get("mux_warning"):
         t.log("warn", f"音视频合并失败，当前为无声视频：{meta['mux_warning'][:200]}")
@@ -317,6 +328,7 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
     while th.is_alive():
         th.join(timeout=0.3)
         _check_cancel(t)
+        _check_alive(t)
     th.join()
     if run_err:
         raise run_err[0]
@@ -453,6 +465,7 @@ def _sync_variant_meta(t: store.Task) -> None:
 def _polish_body(t: store.Task, style: str, emit: EmitFn = None, force: bool = False) -> None:
     """在已有转写文本基础上做 LLM 整理。异常直接向上抛"""
     _check_cancel(t)
+    _check_alive(t)
     if not t.transcript:
         raise RuntimeError("没有可整理的转写文本，请先完成转写")
 
@@ -501,6 +514,7 @@ def _polish_body(t: store.Task, style: str, emit: EmitFn = None, force: bool = F
 
     t.stage = "done"
     t.status = "done"
+    t.failed_stage = ""
     t.spercent = 100
     t.percent = 100
     t.error = ""
@@ -522,7 +536,7 @@ def _polish_body(t: store.Task, style: str, emit: EmitFn = None, force: bool = F
 
 # ============================ 对外接口 ============================
 
-def retry(t: store.Task) -> str:
+def retry(t: store.Task, force_media: bool = False) -> str:
     """从失败处重试，返回本次要执行的动作（transcribe / polish）。
 
     分两类：
@@ -531,11 +545,17 @@ def retry(t: store.Task) -> str:
       _transcribe_body 开头会检测本地已有媒体并复用，所以不会重复下载。
 
     canceled 也允许重试：用户主动取消后通常就是想再跑一次。
+    force_media=True：先清掉本地媒体与 meta，强制重新下载（媒体损坏时用；
+    上传任务的源文件就是媒体本身，不清，避免把用户文件删了无处重下）。
     """
     if t.status == "running":
         return "busy"
 
     t._cancel = False
+    if force_media and not (t.options or {}).get("source_file"):
+        shutil.rmtree(MEDIA_DIR / t.id, ignore_errors=True)
+        t.meta = {}
+        t.log("info", "已清除本地媒体，重试将重新下载")
     stage = t.failed_stage or ""
 
     # 整理阶段失败：原文完好，只补这一段
@@ -559,6 +579,8 @@ def retry(t: store.Task) -> str:
 
 
 def submit(t: store.Task) -> None:
+    if store.is_deleted(t.id):
+        return
     t.status = "running"
     store.save(t)
     _executor.submit(lambda: _run_and_catch(t, lambda: _transcribe_body(t)))
@@ -628,9 +650,12 @@ def _catch_polish(t: store.Task, style: str, force: bool = False) -> bool:
         store.save(t)
         return False
     except Exception as e:
-        # 失败回退到「已转写」，允许重试
+        # 失败回退到「已转写」，允许重试。★必须记 failed_stage="polishing"：
+        # retry() 靠它分流到「只重跑整理」；旧代码漏设，整理失败的任务
+        # 既进不了 retry（状态是 transcribed 而非 failed），分流也无从谈起。
         t.status = "transcribed"
         t.stage = "transcribed"
+        t.failed_stage = "polishing"
         t.spercent = 100
         t.percent = RANGES["transcribing"][1]
         t.error = str(e)
@@ -671,10 +696,32 @@ def _existing_media(t: store.Task) -> dict | None:
     """该任务是否已在本地落盘？返回可复用的 meta，否则 None。
 
     典型场景：下载成功但转写因缺 Key / 网络抖动失败，重跑时不必重新下载。
+
+    ★复用前必须校验：旧实现只判 is_file()，半截/损坏的 audio.mp3 会被
+    无条件复用、直达切片阶段报错，且没有任何「强制重下」出口。
+    现在用 ffprobe 校验（文件大小 > 0 且能探到时长 > 0），不过则删掉
+    音视频强制重新下载。
     """
     meta = t.meta or {}
-    audio = meta.get("audio_path")
-    if not audio or not Path(audio).is_file():
+    audio_path = meta.get("audio_path")
+    if not audio_path or not Path(audio_path).is_file():
+        return None
+    p = Path(audio_path)
+    ok = False
+    try:
+        ok = p.stat().st_size > 0 and audio.probe_duration(p) > 0
+    except Exception:
+        ok = False
+    if not ok:
+        for key in ("audio_path", "video_path"):
+            fp = meta.get(key)
+            if fp:
+                try:
+                    Path(fp).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        t.log("warn", "本地已有媒体校验不通过（文件为空或 ffprobe 探不到时长），"
+                      "已删除，将重新下载")
         return None
     video = meta.get("video_path") or ""
     if video and not Path(video).is_file():
