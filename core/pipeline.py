@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import queue
 import shutil
 import threading
@@ -18,7 +19,22 @@ from typing import Callable
 from . import asr, audio, downloader, llm, store
 from .config import MEDIA_DIR, get_int_clamped, load_settings
 
-_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="v2n")
+def _max_workers() -> int:
+    """.env 的 MAX_WORKERS（或 V2N_MAX_WORKERS）真正接到线程池大小。
+
+    旧代码把 max_workers=2 写死，.env.example 里的 MAX_WORKERS 是摆设。
+    钳制 [1,8]：这台机器只有 2 核，池开太大只会互相抢 CPU/内存。
+    """
+    raw = (os.getenv("MAX_WORKERS") or os.getenv("V2N_MAX_WORKERS") or "").strip()
+    try:
+        v = int(float(raw)) if raw else 2
+    except ValueError:
+        v = 2
+    return max(1, min(v, 8))
+
+
+_executor = ThreadPoolExecutor(max_workers=_max_workers(),
+                               thread_name_prefix="v2n")
 
 # 阶段 -> 整体进度区间
 RANGES = {

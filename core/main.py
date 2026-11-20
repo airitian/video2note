@@ -21,6 +21,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import audio, dedupe, downloader, exporters, store
+from .log import get_logger as _get_struct_logger
+
+_access_log = _get_struct_logger("v2n.access")
+_app_log = _get_struct_logger("v2n.app")
 from .downloader import detect_platform, extract_url
 from .config import (ACCESS_TOKEN, ADMIN_TOKEN, HELP, MEDIA_DIR, ROOT, SECRET_KEYS,
                      SETTINGS_GROUPS, all_valid_tokens, ensure_cookie_file,
@@ -97,11 +101,75 @@ def _compute_health(force: bool = False) -> dict:
             **_build_info(refresh=force)}
 
 
+def _tree_size(root: Path) -> int:
+    total = 0
+    try:
+        for dirpath, _dirs, files in os.walk(root):
+            for fn in files:
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, fn))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def _disk_warn_bytes() -> int:
+    raw = (os.getenv("V2N_DISK_WARN_GB") or "").strip()
+    try:
+        gb = float(raw) if raw else 5.0
+    except ValueError:
+        gb = 5.0
+    return int(max(0.1, gb) * 1073741824)
+
+
+def _disk_info() -> dict:
+    """磁盘与任务分布快照（进 /api/health 的 disk 字段）。
+
+    data 目录总量 / media 总量 / 任务 JSON 总量、各状态任务数、
+    运行中与排队数。media 超 V2N_DISK_WARN_GB（默认 5GB）打 warning，
+    让磁盘打满在日志里提前可见，而不是等写入失败才发现。
+    """
+    from .config import DATA_DIR, TASK_DIR
+
+    media_bytes = _tree_size(MEDIA_DIR)
+    info = {
+        "data_dir_bytes": _tree_size(DATA_DIR),
+        "media_bytes": media_bytes,
+        "task_bytes": _tree_size(TASK_DIR),
+        "tasks_total": 0,
+        "by_status": {},
+        "running": 0,
+        "queued": 0,
+    }
+    try:
+        tasks = store.list_tasks()
+        info["tasks_total"] = len(tasks)
+        for t in tasks:
+            info["by_status"][t.status] = info["by_status"].get(t.status, 0) + 1
+        info["running"] = info["by_status"].get("running", 0)
+        info["queued"] = info["by_status"].get("pending", 0)
+    except Exception:
+        pass
+    limit = _disk_warn_bytes()
+    if media_bytes > limit:
+        _app_log.warning(
+            "media 目录已达 %.2f GB，超过告警阈值 %.2f GB"
+            "（V2N_DISK_WARN_GB）；检查 V2N_MEDIA_TTL_DAYS / 七牛归档清理",
+            media_bytes / 1073741824, limit / 1073741824)
+    return info
+
+
 def _refresh_health(force: bool = False) -> None:
     """算一次健康快照写进共享 dict（锁保护）。探测失败不影响已有快照。"""
     global _health_snapshot
     try:
         snap = _compute_health(force=force)
+        try:
+            snap["disk"] = _disk_info()
+        except Exception:
+            snap.setdefault("disk", None)
     except Exception:
         return
     with _health_lock:
@@ -252,6 +320,29 @@ def _is_token_required_endpoint(request: Request) -> bool:
     if m == "GET" and p.startswith("/api/media/"):
         return True
     return False
+
+
+@app.middleware("http")
+async def _request_log_mw(request: Request, call_next):
+    """请求日志（结构化 JSON 一行）：方法 / 路径 / 状态码 / 耗时。
+
+    SSE 长连接（/events）跳过：它一连就是几分钟，记完成日志没意义且刷屏。
+    """
+    if request.url.path.endswith("/events"):
+        return await call_next(request)
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+        status = response.status_code
+    except Exception:
+        ms = (time.perf_counter() - start) * 1000
+        _access_log.warning("%s %s -> 500 (%.1fms, handler exception)",
+                            request.method, request.url.path, ms)
+        raise
+    ms = (time.perf_counter() - start) * 1000
+    _access_log.info("%s %s -> %s (%.1fms)",
+                     request.method, request.url.path, status, ms)
+    return response
 
 
 @app.middleware("http")
@@ -624,7 +715,7 @@ async def health(refresh: int = 0):
         # 专属线程已在探测，下一次请求就有数据。
         snap = {"ffmpeg": None, "ffmpeg_msg": "", "yt_dlp": None,
                 "douyin_api": None, "browser": None, "browser_msg": "",
-                "playwright": None, "playwright_msg": "",
+                "playwright": None, "playwright_msg": "", "disk": None,
                 **_build_info()}
     # 显式关掉代理缓冲 + 禁止缓存：预览网关(monkeycode-ai.online)会缓冲
     # 响应，曾导致 SSE 推流到不了浏览器；即便普通 JSON 也带上，双保险。
@@ -822,6 +913,80 @@ def _check_content_length(request: Request) -> None:
                     413, f"文件超过上传上限 {_max_upload_bytes() // 1048576} MB")
         except ValueError:
             pass
+
+
+class BatchCreateBody(BaseModel):
+    urls: list[str]
+    style: str = "detailed"
+    language: str = "zh"
+    model: str = ""
+
+
+@app.post("/api/tasks/batch")
+async def create_tasks_batch(request: Request, body: BatchCreateBody):
+    """批量创建：逐条走与单条创建完全相同的逻辑（查重 + SSRF 校验），
+    单条失败不影响其他条，返回逐条结果。单批上限 50 条。"""
+    tok = _extract_token(request)
+    role = token_role(tok)
+    gate = gate_active()
+    if role is None and not gate:
+        raise HTTPException(401, "NEED_TOKEN：请先在右上角登录")
+    if gate and not tok:
+        raise HTTPException(402, "TOKEN_REQUIRED：创建任务需要访问令牌（兑换码）")
+    if tok and role is None:
+        raise HTTPException(401, "INVALID_TOKEN：令牌无效")
+    owner = token_identity(tok)
+    results = []
+    for raw in body.urls[:50]:
+        u = (raw or "").strip()
+        if not u:
+            results.append({"url": raw, "ok": False, "error": "空行已跳过"})
+            continue
+        try:
+            t, existing = _create_one(
+                u, body.style, body.language, body.model,
+                owner=owner,
+                visible=lambda x: _can_view(request, x))
+            results.append({"url": u, "ok": True, "id": t.id,
+                            "existing": existing})
+        except HTTPException as e:
+            results.append({"url": u, "ok": False, "error": str(e.detail)})
+        except Exception as e:      # noqa: BLE001 - 逐条隔离失败
+            results.append({"url": u, "ok": False, "error": str(e)})
+    ok_n = sum(1 for r in results if r["ok"])
+    return {"results": results, "created": ok_n, "total": len(results)}
+
+
+class TranscriptBody(BaseModel):
+    transcript: str
+
+
+@app.patch("/api/tasks/{tid}/transcript")
+async def patch_transcript(request: Request, tid: str, body: TranscriptBody):
+    """转写纠错：保存人工修订后的转写文本。
+
+    ASR 难免错字，旧流程只能整条重跑。现在可直接改原文：保存新转写，
+    并清掉基于旧转写的成稿/变体/签名（note、variants、note_sig、
+    note_info），任务回到「已转写」态，前端可一键重新整理出新成稿。
+    """
+    t = _get_visible_task(request, tid)
+    text = (body.transcript or "").strip()
+    if not text:
+        raise HTTPException(400, "转写文本不能为空")
+    if t.status == "running":
+        raise HTTPException(409, "任务运行中，不能修改转写")
+    t.transcript = text
+    t.note = ""
+    t.variants = {}
+    t.note_sig = ""
+    t.note_info = {}
+    if t.status == "done":
+        t.status = "transcribed"
+        t.stage = "transcribed"
+    t.error = ""
+    t.message = "转写已更新，可重新整理"
+    store.save(t)
+    return _task_detail(t)
 
 
 @app.post("/api/tasks/upload")
