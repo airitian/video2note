@@ -64,6 +64,12 @@
   let currentId = null;
   let pickedFile = null;
   let uploadPct = null;
+  // 任务搜索：query 非空时历史列表改用服务端过滤结果（historyItems）
+  let historyQuery = "";
+  let historyItems = [];
+  let historySearchTimer = null;
+  // 批量创建模式开关（多行链接一次提交）
+  let batchMode = false;
   let settingsCache = { values: {}, help: {} };
   // 记录设置接口的加载错误；为空表示加载正常
   let settingsLoadErr = "";
@@ -81,7 +87,7 @@
   // 而不是被 note_info.style（最后一次生成的）强行覆盖
   const viewStyle = new Map();
 
-  function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+  function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
 
   // 字数统计：中文按「不计空格」计，和 Word/WPS 的字符数口径一致。
   // 直接用 length() 会被换行与缩进灌水——转写稿是逐句拼出来的，空白占比很高。
@@ -335,6 +341,17 @@
         }
       };
       xhr.onload = () => {
+        // 先判状态码：413/401/500 的响应体不是任务 JSON，旧实现只试
+        // JSON.parse，服务端给出的具体原因（如超过上传上限）会被吞掉。
+        if (xhr.status < 200 || xhr.status >= 300) {
+          let msg = "上传失败 " + xhr.status;
+          try {
+            const d = JSON.parse(xhr.responseText);
+            if (d && d.detail) msg = String(d.detail);
+          } catch (e) {}
+          reject(new Error(msg));
+          return;
+        }
         try { resolve(JSON.parse(xhr.responseText)); }
         catch (e) { reject(new Error("上传失败 " + xhr.status)); }
       };
@@ -379,9 +396,19 @@
   }
 
   function renderHistory() {
-    const list = Array.from(tasks.values()).sort((a, b) => b.created_at - a.created_at);
+    // 搜索中：列表数据源是服务端按 q 过滤的结果（historyItems），
+    // 否则用本地全量任务。两者都是同一份摘要结构。
+    const src = historyQuery ? historyItems : Array.from(tasks.values());
+    const list = src.slice().sort((a, b) => b.created_at - a.created_at);
     const box = $("#history-list");
-    if (!list.length) { box.innerHTML = '<div class="empty">暂无记录</div>'; return; }
+    // 整表 innerHTML 重建会把滚动位置清零：长列表里每来一次进度推送
+    // 就跳回顶部，没法往下翻。先存 scrollTop，重建后恢复。
+    const keepTop = box.scrollTop;
+    if (!list.length) {
+      box.innerHTML = '<div class="empty">' + (historyQuery ? "没有匹配的任务" : "暂无记录") + "</div>";
+      box.scrollTop = keepTop;
+      return;
+    }
     box.innerHTML = list.map((t) => {
       const when = new Date((t.created_at || 0) * 1000);
       const time = isNaN(when.getTime()) ? "" : when.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
@@ -392,6 +419,7 @@
         '<button class="icon hdel" data-del="' + t.id + '" title="删除">×</button>' +
         "</div>";
     }).join("");
+    box.scrollTop = keepTop;
   }
 
   function renderWorkspace() {
@@ -892,6 +920,7 @@
     }
     const url = $("#url").value.trim();
     if (!url) { toast("请先上传文件或粘贴链接", true); return; }
+    if (batchMode) { await startBatch(url); return; }
     try {
       uploadPct = null;                 // 链接任务没有上传这一步
       const r = await api("/api/tasks", {
@@ -905,6 +934,85 @@
       }
       $("#url").value = "";
       afterCreate(r.id, false);
+    } catch (e) {
+      toast(e.message, true);
+    }
+  }
+
+  // 批量创建：输入框按行拆成多条链接，一次提交，逐条结果汇总提示。
+  async function startBatch(text) {
+    const urls = text.split(/\n+/).map((s) => s.trim()).filter(Boolean);
+    if (!urls.length) { toast("请先粘贴链接", true); return; }
+    try {
+      uploadPct = null;
+      const r = await api("/api/tasks/batch", {
+        method: "POST",
+        body: JSON.stringify({ urls: urls, style: curStyle })
+      });
+      const results = (r && r.results) || [];
+      const ok = results.filter((x) => x.ok);
+      const bad = results.filter((x) => !x.ok);
+      ok.forEach((x) => { if (x.id && !tasks.has(x.id)) refreshOne(x.id); });
+      if (ok.length) $("#url").value = "";
+      let msg = "批量创建完成：成功 " + ok.length + " 条";
+      if (bad.length) {
+        msg += "，失败 " + bad.length + " 条（" +
+          bad.slice(0, 2).map((x) => x.error || "未知错误").join("；") +
+          (bad.length > 2 ? "…" : "") + "）";
+      }
+      toast(msg, bad.length > 0 && ok.length === 0, 6000);
+      if (ok.length && ok[0].id) selectTask(ok[0].id);
+      render();
+    } catch (e) {
+      toast(e.message, true);
+    }
+  }
+
+  // 任务搜索：防抖 300ms 后带 q 拉列表（服务端按标题/转写过滤）。
+  async function reloadHistorySearch() {
+    if (!historyQuery) { renderHistory(); return; }
+    try {
+      const list = await api("/api/tasks?q=" + encodeURIComponent(historyQuery));
+      historyItems = Array.isArray(list) ? list : [];
+    } catch (e) {
+      historyItems = [];
+    }
+    renderHistory();
+  }
+
+  // 转写纠错：把当前任务的转写原文装进编辑框。
+  function openTranscriptEdit() {
+    const t = tasks.get(currentId);
+    if (!t) return;
+    if (t.status === "running" || t.status === "pending") {
+      toast("任务运行中，结束后再编辑转写", true);
+      return;
+    }
+    $("#edit-transcript-text").value = t.transcript || "";
+    $("#edit-modal").classList.remove("hidden");
+  }
+
+  async function saveTranscriptEdit() {
+    const text = $("#edit-transcript-text").value.trim();
+    if (!text) { toast("转写文本不能为空", true); return; }
+    try {
+      const r = await api("/api/tasks/" + currentId + "/transcript", {
+        method: "PATCH",
+        body: JSON.stringify({ transcript: text })
+      });
+      const t = tasks.get(currentId);
+      if (t) {
+        // 与后端保持一致：成稿/变体已清，状态回到已转写，可重新整理
+        t.transcript = r.transcript;
+        t.note = "";
+        t.variants = {};
+        t.note_sig = "";
+        t.status = r.status;
+        t.stage = r.stage;
+      }
+      $("#edit-modal").classList.add("hidden");
+      render();
+      toast("转写已保存，可点「重新整理」生成新成稿");
     } catch (e) {
       toast(e.message, true);
     }
@@ -971,7 +1079,9 @@
     const t = tasks.get(id);
     if (!t) return;
     pendingDeleteId = id;
-    const title = t.title || "(无标题)";
+    // 标题在 meta 里（列表行也是读 meta.title）；旧代码读 t.title
+    // 永远是 undefined，弹窗一直显示「(无标题)」。
+    const title = (t.meta && t.meta.title) || t.url || "(无标题)";
     $("#confirm-msg").innerHTML = "确定要删除这条记录吗？<br><b>" + esc(title)
       + "</b><br><span class=\"confirm-sub\">删除后无法恢复，视频与转写稿会一并清除。</span>";
     $("#confirm-modal").classList.remove("hidden");
@@ -1415,10 +1525,34 @@ if (rest.length) {
   $("#url").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) start();
   });
+  // 历史搜索：输入防抖后走服务端 q 过滤（标题/转写），清空恢复全量
+  const searchInput = $("#history-search");
+  if (searchInput) searchInput.addEventListener("input", () => {
+    historyQuery = searchInput.value.trim();
+    clearTimeout(historySearchTimer);
+    historySearchTimer = setTimeout(reloadHistorySearch, 300);
+  });
+  // 批量模式开关
+  const batchToggle = $("#batch-mode");
+  if (batchToggle) batchToggle.addEventListener("change", () => {
+    batchMode = !!batchToggle.checked;
+    $("#btn-start").textContent = batchMode ? "批量开始转写" : "开始转写";
+  });
+  // 转写编辑弹窗
+  const editBtn = $("#btn-edit-transcript");
+  if (editBtn) editBtn.addEventListener("click", openTranscriptEdit);
+  const saveEditBtn = $("#btn-save-edit");
+  if (saveEditBtn) saveEditBtn.addEventListener("click", saveTranscriptEdit);
+  ["#btn-close-edit", "#btn-cancel-edit"].forEach((sel) => {
+    const b = $(sel);
+    if (b) b.addEventListener("click", () => $("#edit-modal").classList.add("hidden"));
+  });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       $("#settings-modal").classList.add("hidden");
       $("#confirm-modal").classList.add("hidden");
+      const em = $("#edit-modal");
+      if (em) em.classList.add("hidden");
       closeDrawers();
       pendingDeleteId = null;
       if (!$("#auth-modal").classList.contains("hidden")) settleAuth(false);
