@@ -465,7 +465,7 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 
 /* —— 文字稿：阅读字号/行距上调；当前播放行加左侧色条，比整行铺色更易定位；
    时间列整体右移（行左内衬加大），避免时间贴着面板左缘被裁切 */
-.line { font-size: 13.5px; line-height: 1.75; padding-left: 22px; gap: 8px; }
+.line { font-size: 13.5px; line-height: 1.75; padding-left: 0px; }
 .line time { width: 21px; }
 .line.active { box-shadow: inset 3px 0 0 var(--primary); }
 
