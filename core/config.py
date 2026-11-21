@@ -262,7 +262,7 @@ DEFAULTS: dict[str, str] = {
     # 模型轮换名单（逗号分隔）：每条新视频分配一个模型、四种风格都用它生成，
     # 下一条视频换下一个；留空 = 不轮换，全部用 llm_model。
     # 五家均已于 2026-11-22 在 ModelScope 端点实测可调（裸名直调）。
-    "llm_rotation_models": "deepseek-ai/DeepSeek-V4.1-Flash-1017,deepseek-ai/DeepSeek-V4-Pro-0813,MiniMax/MiniMax-M3.1-Flash,ZhipuAI/GLM-5.3-Flash,Qwen/Qwen3.8-27B",
+    "llm_rotation_models": "deepseek-ai/DeepSeek-V4.1-Flash-1017,deepseek-ai/DeepSeek-V4-Pro-0813,MiniMax/MiniMax-M3.1-Flash,ZhipuAI/GLM-5.3-Flash,Qwen/Qwen3.8-27B,moonshotai/Kimi-K3.1-Pro:DashScope",
     "llm_api_key_fallback": "",   # 备用 Key（SECRET_KEYS，只落 secrets.json）
     # ---- 工程参数 ----
     "chunk_seconds": "180",
