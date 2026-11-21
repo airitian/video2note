@@ -139,6 +139,11 @@ def _config(model_override: str | None = None,
 _NO_TEMP_PATTERNS = ("kimi",)
 
 
+# 流式生成的总时长上限（秒）：单次调用超过即判失败，避免慢滴流把
+# 生成/质检线程无限期挂住。实测最长的正常单次调用约 3 分钟。
+_STREAM_DEADLINE_S = 480
+
+
 def _model_omits_temperature(model: str) -> bool:
     m = (model or "").lower()
     return any(p in m for p in _NO_TEMP_PATTERNS)
@@ -253,7 +258,16 @@ def _chat_openai(cfg: dict, system: str, user: str) -> str:
         kwargs["temperature"] = cfg["temperature"]
     stream = client.chat.completions.create(**kwargs)
     parts: list[str] = []
+    deadline = time.monotonic() + _STREAM_DEADLINE_S
     for chunk in stream:
+        if time.monotonic() > deadline:
+            # SDK 的 timeout 只管单次读间隔，慢滴流（每 <600s 来一个
+            # chunk）能把线程无限期挂住，这里加总时长上限兜底
+            try:
+                stream.close()
+            except Exception:
+                pass
+            raise LLMError(f"LLM 流式生成超时（超过 {_STREAM_DEADLINE_S} 秒未完成），已中断")
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
@@ -638,7 +652,7 @@ def review_note(source: str, note: str, style: str,
     for attempt in range(2):
         try:
             raw = chat(SYSTEM, prompt, model=judge_model,
-                       temperature=0.2, max_retries=1)
+                       temperature=0.2, max_retries=0)
         except Exception as e:
             return {"fit": "未评", "problems": [f"质检调用失败：{e}"[:160]], "suggestions": []}
         parsed = _parse_review(raw) or _salvage_review(raw)

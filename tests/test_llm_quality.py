@@ -147,3 +147,44 @@ def test_review_note_retries_after_garbage(monkeypatch):
     monkeypatch.setattr(llm, "chat", lambda s, u, **kw: next(replies))
     r = llm.review_note("原文", "成稿", "digest", None)
     assert r["fit"] == "符合"
+
+
+def test_stream_deadline_aborts_slow_drip(monkeypatch):
+    import time as _time
+
+    import openai as _oai
+
+    class FakeDelta:
+        content = "甲"
+
+    class FakeChoice:
+        delta = FakeDelta()
+
+    class FakeChunk:
+        choices = [FakeChoice()]
+
+    def fake_stream():
+        yield FakeChunk()
+        _time.sleep(0.2)
+        yield FakeChunk()
+
+    class FakeCompletions:
+        def create(self, **kw):
+            return fake_stream()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        def __init__(self, **kw):
+            self.chat = FakeChat()
+
+    monkeypatch.setattr(_oai, "OpenAI", FakeClient)
+    monkeypatch.setattr(llm, "_STREAM_DEADLINE_S", 0.05)
+    cfg = {"base": "http://x", "key": "k", "model": "m", "max_tokens": 10,
+           "temperature": 0.1, "protocol": "openai"}
+    try:
+        llm._chat_openai(cfg, "s", "u")
+        raise AssertionError("慢滴流应触发超时")
+    except llm.LLMError as e:
+        assert "超时" in str(e)
