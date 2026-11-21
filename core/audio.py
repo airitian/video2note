@@ -161,6 +161,21 @@ def extract_audio(src: Path, dst: Path) -> Path:
     return dst
 
 
+def extract_cover(src: Path, dst: Path) -> Path:
+    """从视频抽一帧作封面（poster 回显用）。先试 2 秒处（避开黑场片头），
+    失败再退到首帧；两次都失败抛 AudioError，由调用方记 warn 后忽略。"""
+    check_ffmpeg()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    for ss in ("2", "0"):
+        r = _run_ffmpeg([ff_bin("ffmpeg"), "-hide_banner", "-y",
+                         "-ss", ss, "-i", str(src), "-frames:v", "1",
+                         "-vf", "scale='min(640,iw)':-2", "-q:v", "3",
+                         "-threads", "1", str(dst)], dst)
+        if r.returncode == 0 and dst.exists() and dst.stat().st_size > 0:
+            return dst
+    raise AudioError("视频抽帧失败（源文件可能没有视频轨）")
+
+
 def mux(video: Path, audio: Path, out: Path) -> Path:
     """合并视频轨与音频轨为可直接在浏览器播放的 mp4
 

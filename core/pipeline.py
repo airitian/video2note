@@ -185,6 +185,7 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
     if meta.get("mux_warning"):
         t.log("warn", f"音视频合并失败，当前为无声视频：{meta['mux_warning'][:200]}")
     t.log("info", f"获取媒体：{meta['title']}（{int(meta.get('duration') or 0)} 秒）")
+    _ensure_cover(t, meta)
     store.save(t)
 
     # 注：源视频的七牛云备份已改为「AI 去重（整理）成功后」触发，
@@ -679,6 +680,26 @@ def _catch_polish(t: store.Task, style: str, force: bool = False) -> bool:
         t.log("error", str(e))
         store.save(t)
         return False
+
+
+def _ensure_cover(t: store.Task, meta: dict) -> None:
+    """给视频生成封面图 cover.jpg（播放器 poster 回显）。纯音频跳过；
+    失败只记 warn，绝不影响转写主流程。"""
+    vp = (meta or {}).get("video_path")
+    if not vp:
+        return
+    src = Path(vp)
+    dst = src.parent / "cover.jpg"
+    if dst.is_file() and dst.stat().st_size > 0:
+        meta["cover"] = "cover.jpg"
+        return
+    try:
+        audio.extract_cover(src, dst)
+        if dst.is_file() and dst.stat().st_size > 0:
+            meta["cover"] = "cover.jpg"
+            t.log("info", "已生成视频封面")
+    except Exception as e:
+        t.log("warn", f"生成视频封面失败（不影响转写）：{e}")
 
 
 def _ensure_playable_video(t: store.Task, meta: dict, emit: EmitFn = None) -> None:

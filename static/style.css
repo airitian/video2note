@@ -174,7 +174,7 @@ main { min-width: 0; padding: 0; }
 
 .composer .input-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .tab-head { font-size: 12px; font-weight: 600; color: var(--text-2); margin-bottom: 6px; }
-.drop { border: 1.5px dashed var(--border-strong); border-radius: 10px; min-height: 84px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; text-align: center; cursor: pointer; padding: 12px; transition: border-color .15s, background .15s; }
+.drop { border: 1.5px dashed var(--border-strong); border-radius: 10px; width: min(100%, 400px); aspect-ratio: 4 / 3; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; text-align: center; cursor: pointer; padding: 12px; transition: border-color .15s, background .15s; }
 .drop:hover, .drop.over { border-color: var(--primary); background: var(--primary-soft); }
 .up-ico { font-size: 20px; color: var(--primary); line-height: 1; }
 .up-t1 { font-size: 13.5px; }

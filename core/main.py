@@ -413,6 +413,8 @@ MEDIA_TYPES = {
     ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".aac": "audio/aac",
     ".wav": "audio/wav", ".flac": "audio/flac", ".ogg": "audio/ogg",
     ".opus": "audio/opus", ".wma": "audio/x-ms-wma",
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".webp": "image/webp",
 }
 
 
@@ -1459,6 +1461,14 @@ def media(tid: str, name: str, request: Request, download: int = 0):
     if "/" in name or "\\" in name or name.startswith("."):
         raise HTTPException(404, "不支持的媒体文件")
     p = MEDIA_DIR / tid / name
+    if not download and not _proxy_mode():
+        # 优先云端播放：已归档七牛的媒体直接 302 到 CDN 预签名地址，
+        # 播放不占本机出口带宽（NAT 小带宽下本地直出必然卡顿）；
+        # 未归档 / 云端没有这份文件时回落下面的本地直出。
+        # 代理模式（qiniu_proxy=1）除外：那本来就要经本机转发，绕不开带宽。
+        remote = _cloud_playback(tid, name, request)
+        if remote is not None:
+            return remote
     if not p.is_file():
         # 本地文件已被清理（过期释放 / 用户手动删除）。此时从对象存储回显：
         # 前端与 <video src> 的地址「/api/media/{tid}/{name}」一律不用改，

@@ -559,7 +559,10 @@
     // 本地上传的视频落盘名是 source<原后缀>，写死会导致预览区一直空白
     const fname = vp.split(/[\\/]/).pop();
     const kind = (fname.match(/\.(mp3|m4a|aac|wav|flac|ogg|opus|wma)$/i)) ? "audio" : "video";
-    host.innerHTML = '<' + kind + ' controls preload="metadata" playsinline src="/api/media/'
+    // 有封面时作 poster：点开任务先回显封面，而不是黑屏/空白
+    const poster = (kind === "video" && t && t.meta && t.meta.cover)
+      ? ' poster="/api/media/' + currentId + "/" + encodeURIComponent(t.meta.cover) + '"' : "";
+    host.innerHTML = '<' + kind + ' controls preload="metadata" playsinline' + poster + ' src="/api/media/'
       + currentId + "/" + encodeURIComponent(fname) + '"></' + kind + '>';
     ws.videoEl = host.querySelector(kind);
     if (kind === "video" && ws.videoEl) {
