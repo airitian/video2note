@@ -542,8 +542,17 @@
     const host = $("#video-host");
     const lines = $("#lines");
     if (!host || !lines) return;
-    if (host.querySelector("video")) lines.style.height = host.clientHeight + "px";
-    else lines.style.height = "";
+    if (host.querySelector("video")) {
+      // 视频面板已无标题行，文本稿面板还带一行标题：
+      // 稿件区高度 = 视频高度 − 标题行占用，两块面板整体等高
+      const head = lines.parentElement && lines.parentElement.querySelector(".pane-head");
+      let extra = 0;
+      if (head) {
+        const mb = parseFloat(getComputedStyle(head).marginBottom) || 0;
+        extra = head.offsetHeight + mb;
+      }
+      lines.style.height = Math.max(120, host.clientHeight - extra) + "px";
+    } else lines.style.height = "";
   }
   window.addEventListener("resize", syncLinesHeight);
   if (window.ResizeObserver) {
