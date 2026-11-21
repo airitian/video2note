@@ -172,7 +172,8 @@ code, pre, .mono { font-family: var(--wb-font-mono); }
 main { min-width: 0; padding: 0; }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 13px 15px; }
 
-.composer .input-grid { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 12px; }
+.composer { padding: 8px 10px; }
+.composer .input-grid { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 10px; }
 .input-col { display: flex; flex-direction: column; min-width: 0; }
 .tab-head { font-size: 12px; font-weight: 600; color: var(--text-2); margin-bottom: 6px; }
 .drop { border: 1.5px dashed var(--border-strong); border-radius: 10px; flex: 1; min-height: 104px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; text-align: center; cursor: pointer; padding: 12px; transition: border-color .15s, background .15s; }
