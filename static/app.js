@@ -595,7 +595,7 @@
     // 有封面时作 poster：点开任务先回显封面，而不是黑屏/空白
     const poster = (kind === "video" && t && t.meta && t.meta.cover)
       ? ' poster="/api/media/' + currentId + "/" + encodeURIComponent(t.meta.cover) + '"' : "";
-    host.innerHTML = '<' + kind + ' controls preload="metadata" playsinline' + poster + ' src="/api/media/'
+    host.innerHTML = '<' + kind + ' controls preload="' + (kind === "video" ? "auto" : "metadata") + '" playsinline' + poster + ' src="/api/media/'
       + currentId + "/" + encodeURIComponent(fname) + '"></' + kind + '>';
     ws.videoEl = host.querySelector(kind);
     if (prev && ws.videoEl) {

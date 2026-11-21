@@ -208,6 +208,70 @@ def mux(video: Path, audio: Path, out: Path) -> Path:
     raise AudioError(f"视频合并失败：{last}")
 
 
+def _moov_at_front(path: Path) -> bool:
+    """MP4/MOV 顶层原子扫描：moov 出现在 mdat 之前即已 faststart。
+
+    解析失败（非标准容器、文件过小等）一律按「已在前面」处理，跳过重封装。
+    """
+    try:
+        with open(path, "rb") as f:
+            for _ in range(64):
+                header = f.read(8)
+                if len(header) < 8:
+                    return True
+                size = int.from_bytes(header[:4], "big")
+                atype = header[4:8]
+                if size == 1:
+                    ext = f.read(8)
+                    if len(ext) < 8:
+                        return True
+                    size = int.from_bytes(ext, "big")
+                    header_len = 16
+                elif size == 0:
+                    return True  # 延伸到文件尾的原子，只可能是 mdat 在最后
+                else:
+                    header_len = 8
+                if atype == b"moov":
+                    return True
+                if atype == b"mdat":
+                    return False
+                if size < header_len:
+                    return True
+                f.seek(size - header_len, 1)
+        return True
+    except Exception:
+        return True
+
+
+def ensure_faststart(path: Path) -> bool:
+    """moov 在文件尾的 mp4/mov 补一遍 faststart 重封装（-c copy 不重编码）。
+
+    返回 True 表示做了重封装。非 mp4 容器、已 faststart、或重封装失败
+    都返回 False（失败时保留原文件，不影响主流程）。
+    """
+    if path.suffix.lower() not in (".mp4", ".mov", ".m4v"):
+        return False
+    if not path.is_file() or _moov_at_front(path):
+        return False
+    check_ffmpeg()
+    ff = ff_bin("ffmpeg")
+    tmp = path.with_name(path.stem + ".faststart" + path.suffix)
+    try:
+        r = _run_ffmpeg([ff, "-hide_banner", "-y", "-i", str(path),
+                         "-c", "copy", "-movflags", "+faststart", str(tmp)], tmp)
+        if r.returncode != 0 or not tmp.is_file():
+            tmp.unlink(missing_ok=True)
+            return False
+        tmp.replace(path)
+        return True
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+
 def video_codec(path: Path) -> str:
     """探测视频轨编码名（h264 / hevc / ...），没有视频轨时返回 ''"""
     r = _run([ff_bin("ffmpeg"), "-hide_banner", "-i", str(path)])

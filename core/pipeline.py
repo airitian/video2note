@@ -167,6 +167,7 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
         t.log("info", "检测到本地已有该任务的媒体文件，跳过下载")
         # 历史任务可能是 HEVC（浏览器放不出画面），顺手修一次
         _ensure_playable_video(t, meta, emit)
+        _ensure_faststart(t, meta)
     else:
         _check_cancel(t)
         _set(t, "downloading", 0.0, "正在解析并下载视频", emit=emit)
@@ -179,6 +180,9 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
                 _set(t, "extracting", (pct - 90) / 10.0, msg, emit=emit)
 
         meta = downloader.download_media(t.url, workdir, progress=prog)
+        # 直下的单文件可能 moov 索引在文件尾：补一遍 faststart 重封装，
+        # 保证浏览器拿到开头就能起播，不必先把文件拉完
+        _ensure_faststart(t, meta)
 
     _check_alive(t)          # 下载期间被删除：到此为止，不再往下跑
     t.meta = meta
@@ -188,8 +192,10 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
     _ensure_cover(t, meta)
     store.save(t)
 
-    # 注：源视频的七牛云备份已改为「AI 去重（整理）成功后」触发，
-    # 见 _polish_body 末尾的 _schedule_backup(t)，不再在媒体落盘时备份。
+    # 媒体落盘即触发七牛备份（后台异步上传，不拖慢转写主流程）：
+    # 播放可以尽早走云端，不必等生成文稿后才备份。
+    # _polish_body 末尾的调用保留作兜底（备份模块自身幂等，重复触发无妨）。
+    _schedule_backup(t)
 
     _check_cancel(t)
     if not src:
@@ -733,6 +739,18 @@ def _ensure_playable_video(t: store.Task, meta: dict, emit: EmitFn = None) -> No
         except Exception:
             pass
         t.log("warn", f"转码为 H.264 失败，预览可能只有声音：{e}")
+
+
+def _ensure_faststart(t: store.Task, meta: dict) -> None:
+    """下载/复用的视频若 moov 索引在文件尾，补一遍 faststart 重封装（不重编码）"""
+    vp = (meta or {}).get("video_path")
+    if not vp:
+        return
+    try:
+        if audio.ensure_faststart(Path(vp)):
+            t.log("info", "视频索引已前置（faststart），起播更快")
+    except Exception:
+        pass  # 加分项，失败不影响主流程
 
 
 def _existing_media(t: store.Task) -> dict | None:
