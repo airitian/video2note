@@ -602,6 +602,28 @@ def _parse_review(raw: str) -> dict | None:
             "suggestions": [str(x) for x in sugs][:5] if isinstance(sugs, list) else []}
 
 
+def _salvage_review(raw: str) -> dict | None:
+    """JSON 整体解析失败时的兜底：正则抓 fit 与两个数组的条目。
+
+    大模型偶尔会在 JSON 前后夹带推理文字或把引号写错，整段解析失败；
+    能抓到 fit 就先给结论，问题/建议抓多少算多少。
+    """
+    text = raw or ""
+    m = re.search(r"(不符合|基本符合|符合)", text)
+    if not m:
+        return None
+
+    def grab(key: str) -> list[str]:
+        km = re.search(key + r'"\s*:\s*\[(.*?)\]', text, re.DOTALL)
+        if not km:
+            return []
+        return [s.strip() for s in
+                re.findall(r'"([^"]{2,200})"', km.group(1))][:5]
+
+    return {"fit": m.group(1), "problems": grab("problems"),
+            "suggestions": grab("suggestions")}
+
+
 def review_note(source: str, note: str, style: str,
                 judge_model: str | None = None) -> dict:
     """生成后质检：对照风格要求评价一篇成稿，返回 {fit, problems, suggestions}。
@@ -609,17 +631,21 @@ def review_note(source: str, note: str, style: str,
     质检失败不抛异常，返回「未评」加失败原因——质检是旁路，不能拖垮主流程。
     """
     rubric = STYLE_RUBRICS.get(style, STYLE_RUBRICS["general"])
-    try:
-        raw = chat(SYSTEM, QC_TMPL.format(rubric=rubric,
-                                          source=(source or "")[:16000],
-                                          note=(note or "")[:16000]),
-                   model=judge_model, temperature=0.2, max_retries=1)
-    except Exception as e:
-        return {"fit": "未评", "problems": [f"质检调用失败：{e}"[:160]], "suggestions": []}
-    parsed = _parse_review(raw)
-    if parsed is None:
-        return {"fit": "未评", "problems": ["质检回复无法解析"], "suggestions": []}
-    return parsed
+    prompt = QC_TMPL.format(rubric=rubric,
+                            source=(source or "")[:16000],
+                            note=(note or "")[:16000])
+    raw = ""
+    for attempt in range(2):
+        try:
+            raw = chat(SYSTEM, prompt, model=judge_model,
+                       temperature=0.2, max_retries=1)
+        except Exception as e:
+            return {"fit": "未评", "problems": [f"质检调用失败：{e}"[:160]], "suggestions": []}
+        parsed = _parse_review(raw) or _salvage_review(raw)
+        if parsed is not None and parsed["fit"] != "未评":
+            return parsed
+        # 回复格式漂移（夹带推理/引号错误）时重试一次，多数能回到 JSON
+    return {"fit": "未评", "problems": ["质检回复无法解析"], "suggestions": []}
 
 
 def _strip_fence(text: str) -> str:

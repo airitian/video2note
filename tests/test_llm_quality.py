@@ -130,3 +130,20 @@ def test_polish_long_general_is_verbatim_cleaned(monkeypatch):
         assert f"包含具体事实与数字{i}" in out
 
 
+
+
+def test_review_note_salvages_loose_reply(monkeypatch):
+    # 裁判回复夹带推理文字、JSON 不完整时，正则兜底抓 fit 与条目
+    loose = ('我先分析一下……结论如下：{"fit": "基本符合", '
+             '"problems": ["标题太长", "少了数据"], "suggestions": ["缩短标题"]}')
+    monkeypatch.setattr(llm, "chat", lambda s, u, **kw: loose)
+    r = llm.review_note("原文", "成稿", "article", None)
+    assert r["fit"] == "基本符合"
+    assert "标题太长" in r["problems"]
+
+
+def test_review_note_retries_after_garbage(monkeypatch):
+    replies = iter(["完全不是 JSON", '{"fit": "符合", "problems": [], "suggestions": []}'])
+    monkeypatch.setattr(llm, "chat", lambda s, u, **kw: next(replies))
+    r = llm.review_note("原文", "成稿", "digest", None)
+    assert r["fit"] == "符合"
