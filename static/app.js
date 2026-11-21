@@ -62,14 +62,12 @@
     pollers.set(tid, iv);
   }
   let currentId = null;
-  let pickedFile = null;
+  let pickedFiles = [];
   let uploadPct = null;
   // 任务搜索：query 非空时历史列表改用服务端过滤结果（historyItems）
   let historyQuery = "";
   let historyItems = [];
   let historySearchTimer = null;
-  // 批量创建模式开关（多行链接一次提交）
-  let batchMode = false;
   let settingsCache = { values: {}, help: {} };
   // 记录设置接口的加载错误；为空表示加载正常
   let settingsLoadErr = "";
@@ -540,6 +538,21 @@
     }
   }
 
+  // 文字稿高度跟随视频框：有视频时把稿件区高度设为视频框的实际高度，
+  // 视频多高它多高（不写死）；没视频时清掉内联高度，走 CSS 兜底上限。
+  function syncLinesHeight() {
+    const host = $("#video-host");
+    const lines = $("#lines");
+    if (!host || !lines) return;
+    if (host.querySelector("video")) lines.style.height = host.clientHeight + "px";
+    else lines.style.height = "";
+  }
+  window.addEventListener("resize", syncLinesHeight);
+  if (window.ResizeObserver) {
+    const vh = $("#video-host");
+    if (vh) new ResizeObserver(() => syncLinesHeight()).observe(vh);
+  }
+
   function ensureVideo(t) {
     const host = $("#video-host");
     const vp = t && t.meta && t.meta.video_path;
@@ -929,14 +942,23 @@
 
   // ---------- 动作 ----------
   async function start() {
-    if (pickedFile) {
-      uploadPct = 0;
+    if (pickedFiles.length) {
+      // 默认就是批量：选了几个文件就逐个上传、各自建任务
+      const files = pickedFiles.slice();
+      pickedFiles = [];
+      $("#file").value = "";
+      $("#drop-text").textContent = "将文件拖放到此处";
+      let firstId = null, okCount = 0;
       try {
-        const r = await uploadFile(pickedFile, curStyle);
-        pickedFile = null;
-        $("#file").value = "";
-        $("#drop-text").textContent = "将文件拖放到此处";
-        afterCreate(r.id, true);
+        for (const f of files) {
+          uploadPct = 0;
+          const r = await uploadFile(f, curStyle);
+          if (r && r.id) {
+            okCount++;
+            if (!firstId) firstId = r.id;
+            else if (!tasks.has(r.id)) refreshOne(r.id);
+          }
+        }
       } catch (e) {
         toast(e.message, true);
       } finally {
@@ -944,27 +966,14 @@
         uploadPct = 100;
         render();
       }
+      if (firstId) afterCreate(firstId, true);
+      if (files.length > 1) toast("已创建 " + okCount + " 个上传任务");
       return;
     }
     const url = $("#url").value.trim();
     if (!url) { toast("请先上传文件或粘贴链接", true); return; }
-    if (batchMode) { await startBatch(url); return; }
-    try {
-      uploadPct = null;                 // 链接任务没有上传这一步
-      const r = await api("/api/tasks", {
-        method: "POST",
-        body: JSON.stringify({ url: url, style: curStyle })
-      });
-      // 后端按作品 ID 查重命中：不新建任务、不重复下载，直接跳到已有记录
-      if (r && r.existing) {
-        await openExisting(r);
-        return;                         // 保留输入框内容，用户可继续粘贴下一条
-      }
-      $("#url").value = "";
-      afterCreate(r.id, false);
-    } catch (e) {
-      toast(e.message, true);
-    }
+    // 默认就是批量：一行一个链接，有几行建几个任务（单行即单任务）
+    await startBatch(url);
   }
 
   // 批量创建：输入框按行拆成多条链接，一次提交，逐条结果汇总提示。
@@ -1558,14 +1567,20 @@ if (rest.length) {
     drop.addEventListener("drop", (e) => {
       e.preventDefault();
       drop.classList.remove("over");
-      const f = e.dataTransfer.files && e.dataTransfer.files[0];
-      if (f) { pickedFile = f; $("#drop-text").textContent = "已选择：" + f.name; }
+      const fs = e.dataTransfer.files;
+      if (fs && fs.length) {
+        pickedFiles = Array.from(fs);
+        $("#drop-text").textContent = fs.length > 1 ? "已选择 " + fs.length + " 个文件" : "已选择：" + fs[0].name;
+      }
     });
   }
   const fileInput = $("#file");
   if (fileInput) fileInput.addEventListener("change", () => {
-    const f = fileInput.files && fileInput.files[0];
-    if (f) { pickedFile = f; $("#drop-text").textContent = "已选择：" + f.name; }
+    const fs = fileInput.files;
+    if (fs && fs.length) {
+      pickedFiles = Array.from(fs);
+      $("#drop-text").textContent = fs.length > 1 ? "已选择 " + fs.length + " 个文件" : "已选择：" + fs[0].name;
+    }
   });
   $("#url").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) start();
@@ -1576,12 +1591,6 @@ if (rest.length) {
     historyQuery = searchInput.value.trim();
     clearTimeout(historySearchTimer);
     historySearchTimer = setTimeout(reloadHistorySearch, 300);
-  });
-  // 批量模式开关
-  const batchToggle = $("#batch-mode");
-  if (batchToggle) batchToggle.addEventListener("change", () => {
-    batchMode = !!batchToggle.checked;
-    $("#btn-start").textContent = batchMode ? "批量开始转写" : "开始转写";
   });
   // 转写编辑弹窗
   const editBtn = $("#btn-edit-transcript");

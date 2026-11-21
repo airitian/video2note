@@ -172,9 +172,10 @@ code, pre, .mono { font-family: var(--wb-font-mono); }
 main { min-width: 0; padding: 0; }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 13px 15px; }
 
-.composer .input-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.composer .input-grid { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 12px; }
+.input-col { display: flex; flex-direction: column; min-width: 0; }
 .tab-head { font-size: 12px; font-weight: 600; color: var(--text-2); margin-bottom: 6px; }
-.drop { border: 1.5px dashed var(--border-strong); border-radius: 10px; width: min(100%, 400px); aspect-ratio: 4 / 3; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; text-align: center; cursor: pointer; padding: 12px; transition: border-color .15s, background .15s; }
+.drop { border: 1.5px dashed var(--border-strong); border-radius: 10px; flex: 1; min-height: 104px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; text-align: center; cursor: pointer; padding: 12px; transition: border-color .15s, background .15s; }
 .drop:hover, .drop.over { border-color: var(--primary); background: var(--primary-soft); }
 .up-ico { font-size: 20px; color: var(--primary); line-height: 1; }
 .up-t1 { font-size: 13.5px; }
@@ -449,9 +450,9 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 /* —— 文字稿高度与视频框一致：对照区两列等高，文字稿面板拉伸到与视频面板
    同高，稿件区 flex 填满（两边标题栏等高，故稿件区≈视频画面高） */
 .lines-pane { display: flex; flex-direction: column; }
-@media (min-width: 721px) {
-  .lines-pane .lines { flex: 1 1 auto; min-height: 220px; max-height: none; }
-}
+/* 文字稿高度由 JS 按视频框实际高度同步（syncLinesHeight），这里只留兜底：
+   没有视频时最高 460px，避免长稿把页面撑爆 */
+.lines-pane .lines { min-height: 120px; }
 /* 竖屏视频（抖音多为 9:16）：限高 + contain，长边不再撑爆版面、画面不变形 */
 .video-host video { object-fit: contain; max-height: min(640px, 78vh); max-height: min(640px, 78dvh); margin: 0 auto; }
 /* —— 播放器去边框：面板不留边框与内衬，宿主去掉深色底，画面四边贴齐 */

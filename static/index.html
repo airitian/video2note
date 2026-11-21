@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#7c3aed">
 <title>抖音 / B站 视频转文字</title>
-<link rel="stylesheet" href="/static/style.css?v=20261121j">
+<link rel="stylesheet" href="/static/style.css?v=20261121k">
 </head>
 <body>
 <header class="topbar">
@@ -52,7 +52,7 @@
           <div class="up-ico">⇧</div>
           <div class="up-t1" id="drop-text">将文件拖放到此处</div>
           <div class="up-t2">或 <a href="javascript:void(0)" id="pick">点击上传</a>，支持视频 / 音频</div>
-          <input type="file" id="file" accept="video/*,audio/*" hidden>
+          <input type="file" id="file" accept="video/*,audio/*" multiple hidden>
         </div>
       </div>
       <div class="input-col">
@@ -60,8 +60,7 @@
         <div class="url-row">
           <textarea id="url" rows="3" placeholder="粘贴 https://v.douyin.com/... 、https://www.bilibili.com/video/BV... 或 https://b23.tv/... 分享链接（可连同标题一起粘贴）"></textarea>
           <div class="url-mid">
-            <span class="opts-hint">支持抖音 / B站链接，可连同分享文案一起粘贴；也支持直接拖入本地音视频</span>
-            <label class="batch-toggle"><input type="checkbox" id="batch-mode"> 批量模式（一行一个链接，一次全部提交）</label>
+            <span class="opts-hint">支持抖音 / B站链接，可连同分享文案一起粘贴；也支持直接拖入本地音视频。一行一个链接、多个文件都会全部处理</span>
           </div>
           <button id="btn-start" class="btn primary big">开始转写</button>
         </div>
@@ -211,6 +210,6 @@
 
 <div id="toast" class="toast hidden"></div>
 
-<script src="/static/app.js?v=20261121j"></script>
+<script src="/static/app.js?v=20261121k"></script>
 </body>
 </html>
