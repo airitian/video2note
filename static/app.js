@@ -433,7 +433,7 @@
       const pct = Math.max(0, Math.min(100, Math.round(t.percent || t.spercent || 0)));
       return head +
         '<div class="hitem' + (t.id === currentId ? " on" : "") + '" data-id="' + t.id + '">' +
-        '<div class="hmain"><b>' + esc((t.meta && t.meta.title) || t.url || "(无标题)") + '</b>' +
+        '<div class="hmain"><b title="' + esc((t.meta && t.meta.title) || t.url || "(无标题)") + '">' + esc((t.meta && t.meta.title) || t.url || "(无标题)") + '</b>' +
         '<span>' + parts.join(" · ") + '</span>' +
         (running ? '<span class="hprog"><i style="width:' + pct + '%"></i></span>' : "") +
         '</div>' +
