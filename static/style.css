@@ -443,6 +443,11 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 .pane.sticky-pane { top: 76px; }
 /* 竖屏视频（抖音多为 9:16）：限高 + contain，长边不再撑爆版面、画面不变形 */
 .video-host video { object-fit: contain; max-height: min(560px, 74vh); max-height: min(560px, 74dvh); margin: 0 auto; }
+/* —— 播放器去边框：面板不留边框与内衬，宿主去掉深色底，画面四边贴齐 */
+.video-pane { border: none; background: transparent; padding: 0; }
+.video-pane .pane-head { padding: 0 2px; }
+.video-host { background: transparent; border-radius: 0; min-height: 0; }
+.video-host video { border-radius: 0; }
 /* 倍速选择器：与面板头其它小按钮同高 */
 .rate-pick { height: 28px; padding: 0 6px; font-size: 12px; border: 1px solid var(--border-strong); border-radius: 7px; background: #fff; color: var(--text); cursor: pointer; }
 
@@ -458,8 +463,9 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 /* 宽屏时左栏略放宽，标题少截断几个字 */
 @media (min-width: 1440px) { #side-left .side-card { width: 288px; } }
 
-/* —— 文字稿：阅读字号/行距上调；当前播放行加左侧色条，比整行铺色更易定位 */
-.line { font-size: 13.5px; line-height: 1.75; }
+/* —— 文字稿：阅读字号/行距上调；当前播放行加左侧色条，比整行铺色更易定位；
+   时间列整体右移（行左内衬加大），避免时间贴着面板左缘被裁切 */
+.line { font-size: 13.5px; line-height: 1.75; padding-left: 22px; }
 .line time { width: 46px; }
 .line.active { box-shadow: inset 3px 0 0 var(--primary); }
 
