@@ -372,7 +372,7 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
     t.spercent = 100
     t.percent = RANGES["transcribing"][1]
     t.error = ""          # 清掉上一轮的失败信息，避免重试成功后界面仍显示旧错误
-    t.message = "转写完成，可点击「AI 整理文字」生成成稿"
+    t.message = "转写完成，正在自动生成整理文稿"
     store.save(t)
     # 免费次数计数：每次成功转写 +1（失败不计数）。写入失败不影响主流程。
     try:
@@ -380,6 +380,12 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
         record_pro_use()
     except Exception:
         pass
+    # 转写完成默认自动生成「整理文稿」，用户无需再手动点生成。
+    # submit_polish 自带幂等：重转写且原文未变、已有成稿时直接复用，不重复消耗。
+    try:
+        submit_polish(t, "general")
+    except Exception:
+        t.log("warn", "自动生成整理文稿提交失败，可在页面手动点击生成")
 
 
 # ============================ AI 整理幂等性 ============================

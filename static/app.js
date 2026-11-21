@@ -50,7 +50,10 @@
     try {
       await refreshOne(tid);                // 原地合并 + 本地增量优先
       const cur = tasks.get(tid);
-      if (cur) { ws.linesTask = null; ws.linesSig = null; render(); }
+      // 不再强制清 linesSig：ensureLines 的签名（句数/尾句/直播态）本身
+      // 就能识别内容变化；每轮都清会把文本稿整表重建，滚动位置被反复
+      // 恢复、正在播放的跟随滚动也被打断，看起来像页面在刷新。
+      if (cur) render();
     } catch (e) { /* 网络抖动忽略，下个周期再试 */ }
     finally { pollingInFlight.delete(tid); }
   }
@@ -551,8 +554,10 @@
         const mb = parseFloat(getComputedStyle(head).marginBottom) || 0;
         extra = head.offsetHeight + mb;
       }
-      lines.style.height = Math.max(120, host.clientHeight - extra) + "px";
-    } else lines.style.height = "";
+      const h = Math.max(120, host.clientHeight - extra);
+      lines.style.height = h + "px";
+      lines.style.maxHeight = h + "px";   // 压过 CSS 的 460px 上限，否则高视频时对不齐
+    } else { lines.style.height = ""; lines.style.maxHeight = ""; }
   }
   window.addEventListener("resize", syncLinesHeight);
   if (window.ResizeObserver) {
@@ -563,8 +568,17 @@
   function ensureVideo(t) {
     const host = $("#video-host");
     const vp = t && t.meta && t.meta.video_path;
-    const key = currentId + "|" + (vp || "");
+    // 键只取「任务 + 文件名 + 封面」：meta 里的归档信息等字段变化
+    // （如生成文稿后七牛备份回写 archived）不该重建播放器，
+    // 否则正在播放的视频会被打断、从头加载，看起来像页面刷新。
+    const fname = vp ? vp.split(/[\\/]/).pop() : "";
+    const cover = (t && t.meta && t.meta.cover) || "";
+    const key = currentId + "|" + fname + "|" + cover;
     if (ws.videoKey === key) return;
+    // 真要重建时先存播放状态，重建后恢复，播放不中断
+    const prev = (ws.videoEl && ws.videoTask === currentId)
+      ? { t: ws.videoEl.currentTime || 0, paused: ws.videoEl.paused, rate: ws.videoEl.playbackRate || 1 }
+      : null;
     ws.videoKey = key;
     ws.videoTask = currentId;
     ws.videoEl = null;
@@ -577,7 +591,6 @@
     }
     // 必须用 meta 里记录的真实文件名，不能写死 video.mp4：
     // 本地上传的视频落盘名是 source<原后缀>，写死会导致预览区一直空白
-    const fname = vp.split(/[\\/]/).pop();
     const kind = (fname.match(/\.(mp3|m4a|aac|wav|flac|ogg|opus|wma)$/i)) ? "audio" : "video";
     // 有封面时作 poster：点开任务先回显封面，而不是黑屏/空白
     const poster = (kind === "video" && t && t.meta && t.meta.cover)
@@ -585,6 +598,14 @@
     host.innerHTML = '<' + kind + ' controls preload="metadata" playsinline' + poster + ' src="/api/media/'
       + currentId + "/" + encodeURIComponent(fname) + '"></' + kind + '>';
     ws.videoEl = host.querySelector(kind);
+    if (prev && ws.videoEl) {
+      const el = ws.videoEl;
+      el.addEventListener("loadedmetadata", () => {
+        try { el.currentTime = prev.t; } catch (e) {}
+        if (prev.rate && prev.rate !== 1) el.playbackRate = prev.rate;
+        if (!prev.paused) el.play().catch(() => {});
+      }, { once: true });
+    }
     if (kind === "video" && ws.videoEl) {
       // 恢复上次的倍速选择（倍速控件在视频面板头部）
       const savedRate = parseFloat(localStorage.getItem("v2n_rate") || "1");
@@ -741,6 +762,15 @@
     return ans;
   }
 
+  // 只滚动文本稿容器本身把当前句带到中间：scrollIntoView 会连带滚动
+  // 外层页面与吸顶面板，在不少浏览器上表现为页面乱跳或干脆不跟随。
+  function scrollLineCenter(line, smooth) {
+    const box = $("#lines");
+    if (!box || !line) return;
+    const top = line.offsetTop - (box.clientHeight - line.clientHeight) / 2;
+    box.scrollTo({ top: Math.max(0, top), behavior: smooth ? "smooth" : "auto" });
+  }
+
   function markActive(i, scroll) {
     if (i === ws.active) return;
     if (ws.lineEls[ws.active]) ws.lineEls[ws.active].classList.remove("active");
@@ -748,13 +778,13 @@
     const line = ws.lineEls[i];
     if (!line) return;
     line.classList.add("active");
-    if (scroll && ws.follow) line.scrollIntoView({ block: "center", behavior: "smooth" });
+    if (scroll && ws.follow) scrollLineCenter(line, true);
   }
 
   function syncActive(t, force) {
     if (!ws.segs.length) return;
     markActive(findIdx(ws.segs, t), true);
-    if (force && ws.lineEls[ws.active]) ws.lineEls[ws.active].scrollIntoView({ block: "center" });
+    if (force && ws.lineEls[ws.active]) scrollLineCenter(ws.lineEls[ws.active], false);
   }
 
   // ---------- SSE ----------
