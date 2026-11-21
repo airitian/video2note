@@ -186,7 +186,8 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 /* 链接行：输入框 | 说明与批量模式（中间列）| 「开始转写」按钮，同一行 */
 .url-row { display: flex; align-items: stretch; gap: 10px; }
 .url-row .btn.big { flex: none; width: 104px; height: auto; padding: 0 14px; }
-.url-mid { flex: none; width: 230px; display: flex; flex-direction: column; gap: 6px; justify-content: center; }
+.url-mid { flex: none; width: 200px; display: flex; flex-direction: column; gap: 6px; justify-content: center; }
+.url-row textarea#url { flex: 1 1 160px; min-width: 0; }
 .url-mid .opts-hint { margin-top: 0; }
 .url-mid .batch-toggle { margin-top: 0; }
 @media (max-width: 720px) { .url-mid { width: 100%; } }
