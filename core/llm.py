@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -94,6 +95,11 @@ def _config(model_override: str | None = None,
     key = (s.get("llm_api_key") or s.get("asr_api_key") or "").strip()
     if not key:
         raise LLMError("未配置 LLM API Key，请在「设置」页签填写（或填写 ASR 密钥以复用）")
+    # 备用 Key：主 Key 积分/余额不足时自动切换（积分次日重置，届时自动切回）。
+    # 今日已确认耗尽时直接用备用 Key，省去每次调用先撞一次余额错误。
+    key_fallback = (s.get("llm_api_key_fallback") or "").strip()
+    if key_fallback and key_fallback != key and _main_key_exhausted_today():
+        key, key_fallback = key_fallback, ""
 
     base = (s.get("llm_base_url") or "").strip().rstrip("/")
     if not base:
@@ -119,6 +125,7 @@ def _config(model_override: str | None = None,
         "protocol": protocol,
         "base": base,
         "key": key,
+        "key_fallback": key_fallback,
         "model": model,
         "max_tokens": max_tokens,
         "temperature": temp,
@@ -279,15 +286,42 @@ def chat(system: str, user: str, max_retries: int = 2, model: str | None = None,
     model 是按任务传入的覆盖值（历史任务可能留存了已下线的旧模型名），
     若该模型报错不存在，自动回退到当前配置里的默认模型。
     temperature 显式传入时覆盖设置页的全局温度（分风格/分工序用）。
+    主 Key 积分/余额不足时，自动切到备用 Key 重试（见 _is_balance_error）。
     """
     cfg = _config(model, temperature)
     try:
         return _request(cfg, system, user, max_retries)
     except LLMError as e:
+        fb = (cfg.get("key_fallback") or "").strip()
+        if fb and fb != cfg["key"] and _is_balance_error(str(e)):
+            _mark_main_key_exhausted()
+            return _request(dict(cfg, key=fb, key_fallback=""),
+                            system, user, max_retries)
         default_model = (load_settings().get("llm_model") or "").strip()
         if model and default_model and default_model != cfg["model"] and _is_model_error(str(e)):
             return _request(_config(None, temperature), system, user, max_retries)
         raise
+
+
+# 主 Key 余额耗尽的日期（进程内记忆）：积分按天重置，次日自动恢复主 Key
+_KEY_EXHAUSTED = {"date": ""}
+
+
+def _main_key_exhausted_today() -> bool:
+    return _KEY_EXHAUSTED["date"] == time.strftime("%Y-%m-%d")
+
+
+def _mark_main_key_exhausted() -> None:
+    _KEY_EXHAUSTED["date"] = time.strftime("%Y-%m-%d")
+
+
+def _is_balance_error(msg: str) -> bool:
+    """积分/余额不足类错误（区别于限流与模型不存在）：触发备用 Key 切换。"""
+    low = (msg or "").lower()
+    return any(k in low for k in (
+        "余额不足", "无可用资源包", "insufficient", "1113",
+        "error code: 402", "http_code': '402'",
+    ))
 
 
 def _is_model_error(msg: str) -> bool:

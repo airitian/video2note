@@ -260,8 +260,10 @@ DEFAULTS: dict[str, str] = {
     "llm_max_tokens": "16384",   # 推理模型会先输出 thinking，额度太小会导致正文被截断
     "llm_temperature": "0.3",
     # 模型轮换名单（逗号分隔）：每条新视频分配一个模型、四种风格都用它生成，
-    # 下一条视频换下一个；留空 = 不轮换，全部用 llm_model
-    "llm_rotation_models": "deepseek-ai/DeepSeek-V4-Pro-0813,Qwen/Qwen3.5-397B-A17B,ZhipuAI/GLM-5.2,moonshotai/Kimi-K3.1-Pro:DashScope",
+    # 下一条视频换下一个；留空 = 不轮换，全部用 llm_model。
+    # 五家均已于 2026-11-22 在 ModelScope 端点实测可调（裸名直调）。
+    "llm_rotation_models": "deepseek-ai/DeepSeek-V4.1-Flash-1017,deepseek-ai/DeepSeek-V4-Pro-0813,MiniMax/MiniMax-M3.1-Flash,ZhipuAI/GLM-5.3-Flash,Qwen/Qwen3.8-27B",
+    "llm_api_key_fallback": "",   # 备用 Key（SECRET_KEYS，只落 secrets.json）
     # ---- 工程参数 ----
     "chunk_seconds": "180",
     # 首片单独取短，让第一句话尽快出现（秒）。ASR 耗时与音频长度近似成正比，
@@ -305,7 +307,7 @@ DEFAULTS: dict[str, str] = {
 # 敏感配置：只落在 secrets.json，永不经接口下发。
 # Cookie 文本同样算敏感——它就是登录态，回显到浏览器等于把账号会话交出去。
 SECRET_KEYS = {
-    "asr_api_key", "llm_api_key", "cookie_text", "cookie_text_bili",
+    "asr_api_key", "llm_api_key", "llm_api_key_fallback", "cookie_text", "cookie_text_bili",
     "resolver_curl",
     # 七牛云密钥等同于「整个存储桶的读写权限」，必须与 ASR/LLM Key 同级保护：
     # 只落 secrets.json（0600）。
@@ -351,6 +353,7 @@ HELP: dict[str, str] = {
     "llm_protocol": "LLM 协议：anthropic（/v1/messages + x-api-key）或 openai（/v1/chat/completions）",
     "llm_base_url": "LLM 接口地址（不含 /messages 或 /chat/completions）",
     "llm_api_key": "LLM API Key（留空则复用 ASR 的 Key）",
+    "llm_api_key_fallback": "LLM 备用 API Key（主 Key 积分/余额不足时自动切换；积分次日重置后自动切回主 Key）",
     "llm_model": "LLM 模型名",
     "llm_rotation_models": "轮换模型名单（逗号分隔，每条视频轮流用一个；留空则不轮换）",
     "llm_max_tokens": "单次生成最大 token 数（Anthropic 协议必填）",
@@ -401,7 +404,8 @@ HELP: dict[str, str] = {
 SETTINGS_GROUPS: list[tuple[str, list[str]]] = [
     ("平台登录态", ["cookie_text", "cookie_text_bili", "resolver_curl"]),
     ("模型与生成", ["asr_base_url", "asr_api_key", "asr_model", "asr_language",
-                   "llm_protocol", "llm_base_url", "llm_api_key", "llm_model",
+                   "llm_protocol", "llm_base_url", "llm_api_key", "llm_api_key_fallback",
+                   "llm_model",
                    "llm_rotation_models",
                    "llm_max_tokens", "llm_temperature"]),
     ("性能", ["first_chunk_seconds", "chunk_seconds", "max_concurrency"]),
