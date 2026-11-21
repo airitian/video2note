@@ -439,11 +439,14 @@ def auth_state(request: Request):
     """前端据此判断：是否要弹令牌、当前角色、门禁与剩余次数。"""
     tok = _extract_token(request)
     role = token_role(tok) or "none"
+    # 门禁只针对匿名访客：已持令牌者（管理员/普通令牌）不受免费额度限制，
+    # 对其报告 gate_active=False，否则管理员也会看到「免费次数已用完」横幅。
+    gated = gate_active() and role == "none"
     return {
         "admin_configured": bool(ADMIN_TOKEN),
         "role": role,
-        "token_required": gate_active(),
-        "gate_active": gate_active(),
+        "token_required": gated,
+        "gate_active": gated,
         "free_remaining": free_remaining(),
         "pro_used": pro_used(),
         "pro_limit": pro_free_limit(),

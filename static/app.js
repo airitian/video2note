@@ -249,13 +249,13 @@
         };
       }
     }
-    // 门禁横幅
+    // 门禁横幅：只对匿名访客显示；已登录（管理员/普通令牌）不受免费额度限制
     const banner = $("#gate-banner");
     if (banner) {
-      if (authState.gate_active) {
+      if (authState.role === "none" && authState.gate_active) {
         banner.textContent = "免费次数已用完，继续使用请输入访问令牌。";
         banner.classList.remove("hidden");
-      } else if (authState.pro_limit && authState.free_remaining > 0) {
+      } else if (authState.role === "none" && authState.pro_limit && authState.free_remaining > 0) {
         banner.textContent = "免费额度剩余 " + authState.free_remaining
           + " 次（成功转写），用完需令牌";
         banner.classList.remove("hidden");
