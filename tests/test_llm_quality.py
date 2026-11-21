@@ -42,56 +42,61 @@ def test_terms_budget_scales_with_length():
     assert llm._terms_budget(100000) == 16000       # 上限
 
 
-# ---------- 质检闭环 ----------
+# ---------- 生成内质检已下线；质检改为生成后独立报告 ----------
 
-def _judge_chat(verdict_json, repaired="REPAIRED-TEXT"):
+def test_polish_short_path_makes_one_call_and_returns_note(monkeypatch):
+    # 生成链路里不再有质检/修订：一次调用直接交付成稿，不会被整篇重写
+    calls = []
+
     def fake_chat(system, user, **kw):
-        if "质检员" in user:
-            return verdict_json
-        if "质检发现" in user:
-            return repaired
-        raise AssertionError(f"unexpected chat call: {user[:40]}")
-    return fake_chat
+        calls.append(user)
+        return "整理好的成稿"
+
+    monkeypatch.setattr(llm, "chat", fake_chat)
+    out = llm.polish("一小段原文", {"title": "标题"}, style="general",
+                     progress=lambda m: None)
+    assert out == "整理好的成稿"
+    assert len(calls) == 1
+    assert "质检员" not in calls[0]
 
 
-def test_judge_pass_returns_original(monkeypatch):
-    monkeypatch.setattr(llm, "chat", _judge_chat(
-        '{"coverage": 95, "fabrications": [], "missing": []}'))
-    out = llm._judge_and_repair("原文", "成稿", "general", "t", None, lambda m: None)
-    assert out == "成稿"
+def test_review_note_parses_verdict(monkeypatch):
+    def fake_chat(system, user, **kw):
+        assert "质检员" in user
+        return '{"fit": "不符合", "problems": ["删太多了"], "suggestions": ["按原文补回"]}'
+
+    monkeypatch.setattr(llm, "chat", fake_chat)
+    r = llm.review_note("原文", "成稿", "general", "judge-model")
+    assert r["fit"] == "不符合"
+    assert r["problems"] == ["删太多了"]
+    assert r["suggestions"] == ["按原文补回"]
 
 
-def test_judge_fail_triggers_one_repair(monkeypatch):
-    monkeypatch.setattr(llm, "chat", _judge_chat(
-        '{"coverage": 60, "fabrications": ["编了个数据"], "missing": ["漏了结论"]}'))
-    out = llm._judge_and_repair("原文", "成稿", "general", "t", None, lambda m: None)
-    assert out == "REPAIRED-TEXT"
-
-
-def test_judge_garbage_never_blocks(monkeypatch):
-    monkeypatch.setattr(llm, "chat", _judge_chat("不是 JSON"))
-    out = llm._judge_and_repair("原文", "成稿", "general", "t", None, lambda m: None)
-    assert out == "成稿"
-
-
-def test_repair_must_not_drop_star_sections(monkeypatch):
-    # 修订稿把固定章节修丢了 → 退回原稿，不能为了补内容牺牲格式
-    original = "# 问题\n\n## 内容判断\n\n判断。\n\n## 优化后的回答\n\n回答。"
-    monkeypatch.setattr(llm, "chat", _judge_chat(
-        '{"coverage": 50, "fabrications": [], "missing": ["漏了短版"]}',
-        repaired="# 问题\n\n修订后的自由正文，没有章节了。"))
-    out = llm._judge_and_repair("原文", original, "star", "t", None, lambda m: None)
-    assert out == original
-
-
-def test_judge_can_be_disabled(monkeypatch):
-    monkeypatch.setenv("V2N_POLISH_JUDGE", "0")
-
+def test_review_note_failure_returns_unrated(monkeypatch):
     def boom(system, user, **kw):
-        raise AssertionError("judge 不应被调用")
+        raise RuntimeError("endpoint down")
+
     monkeypatch.setattr(llm, "chat", boom)
-    out = llm._judge_and_repair("原文", "成稿", "general", "t", None, lambda m: None)
-    assert out == "成稿"
+    r = llm.review_note("原文", "成稿", "general", None)
+    assert r["fit"] == "未评"
+    assert r["problems"] and "质检调用失败" in r["problems"][0]
+
+
+def test_review_note_garbage_returns_unrated(monkeypatch):
+    monkeypatch.setattr(llm, "chat", lambda s, u, **kw: "不是 JSON")
+    r = llm.review_note("原文", "成稿", "digest", None)
+    assert r["fit"] == "未评"
+
+
+# ---------- temperature 适配 ----------
+
+def test_kimi_models_omit_temperature():
+    # Kimi K3 经 DashScope 路由不接受 temperature 参数，传了会 400
+    assert llm._model_omits_temperature("moonshotai/Kimi-K3.1-Pro:DashScope")
+    assert llm._model_omits_temperature("moonshotai/Kimi-K2-Instruct")
+    assert not llm._model_omits_temperature("deepseek-ai/DeepSeek-V4-Pro-0813")
+    assert not llm._model_omits_temperature("Qwen/Qwen3.5-397B-A17B")
+    assert not llm._model_omits_temperature("")
 
 
 # ---------- 签名 ----------

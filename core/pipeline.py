@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import queue
+import re
 import shutil
 import threading
 import time
@@ -17,7 +19,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import asr, audio, downloader, llm, store
-from .config import MEDIA_DIR, get_int_clamped, load_settings
+from .config import MEDIA_DIR, TASK_DIR, get_int_clamped, load_settings
 
 def _max_workers() -> int:
     """.env 的 MAX_WORKERS（或 V2N_MAX_WORKERS）真正接到线程池大小。
@@ -378,7 +380,7 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
     t.spercent = 100
     t.percent = RANGES["transcribing"][1]
     t.error = ""          # 清掉上一轮的失败信息，避免重试成功后界面仍显示旧错误
-    t.message = "转写完成，正在自动生成整理文稿"
+    t.message = "转写完成，正在自动生成全部风格文稿"
     store.save(t)
     # 免费次数计数：每次成功转写 +1（失败不计数）。写入失败不影响主流程。
     try:
@@ -386,12 +388,19 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
         record_pro_use()
     except Exception:
         pass
-    # 转写完成默认自动生成「整理文稿」，用户无需再手动点生成。
-    # submit_polish 自带幂等：重转写且原文未变、已有成稿时直接复用，不重复消耗。
+    # 转写完成默认自动生成全部四种风格，用户无需再手动点生成。
+    # 先按轮换名单给本视频分配一个模型（四种风格共用同一模型），
+    # 再逐个提交（不同风格可并行，submit_polish 自带幂等与防重复）。
     try:
-        submit_polish(t, "general")
+        assign_rotation_model(t)
+        store.save(t)
     except Exception:
-        t.log("warn", "自动生成整理文稿提交失败，可在页面手动点击生成")
+        t.log("warn", "模型轮换分配失败，改用默认模型生成")
+    for _style in AUTO_STYLES:
+        try:
+            submit_polish(t, _style)
+        except Exception:
+            t.log("warn", f"自动生成「{_style}」提交失败，可在页面手动点击生成")
 
 
 # ============================ AI 整理幂等性 ============================
@@ -431,6 +440,167 @@ def _polish_unregister(tid: str, style: str) -> bool:
                 return False
             _polish_running.pop(tid, None)
         return True
+
+
+# ========== 模型轮换（按视频轮流用不同厂商的旗舰模型） ==========
+# 名单在设置项 llm_rotation_models（逗号/换行分隔）。每条新视频分配一个
+# 模型、四种风格都用它；下一条视频换下一个。计数落盘，重启不乱序；
+# 分配前逐个探活，不可用的跳过，全灭则回退设置里的默认模型。
+_ROTATION_LOCK = threading.Lock()
+# 全局整理并发上限：多个视频同时下完时，整理任务最多同时跑 2 个，
+# 避免把模型端点打到限流（限流后重试反而更慢）
+_POLISH_SEM = threading.Semaphore(2)
+AUTO_STYLES = ("general", "digest", "article", "star")
+
+
+def rotation_models() -> list[str]:
+    raw = (load_settings().get("llm_rotation_models") or "")
+    models = [m.strip() for m in re.split(r"[,\n]", raw) if m.strip()]
+    return list(dict.fromkeys(models))
+
+
+def _rotation_next_index(n: int) -> int:
+    """取当前轮换序号并 +1 落盘（rotation.json 与任务数据同目录）。"""
+    path = TASK_DIR.parent / "rotation.json"
+    idx = 0
+    try:
+        idx = int(json.loads(path.read_text("utf-8")).get("idx", 0))
+    except Exception:
+        idx = 0
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"idx": idx + 1}), "utf-8")
+        tmp.replace(path)
+    except Exception:
+        pass
+    return idx % n if n else 0
+
+
+def _probe_model(model: str) -> bool:
+    try:
+        llm.chat("你是一个助手", "只回复：OK", model=model, max_retries=0)
+        return True
+    except Exception:
+        return False
+
+
+def assign_rotation_model(t: store.Task) -> str | None:
+    """给任务分配本轮模型，写进 options['llm_model']（后续所有风格共用）。
+
+    任务已有显式模型（页面手填）时不覆盖。返回实际分配的模型名，
+    未分配（无名单/全不可用）返回 None，此时沿用设置里的默认模型。
+    """
+    if (t.options or {}).get("llm_model"):
+        return t.options["llm_model"]
+    pool = rotation_models()
+    if not pool:
+        return None
+    with _ROTATION_LOCK:
+        start = _rotation_next_index(len(pool))
+        for k in range(len(pool)):
+            m = pool[(start + k) % len(pool)]
+            if _probe_model(m):
+                if k:
+                    t.log("warn", f"轮换模型 {pool[start]} 不可用，改用 {m}")
+                t.options["llm_model"] = m
+                t.log("info", f"本视频文稿由 {m} 生成（模型轮换）")
+                return m
+            t.log("warn", f"轮换模型 {m} 探活失败，尝试下一个")
+    t.log("warn", "轮换模型全部不可用，回退到设置中的默认模型")
+    return None
+
+
+# ========== 生成后质检（独立环节，只出报告不改稿） ==========
+_QC_RUNNING: set[str] = set()
+
+
+def qc_running(tid: str) -> bool:
+    with _polish_running_lock:
+        return tid in _QC_RUNNING
+
+
+def _qc_stale(t: store.Task) -> bool:
+    """已有报告是否覆盖了当前最新成稿（任一风格比报告新 = 报告过期）。"""
+    qc = t.qc or {}
+    if not qc:
+        return True
+    at_ts = float(qc.get("at_ts") or 0)
+    latest = max((float((v or {}).get("info", {}).get("ts") or 0)
+                  for v in (t.variants or {}).values()), default=0)
+    return latest > at_ts
+
+
+def submit_qc(t: store.Task, force: bool = False) -> bool:
+    """提交一次质检（异步）。已有质检在跑、或报告未过期且非强制时跳过。"""
+    if not any((v or {}).get("note") for v in (t.variants or {}).values()):
+        return False
+    with _polish_running_lock:
+        if t.id in _QC_RUNNING:
+            return False
+        if not force and not _qc_stale(t):
+            return False
+        _QC_RUNNING.add(t.id)
+    _executor.submit(lambda: _catch_qc(t))
+    return True
+
+
+def _catch_qc(t: store.Task) -> None:
+    try:
+        generate_qc(t)
+    except Exception as e:
+        try:
+            t.log("warn", f"质检报告生成失败：{e}")
+            store.save(t)
+        except Exception:
+            pass
+    finally:
+        with _polish_running_lock:
+            _QC_RUNNING.discard(t.id)
+
+
+def _judge_model_for(t: store.Task) -> str:
+    """质检裁判：优先用轮换名单里生成模型的下一个，避免自己评自己。"""
+    gen = (t.options or {}).get("llm_model") or ""
+    pool = rotation_models()
+    if gen in pool and len(pool) > 1:
+        return pool[(pool.index(gen) + 1) % len(pool)]
+    for m in pool:
+        if m != gen:
+            return m
+    return llm.resolve_model(None)
+
+
+def generate_qc(t: store.Task) -> dict:
+    """对任务的全部成稿逐风格做质检，结果存 t.qc 并落盘。"""
+    variants = {s: v for s, v in (t.variants or {}).items()
+                if (v or {}).get("note")}
+    if not variants:
+        raise RuntimeError("尚无成稿可质检")
+    judge = _judge_model_for(t)
+    src_len = max(1, len(t.transcript or ""))
+    items: dict[str, dict] = {}
+    for style, v in variants.items():
+        info = v.get("info") or {}
+        note = v["note"]
+        review = llm.review_note(t.transcript or "", note, style, judge)
+        items[style] = {
+            "model": info.get("model") or (t.options or {}).get("llm_model") or "",
+            "chars": len(note),
+            "ratio": round(len(note) / src_len, 3),
+            "seconds": info.get("seconds"),
+            "fit": review["fit"],
+            "problems": review["problems"],
+            "suggestions": review["suggestions"],
+        }
+    qc = {"at": datetime.now().strftime("%m-%d %H:%M"),
+          "at_ts": time.time(),
+          "judge_model": judge,
+          "items": items}
+    with _task_lock(t.id):
+        t.qc = qc
+        store.save(t)
+    t.log("info", f"质检报告已生成（裁判模型：{judge}）")
+    return qc
 
 
 def _task_lock(tid: str) -> threading.Lock:
@@ -567,8 +737,10 @@ def _polish_body(t: store.Task, style: str, emit: EmitFn = None, force: bool = F
         _set(t, "polishing", 0.3, msg, emit=emit)
 
     model = t.options.get("llm_model") or None
+    _t0 = time.time()
     text = llm.polish(t.transcript, t.meta or {}, style, prog, model=model)
-    t.log("info", f"整理完成，输出 {len(text)} 字")
+    _seconds = round(time.time() - _t0, 1)
+    t.log("info", f"整理完成，输出 {len(text)} 字（用时 {_seconds}s）")
 
     # 按风格存档：不同风格互不覆盖，来回切换可直接复用。
     # 写回在任务锁内做：多个风格同时生成时，避免交叉 save 把对方刚写的
@@ -577,6 +749,8 @@ def _polish_body(t: store.Task, style: str, emit: EmitFn = None, force: bool = F
         "style": style,
         "model": llm.resolve_model(model),
         "chars": len(text),
+        "seconds": _seconds,
+        "ratio": round(len(text) / max(1, len(t.transcript or "")), 3),
         "at": datetime.now().strftime("%m-%d %H:%M"),
         "ts": time.time(),
         "src_hash": src_hash(t),
@@ -724,6 +898,12 @@ def submit_polish(t: store.Task, style: str, force: bool = False) -> None:
 
 
 def _catch_polish(t: store.Task, style: str, force: bool = False) -> bool:
+    # 全局整理并发封顶（见 _POLISH_SEM）：排队等待，不拒绝任务
+    with _POLISH_SEM:
+        return _catch_polish_run(t, style, force)
+
+
+def _catch_polish_run(t: store.Task, style: str, force: bool = False) -> bool:
     ok = False
     try:
         _polish_body(t, style, force=force)
@@ -768,6 +948,9 @@ def _catch_polish(t: store.Task, style: str, force: bool = False) -> bool:
                         t.percent = 100
                         t.message = "完成"
                     store.save(t)
+            # 全部风格都生成完后，自动补一次生成后质检（旁路，失败不影响成稿）
+            if ok and not polishing_styles(t.id):
+                submit_qc(t)
     return ok
 
 

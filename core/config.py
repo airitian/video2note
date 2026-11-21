@@ -259,6 +259,9 @@ DEFAULTS: dict[str, str] = {
     "llm_model": "deepseek-v4.1-flash",
     "llm_max_tokens": "16384",   # 推理模型会先输出 thinking，额度太小会导致正文被截断
     "llm_temperature": "0.3",
+    # 模型轮换名单（逗号分隔）：每条新视频分配一个模型、四种风格都用它生成，
+    # 下一条视频换下一个；留空 = 不轮换，全部用 llm_model
+    "llm_rotation_models": "deepseek-ai/DeepSeek-V4-Pro-0813,Qwen/Qwen3.5-397B-A17B,ZhipuAI/GLM-5.2,moonshotai/Kimi-K3.1-Pro:DashScope",
     # ---- 工程参数 ----
     "chunk_seconds": "180",
     # 首片单独取短，让第一句话尽快出现（秒）。ASR 耗时与音频长度近似成正比，
@@ -349,6 +352,7 @@ HELP: dict[str, str] = {
     "llm_base_url": "LLM 接口地址（不含 /messages 或 /chat/completions）",
     "llm_api_key": "LLM API Key（留空则复用 ASR 的 Key）",
     "llm_model": "LLM 模型名",
+    "llm_rotation_models": "轮换模型名单（逗号分隔，每条视频轮流用一个；留空则不轮换）",
     "llm_max_tokens": "单次生成最大 token 数（Anthropic 协议必填）",
     "llm_temperature": "生成温度 0-1",
     # ---- 性能 ----
@@ -398,6 +402,7 @@ SETTINGS_GROUPS: list[tuple[str, list[str]]] = [
     ("平台登录态", ["cookie_text", "cookie_text_bili", "resolver_curl"]),
     ("模型与生成", ["asr_base_url", "asr_api_key", "asr_model", "asr_language",
                    "llm_protocol", "llm_base_url", "llm_api_key", "llm_model",
+                   "llm_rotation_models",
                    "llm_max_tokens", "llm_temperature"]),
     ("性能", ["first_chunk_seconds", "chunk_seconds", "max_concurrency"]),
     ("媒体归档", ["qiniu_ak", "qiniu_sk", "qiniu_bucket", "qiniu_domain",

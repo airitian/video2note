@@ -23,7 +23,7 @@ CHUNK_LIMIT = 3500      # map 阶段每块字符数
 
 # 管线版本：生成行为（合并方式/温度/质检）变化时递增，纳入缓存签名，
 # 避免旧逻辑生成的缓存成稿在新逻辑上线后继续被当作有效结果复用。
-PIPELINE_REV = "20261121-q1"
+PIPELINE_REV = "20261122-v1"
 
 # 分风格温度：忠实类要稳、创作类要放。设置页显式填了温度时以设置页为准
 # （见 _style_temperature），这里只提供未显式设置时的默认值。
@@ -113,14 +113,28 @@ def _config(model_override: str | None = None,
         except ValueError:
             temp = 0.3
 
+    model = (model_override or s.get("llm_model") or "").strip() \
+        or "deepseek-ai/DeepSeek-V4.1-Flash-1017"
     return {
         "protocol": protocol,
         "base": base,
         "key": key,
-        "model": (model_override or s.get("llm_model") or "").strip() or "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "model": model,
         "max_tokens": max_tokens,
         "temperature": temp,
+        # 个别模型/路由不接受 temperature 参数（如 Kimi K3 经 DashScope
+        # 路由：传了直接 400 invalid_parameter_error），这类模型省略该参数
+        "omit_temperature": _model_omits_temperature(model),
     }
+
+
+# 不接受 temperature 参数的模型（按模型名小写子串匹配）
+_NO_TEMP_PATTERNS = ("kimi",)
+
+
+def _model_omits_temperature(model: str) -> bool:
+    m = (model or "").lower()
+    return any(p in m for p in _NO_TEMP_PATTERNS)
 
 
 def _err_message(resp: requests.Response) -> str:
@@ -222,13 +236,15 @@ def _chat_openai(cfg: dict, system: str, user: str) -> str:
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": user})
-    stream = client.chat.completions.create(
+    kwargs = dict(
         model=cfg["model"],
         messages=messages,
-        temperature=cfg["temperature"],
         max_tokens=cfg["max_tokens"],
         stream=True,
     )
+    if not cfg.get("omit_temperature"):
+        kwargs["temperature"] = cfg["temperature"]
+    stream = client.chat.completions.create(**kwargs)
     parts: list[str] = []
     for chunk in stream:
         if not chunk.choices:
@@ -498,14 +514,31 @@ STYLE_SYSTEMS = {
 }
 
 
-JUDGE_TMPL = """你是严格的文稿质检员。对照【原文】检查【成稿】的质量，只输出一行 JSON，不要任何解释。
+# ========== 生成后质检（独立环节，只评不改） ==========
+# 质检在全部风格生成完之后单独跑，产出报告供人查看（页头「质检报告」）。
+# 它只对照风格要求评价成稿、列问题与修改建议，绝不改写成稿本身。
 
-检查维度：
-1. coverage：原文的关键事实、观点、数据在成稿中的覆盖程度，0-100 的整数
-2. fabrications：成稿中出现的、原文没有的事实性内容（数据、案例、经历、结论），逐条简短列出；标题、修辞性过渡、以及标注了 [补充] 的通用补充内容不算编造
-3. missing：原文里重要但成稿漏掉的内容，逐条简短列出，最多 5 条
+STYLE_RUBRICS = {
+    "general": "整理文稿：基于原文校对——只修错别字、补缺失字、删纯填充词与引流内容，"
+               "其余内容与表述一字不删、不改写、不概括；字数应与原文接近（保留率不低于 85%）",
+    "digest": "精简文稿：删无意义/引流/废话/非重点内容，只保留主要内容与关键信息；"
+              "明显比原文短，但主线与关键事实完整，不能把重点也删掉",
+    "article": "公众号文章：改写成适合公众号发布的文章体——有吸引人的标题与小标题、"
+               "段落顺畅、可读性强；可适度重组顺序，但事实、数据须与原文一致，不得编造",
+    "star": "面试话术：整理成面试问答口语稿——含「内容判断」与「优化后的回答」两个固定板块，"
+            "口语化、结构清晰，是能直接开口讲的回答，不是书面摘要",
+}
 
-输出格式：{{"coverage": 92, "fabrications": [], "missing": []}}
+QC_TMPL = """你是文稿质检员。用户对每种风格有明确预期（见【风格要求】）。请对照【风格要求】与【原文】检查【成稿】是否符合预期，只输出一行 JSON，不要任何解释。
+
+输出格式：{{"fit": "符合", "problems": [], "suggestions": []}}
+- fit：只能是「符合」「基本符合」「不符合」之一。不符合 = 明显偏离风格定位（如整理文稿大幅删减或被概括、精简文稿几乎照搬全文、公众号文章没有标题结构、面试话术不像口语问答）
+- problems：具体问题，最多 5 条，指明哪里不符合风格要求、哪里与原文事实出入
+- suggestions：针对问题给出怎么修改，最多 5 条
+成稿完全符合时 problems 与 suggestions 留空数组。
+
+【风格要求】
+{rubric}
 
 【原文】
 {source}
@@ -513,22 +546,9 @@ JUDGE_TMPL = """你是严格的文稿质检员。对照【原文】检查【成�
 【成稿】
 {note}"""
 
-REPAIR_TMPL = """质检发现这篇成稿有以下问题：
-{issues}
 
-请根据质检意见输出修正后的完整成稿：补齐遗漏的重要内容（以原文为准）、删除或改写被指出的编造内容、保持原稿的风格与结构。原稿的标题与章节标题行（如 `## 内容判断`、`## 优化后的回答`）必须原样保留，不得删除、改名或合并。不要解释修改过程，只输出成稿全文。
-
-【原文】
-{source}
-
-【原稿】
-{note}"""
-
-JUDGE_MIN_COVERAGE = 85
-
-
-def _parse_judge(raw: str) -> dict | None:
-    """从质检回复里抠出 JSON；解析不了返回 None（按通过处理，绝不拦交付）。"""
+def _parse_review(raw: str) -> dict | None:
+    """从质检回复里抠出 JSON；解析不了返回 None。"""
     m = re.search(r"\{.*\}", raw or "", re.DOTALL)
     if not m:
         return None
@@ -538,59 +558,34 @@ def _parse_judge(raw: str) -> dict | None:
         return None
     if not isinstance(data, dict):
         return None
-    try:
-        coverage = int(data.get("coverage"))
-    except (TypeError, ValueError):
-        return None
-    fabs = data.get("fabrications") or []
-    missing = data.get("missing") or []
-    return {"coverage": coverage,
-            "fabrications": [str(x) for x in fabs] if isinstance(fabs, list) else [],
-            "missing": [str(x) for x in missing] if isinstance(missing, list) else []}
+    fit = str(data.get("fit") or "").strip()
+    if fit not in ("符合", "基本符合", "不符合"):
+        fit = "基本符合" if fit else "未评"
+    probs = data.get("problems") or []
+    sugs = data.get("suggestions") or []
+    return {"fit": fit,
+            "problems": [str(x) for x in probs][:5] if isinstance(probs, list) else [],
+            "suggestions": [str(x) for x in sugs][:5] if isinstance(sugs, list) else []}
 
 
-def _judge_and_repair(source: str, note: str, style: str, title: str,
-                      model: str | None, progress) -> str:
-    """质检闭环：成稿后对照原文查覆盖与编造，不合格带问题清单重写一次。
+def review_note(source: str, note: str, style: str,
+                judge_model: str | None = None) -> dict:
+    """生成后质检：对照风格要求评价一篇成稿，返回 {fit, problems, suggestions}。
 
-    质检本身失败（调用异常/JSON 不合规）一律放行原稿——质检是增益，
-    不能成为新的故障点。环境变量 V2N_POLISH_JUDGE=0 可整体关闭。
+    质检失败不抛异常，返回「未评」加失败原因——质检是旁路，不能拖垮主流程。
     """
-    if os.environ.get("V2N_POLISH_JUDGE") == "0" or not source or not note:
-        return note
-    progress("质检成稿（覆盖与编造）")
+    rubric = STYLE_RUBRICS.get(style, STYLE_RUBRICS["general"])
     try:
-        verdict = _parse_judge(chat(SYSTEM, JUDGE_TMPL.format(source=source, note=note),
-                                    model=model, temperature=WORK_TEMP))
-    except Exception:
-        return note
-    if verdict is None:
-        return note
-    issues = []
-    if verdict["coverage"] < JUDGE_MIN_COVERAGE:
-        issues.append(f"覆盖率只有 {verdict['coverage']}（要求 ≥{JUDGE_MIN_COVERAGE}）")
-    for f in verdict["fabrications"]:
-        issues.append(f"疑似编造：{f}")
-    for mitem in verdict["missing"][:5]:
-        issues.append(f"遗漏：{mitem}")
-    if verdict["coverage"] >= JUDGE_MIN_COVERAGE and not verdict["fabrications"]:
-        return note
-    progress(f"质检未过（覆盖 {verdict['coverage']}），按意见修订一次")
-    try:
-        fixed = _strip_fence(chat(STYLE_SYSTEMS.get(style, SYSTEM),
-                                  REPAIR_TMPL.format(issues="\n".join(f"- {i}" for i in issues),
-                                                     source=source, note=note),
-                                  model=model, temperature=_style_temperature(style)))
-    except Exception:
-        return note
-    if not fixed:
-        return note
-    # 格式护栏：修订稿把原稿的固定章节修丢了，说明这次修订伤了结构，退回原稿
-    if style == "star":
-        for section in ("内容判断", "优化后的回答"):
-            if section in note and section not in fixed:
-                return note
-    return fixed
+        raw = chat(SYSTEM, QC_TMPL.format(rubric=rubric,
+                                          source=(source or "")[:16000],
+                                          note=(note or "")[:16000]),
+                   model=judge_model, temperature=0.2, max_retries=1)
+    except Exception as e:
+        return {"fit": "未评", "problems": [f"质检调用失败：{e}"[:160]], "suggestions": []}
+    parsed = _parse_review(raw)
+    if parsed is None:
+        return {"fit": "未评", "problems": ["质检回复无法解析"], "suggestions": []}
+    return parsed
 
 
 def _strip_fence(text: str) -> str:
@@ -699,7 +694,9 @@ def polish(raw: str, meta: dict, style: str = "general", progress=None,
             title=title, uploader=meta.get("uploader", ""),
             description=meta.get("description", "")[:300], cleaned=raw),
             model=model, temperature=temp))
-        return _judge_and_repair(raw, note, style, title, model, progress)
+        # 生成内质检已下线（2026-11-22）：质检改为生成后的独立环节出报告，
+        # 只评不改——避免「按意见整篇重写」把好稿改没（曾把 4785 字改成 1080 字）
+        return note
 
     progress("抽取专有名词，用于纠错")
     terms = _extract_terms(raw, title, model)
@@ -743,7 +740,8 @@ def polish(raw: str, meta: dict, style: str = "general", progress=None,
             title=title, uploader=meta.get("uploader", ""),
             description=meta.get("description", "")[:300], cleaned=cleaned),
             model=model, temperature=_style_temperature(style)))
-    return _judge_and_repair(cleaned, note, style, title, model, progress)
+    # 同短稿路径：生成后不再做质检修订，成稿直接交付；质检走独立报告
+    return note
 
 
 # ========== 幂等键 ==========

@@ -18,6 +18,7 @@
   </div>
   <div class="topbar-right">
     <span id="health" class="health"></span>
+    <button id="btn-qc" class="btn ghost" title="查看当前任务的生成后质检报告">🧪 质检报告</button>
     <!-- 登录/登出入口：未登录时一直显示（否则用户找不到输入令牌的地方，
          只能等某次请求被 401/402 打回来才弹框）；已登录时显示当前角色，点击可退出。 -->
     <button id="btn-auth" class="btn ghost hidden">🔑 登录</button>
@@ -137,6 +138,20 @@
     <div class="modal-foot">
       <button id="btn-save-settings" class="btn primary">保存</button>
       <button id="btn-cancel-settings" class="btn ghost">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="qc-modal" class="modal hidden">
+  <div class="modal-body">
+    <div class="modal-head">
+      <h2>质检报告</h2>
+      <button id="btn-close-qc" class="icon">×</button>
+    </div>
+    <div id="qc-content" class="qc-content"></div>
+    <div class="modal-foot">
+      <button id="btn-regen-qc" class="btn primary">重新质检</button>
+      <button id="btn-cancel-qc" class="btn ghost">关闭</button>
     </div>
   </div>
 </div>

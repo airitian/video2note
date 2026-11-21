@@ -117,7 +117,7 @@ journalctl -u video2note -f
 | `V2N_MAX_UPLOAD_MB` | 500 | 单文件上传上限 |
 | `V2N_MAX_WORKERS` | 按 CPU | 并发处理任务数 |
 | `V2N_FFMPEG_TIMEOUT` | 内部默认 | ffmpeg 单步超时（秒） |
-| `V2N_POLISH_JUDGE` | 1 | 成稿质检闭环开关，`0` 关闭（关闭后不做覆盖/编造检查与重写） |
+| `V2N_POLISH_JUDGE` | — | 已废弃（2026-11-22 起生成内质检下线，质检改为生成后独立报告，此变量不再生效） |
 | `V2N_LLM_TEMPERATURE` | 空 | 全局温度覆盖；不设则按文稿风格分别取温度 |
 | `V2N_QINIU_URL_EXPIRES` | 内部默认 | 七牛预签名播放地址有效期（秒） |
 | `V2N_DISK_WARN_GB` | 内部默认 | 数据盘剩余空间告警阈值 |

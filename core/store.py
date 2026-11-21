@@ -48,6 +48,8 @@ class Task:
     # 按风格缓存的多份成稿：{"general": {"note":..., "sig":..., "info":{...}}, ...}
     # 用于「换风格重写」时复用已生成过的风格，避免反复调用 LLM
     variants: dict = field(default_factory=dict)
+    # 生成后质检报告：{"at","at_ts","judge_model","items":{style:{model,chars,ratio,seconds,fit,problems,suggestions}}}
+    qc: dict = field(default_factory=dict)
     options: dict = field(default_factory=dict)
     # 任务归属：创建时所持令牌的标识（config.token_identity），"" = 无归属
     # （无令牌创建 / 历史数据）。列表与详情按它做可见性隔离，admin 看全部。
@@ -93,6 +95,7 @@ class Task:
             "note_sig": self.note_sig,
             "note_info": self.note_info,
             "variants": self.variants,
+            "qc": self.qc,
         }
         if brief:
             for k in self._HEAVY_FIELDS:

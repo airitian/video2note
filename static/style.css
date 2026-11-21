@@ -490,3 +490,17 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 
 /* —— AI 文稿限宽：整幅长行不利阅读，正文收在约 800px 内 */
 .note { max-width: 800px; }
+
+/* 质检报告面板 */
+.qc-content { max-height: 62vh; overflow-y: auto; padding: 4px 2px; }
+.qc-task { font-weight: 600; margin: 2px 0 6px; }
+.qc-meta, .qc-nums { color: var(--muted, #8a8f98); font-size: 12.5px; margin: 2px 0; }
+.qc-empty { color: var(--muted, #8a8f98); padding: 14px 2px; }
+.qc-item { border: 1px solid var(--border, #e3e5e8); border-radius: 10px; padding: 10px 12px; margin: 10px 0; }
+.qc-item-head { display: flex; align-items: center; gap: 8px; }
+.qc-fit { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border, #e3e5e8); }
+.qc-fit.ok { color: #1a7f37; border-color: #1a7f37; }
+.qc-fit.mid { color: #b25e09; border-color: #b25e09; }
+.qc-fit.bad { color: #c92a2a; border-color: #c92a2a; }
+.qc-sec { font-size: 12.5px; font-weight: 600; margin: 8px 0 2px; }
+.qc-list { margin: 2px 0 4px; padding-left: 18px; font-size: 13px; line-height: 1.65; }

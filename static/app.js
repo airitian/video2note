@@ -540,10 +540,14 @@
     if (text) {
       const info = (t && t.note_info) || {};
       const sameStyle = info.style === curStyle;
+      const vinfo = (((t && t.variants) || {})[curStyle] || {}).info || (sameStyle ? info : {});
       meta.textContent = (STYLE_TEXT[curStyle] || curStyle) + " · " +
         fmtNum(charCount(text)) + " 字" +
         (tc ? "（原文 " + fmtNum(tc) + " 字）" : "") +
-        (sameStyle && info.at ? " · " + info.at : "");
+        (sameStyle && info.at ? " · " + info.at : "") +
+        (vinfo.model ? " · " + shortModel(vinfo.model) : "") +
+        (vinfo.seconds ? " · 用时 " + vinfo.seconds + "s" : "") +
+        (vinfo.ratio ? " · 保留率 " + Math.round(vinfo.ratio * 100) + "%" : "");
     } else {
       meta.textContent = "";
     }
@@ -1198,6 +1202,109 @@
   // 保留结构是为了将来若取消隐藏，可直接把键加回来。
   const SECRET_UI = {};
 
+  function shortModel(m) {
+    return String(m || "").split("/").pop().split(":")[0];
+  }
+
+  // ---- 质检报告 ------------------------------------------------------------
+  // 生成后质检的查看入口：默认看当前打开的任务，没有打开任务时看最近一条
+  // 有成稿的任务。报告由后端异步生成（全部风格生成完自动跑，也可手动重跑）。
+  let qcTaskId = null;
+  let qcTimer = null;
+
+  function qcTargetTask() {
+    const cur = currentId && tasks.get(currentId);
+    if (cur && Object.values(cur.variants || {}).some((v) => v && v.note)) return cur;
+    let best = null;
+    for (const t of tasks.values()) {
+      if (Object.values(t.variants || {}).some((v) => v && v.note) &&
+          (!best || (t.created_at || 0) > (best.created_at || 0))) best = t;
+    }
+    return best;
+  }
+
+  function renderQc(t) {
+    const box = $("#qc-content");
+    if (!box) return;
+    if (!t) {
+      box.innerHTML = "<p class='qc-empty'>还没有可质检的任务（先生成任意一篇文稿）。</p>";
+      return;
+    }
+    const title = ((t.meta || {}).title || t.id || "").slice(0, 60);
+    let h = "<p class='qc-task'>任务：" + esc(title) + "</p>";
+    const qc = t.qc || {};
+    const items = qc.items || {};
+    if (t.qc_running) {
+      h += "<p class='qc-empty'>质检生成中…（裁判模型逐篇对照风格要求评审，稍等片刻）</p>";
+    }
+    if (!Object.keys(items).length && !t.qc_running) {
+      h += "<p class='qc-empty'>该任务还没有质检报告。点下方「重新质检」立即生成。</p>";
+    }
+    if (Object.keys(items).length) {
+      h += "<p class='qc-meta'>质检时间 " + esc(qc.at || "") + " · 裁判模型 " +
+           esc(shortModel(qc.judge_model || "")) + "（与生成模型不同，避免自己评自己）</p>";
+      for (const style of ["general", "digest", "article", "star"]) {
+        const it = items[style];
+        if (!it) continue;
+        const fitCls = it.fit === "符合" ? "ok" : (it.fit === "不符合" ? "bad" : "mid");
+        const lowRatio = style === "general" && typeof it.ratio === "number" && it.ratio < 0.85;
+        h += "<div class='qc-item'>" +
+          "<div class='qc-item-head'><b>" + esc(STYLE_TEXT[style] || style) + "</b>" +
+          "<span class='qc-fit " + fitCls + "'>" + esc(it.fit || "未评") + "</span>" +
+          (lowRatio ? "<span class='qc-fit bad'>保留率过低</span>" : "") + "</div>" +
+          "<div class='qc-nums'>生成模型 " + esc(shortModel(it.model || "")) +
+          " · " + fmtNum(it.chars || 0) + " 字 · 保留率 " +
+          (typeof it.ratio === "number" ? Math.round(it.ratio * 100) + "%" : "-") +
+          (it.seconds ? " · 用时 " + it.seconds + "s" : "") + "</div>";
+        if ((it.problems || []).length) {
+          h += "<div class='qc-sec'>问题</div><ul class='qc-list'>" +
+            it.problems.map((p) => "<li>" + esc(p) + "</li>").join("") + "</ul>";
+        }
+        if ((it.suggestions || []).length) {
+          h += "<div class='qc-sec'>修改建议</div><ul class='qc-list'>" +
+            it.suggestions.map((p) => "<li>" + esc(p) + "</li>").join("") + "</ul>";
+        }
+        if (!(it.problems || []).length && !(it.suggestions || []).length) {
+          h += "<div class='qc-nums'>未发现问题。</div>";
+        }
+        h += "</div>";
+      }
+    }
+    box.innerHTML = h;
+  }
+
+  async function openQc() {
+    const t = qcTargetTask();
+    qcTaskId = t ? t.id : null;
+    renderQc(t);
+    $("#qc-modal").classList.remove("hidden");
+    openQcPollOnly();
+  }
+
+  async function regenQc() {
+    if (!qcTaskId) { toast("没有可质检的任务", true); return; }
+    try {
+      const r = await fetch("/api/tasks/" + qcTaskId + "/qc", { method: "POST" });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || "触发失败");
+      toast("已开始质检，报告生成后自动刷新");
+      const t = tasks.get(qcTaskId);
+      if (t) { t.qc_running = true; renderQc(t); }
+      if (!qcTimer) openQcPollOnly();
+    } catch (e) { toast(String(e.message || e), true); }
+  }
+
+  function openQcPollOnly() {
+    if (qcTimer) clearInterval(qcTimer);
+    qcTimer = setInterval(async () => {
+      if ($("#qc-modal").classList.contains("hidden")) { clearInterval(qcTimer); qcTimer = null; return; }
+      if (!qcTaskId) return;
+      try {
+        const d = await fetch("/api/tasks/" + qcTaskId).then((r) => r.json());
+        if (d && d.id) { tasks.set(d.id, d); renderQc(d); if (!d.qc_running) { clearInterval(qcTimer); qcTimer = null; } }
+      } catch (e) {}
+    }, 4000);
+  }
+
   async function openSettings() {
     // ★每次打开都重新拉，不能只依赖页面加载时那份缓存。
     // 云机器上最典型的卡死场景：管理员 git pull + 重启了后端，
@@ -1583,6 +1690,9 @@ if (rest.length) {
     // 点抽屉遮罩关闭（桌面端遮罩恒隐藏，不会触发）
     else if (e.target.id === "drawer-mask") closeDrawers();
     else if (e.target.id === "btn-settings") openSettings();
+    else if (e.target.id === "btn-qc") openQc();
+    else if (e.target.id === "btn-close-qc" || e.target.id === "btn-cancel-qc") $("#qc-modal").classList.add("hidden");
+    else if (e.target.id === "btn-regen-qc") regenQc();
     else if (e.target.id === "btn-close-settings" || e.target.id === "btn-cancel-settings") $("#settings-modal").classList.add("hidden");
     else if (e.target.id === "btn-save-settings") saveSettings();
     // 令牌输入框：点确定去校验，关闭则放弃本次请求重试

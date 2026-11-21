@@ -34,7 +34,7 @@ from .config import (ACCESS_TOKEN, ADMIN_TOKEN, HELP, MEDIA_DIR, ROOT, SECRET_KE
                      reset_pro_usage, save_settings, token_identity, token_role,
                      add_token as cfg_add_token, remove_token as cfg_remove_token)
 from .pipeline import (_apply_variant, _mark_idempotent_hit, _sync_variant_meta,
-                       polish_needed, polishing_styles,
+                       polish_needed, polishing_styles, qc_running, submit_qc,
                        retry as pipeline_retry,
                        submit, submit_polish)
 
@@ -389,6 +389,7 @@ def _task_view(t, **kw) -> dict:
     """任务序列化 + 透出正在生成的风格列表（前端据此显示各风格生成状态）"""
     d = t.to_dict(**kw)
     d["polishing_styles"] = polishing_styles(t.id)
+    d["qc_running"] = qc_running(t.id)
     return d
 
 
@@ -1117,6 +1118,24 @@ def polish_task(tid: str, body: PolishIn, request: Request):
     t._cancel = False
     submit_polish(t, style, force=body.force)
     return {"ok": True, "idempotent": False, "message": reason}
+
+
+@app.get("/api/tasks/{tid}/qc")
+def get_qc(tid: str, request: Request):
+    """生成后质检报告（只评不改）：逐风格给出生成模型、字数保留率、
+    是否符合风格要求、问题清单与修改建议。"""
+    t = _get_visible_task(request, tid)
+    return {"ok": True, "qc": t.qc or None, "running": qc_running(tid)}
+
+
+@app.post("/api/tasks/{tid}/qc")
+def post_qc(tid: str, request: Request):
+    """手动触发/重跑质检（异步生成，报告通过 GET 或任务数据回读）。"""
+    t = _get_visible_task(request, tid)
+    if not any((v or {}).get("note") for v in (t.variants or {}).values()):
+        raise HTTPException(400, "该任务还没有成稿，无法质检")
+    started = submit_qc(t, force=True)
+    return {"ok": True, "started": started, "running": qc_running(tid)}
 
 
 @app.post("/api/tasks/{tid}/retry")
