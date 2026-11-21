@@ -505,10 +505,20 @@
   function renderPolishBar(t) {
     const btn = $("#btn-polish"), meta = $("#note-meta"), lmeta = $("#lines-meta");
     const hasText = !!(t && t.transcript && t.transcript.length);
-    const canRun = hasText && (t.status === "transcribed" || t.status === "done");
+    // 不同风格可同时生成：按钮只为「当前风格」服务——当前风格在跑才禁用，
+    // 别的风格在跑不影响继续点生成
+    const runningStyles = new Set((t && t.polishing_styles) || []);
+    const curRunning = runningStyles.has(curStyle);
+    if (t) generatedStyles = new Set(
+      (t.note_info && t.note_info.styles) ||
+      Object.keys(t.variants || {}).filter((k) => t.variants[k] && t.variants[k].note));
+    $$(".style-chip").forEach((b) => b.classList.toggle("generating", runningStyles.has(b.dataset.style)));
+    const canRun = hasText && !curRunning &&
+      (t.status === "transcribed" || t.status === "done" ||
+       (t.status === "running" && t.stage === "polishing"));
     btn.disabled = !canRun;
-    if (t && t.status === "running" && t.stage === "polishing") {
-      btn.textContent = "⏳ 正在生成…";
+    if (curRunning) {
+      btn.textContent = "⏳ 正在生成「" + (STYLE_TEXT[curStyle] || curStyle) + "」…";
     } else if (generatedStyles.has(curStyle)) {
       btn.textContent = "↻ 重新生成「" + (STYLE_TEXT[curStyle] || curStyle) + "」";
     } else {

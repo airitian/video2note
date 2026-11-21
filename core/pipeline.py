@@ -399,6 +399,39 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
 _polish_locks: dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
 
+# 正在生成的风格集合（按任务）：不同风格可以同时生成、互不阻塞；
+# 同一风格重复提交才忽略。任务的终态由「最后一个结束的风格」收尾。
+_polish_running: dict[str, set[str]] = {}
+_polish_running_lock = threading.Lock()
+
+
+def polishing_styles(tid: str) -> list[str]:
+    """该任务当前正在生成的风格列表（供接口透出给前端显示状态）"""
+    with _polish_running_lock:
+        return sorted(_polish_running.get(tid) or ())
+
+
+def _others_running(tid: str, style: str) -> list[str]:
+    with _polish_running_lock:
+        return sorted(s for s in (_polish_running.get(tid) or ()) if s != style)
+
+
+def _polish_register(tid: str, style: str) -> None:
+    with _polish_running_lock:
+        _polish_running.setdefault(tid, set()).add(style)
+
+
+def _polish_unregister(tid: str, style: str) -> bool:
+    """注销一个在跑风格；返回 True 表示已无任何风格在跑（由调用方收尾状态）"""
+    with _polish_running_lock:
+        s = _polish_running.get(tid)
+        if s:
+            s.discard(style)
+            if s:
+                return False
+            _polish_running.pop(tid, None)
+        return True
+
 
 def _task_lock(tid: str) -> threading.Lock:
     with _locks_guard:
@@ -482,6 +515,21 @@ def _mark_idempotent_hit(t: store.Task, reason: str) -> None:
     store.save(t)
 
 
+def _apply_cached(t: store.Task, style: str, reason: str) -> None:
+    """幂等命中时的统一处理：有其它风格正在生成时不抢任务终态。
+
+    判断时排除 style 自己：submit 时它还没在册，body 里它已在册，
+    两种情况用「除自己外还有没有在跑的」衡量都成立。
+    """
+    _apply_variant(t, style)
+    _sync_variant_meta(t)
+    if _others_running(t.id, style):
+        t.log("info", f"幂等命中，跳过 LLM 调用：{reason}")
+        store.save(t)
+    else:
+        _mark_idempotent_hit(t, reason)
+
+
 def _sync_variant_meta(t: store.Task) -> None:
     """刷新 note_info 里的 styles 列表，供前端显示「已生成过哪些风格」"""
     styles = sorted(k for k, v in (t.variants or {}).items() if (v or {}).get("note"))
@@ -500,9 +548,7 @@ def _polish_body(t: store.Task, style: str, emit: EmitFn = None, force: bool = F
 
     need, reason = polish_needed(t, style, force)
     if not need:
-        _apply_variant(t, style)
-        _sync_variant_meta(t)
-        _mark_idempotent_hit(t, reason)
+        _apply_cached(t, style, reason)
         # 命中缓存也算「AI 去重已完成」：补一次备份（幂等，云端已有则跳过），
         # 避免早期漏备份的任务一直卡在「待同步」。
         _schedule_backup(t)
@@ -524,7 +570,9 @@ def _polish_body(t: store.Task, style: str, emit: EmitFn = None, force: bool = F
     text = llm.polish(t.transcript, t.meta or {}, style, prog, model=model)
     t.log("info", f"整理完成，输出 {len(text)} 字")
 
-    # 按风格存档：不同风格互不覆盖，来回切换可直接复用
+    # 按风格存档：不同风格互不覆盖，来回切换可直接复用。
+    # 写回在任务锁内做：多个风格同时生成时，避免交叉 save 把对方刚写的
+    # variant 覆盖掉。终态只由「最后一个结束的风格」写，其余只报进度。
     info = {
         "style": style,
         "model": llm.resolve_model(model),
@@ -533,27 +581,28 @@ def _polish_body(t: store.Task, style: str, emit: EmitFn = None, force: bool = F
         "ts": time.time(),
         "src_hash": src_hash(t),
     }
-    t.variants = t.variants or {}
-    t.variants[style] = {"note": text, "sig": polish_signature(t, style), "info": info}
-    t.note = text
-    t.note_sig = t.variants[style]["sig"]
-    t.note_info = dict(info)
-    # 必须在 note_info 赋值之后再同步，否则 styles 字段写不进去
-    _sync_variant_meta(t)
+    with _task_lock(t.id):
+        t.variants = t.variants or {}
+        t.variants[style] = {"note": text, "sig": polish_signature(t, style), "info": info}
+        t.note = text
+        t.note_sig = t.variants[style]["sig"]
+        t.note_info = dict(info)
+        # 必须在 note_info 赋值之后再同步，否则 styles 字段写不进去
+        _sync_variant_meta(t)
+        if _others_running(t.id, style):
+            t.message = f"「{style}」已生成，其余风格生成中"
+        else:
+            t.stage = "done"
+            t.status = "done"
+            t.failed_stage = ""
+            t.spercent = 100
+            t.percent = 100
+            t.error = ""
+            t.message = "完成"
+        store.save(t)
 
-    t.stage = "done"
-    t.status = "done"
-    t.failed_stage = ""
-    t.spercent = 100
-    t.percent = 100
-    t.error = ""
-    t.message = "完成"
-    store.save(t)
-
-    # ★AI 去重（整理）成功：此刻把源视频备份到七牛云。
-    # 这是云端备份的唯一自动触发点——下载/转写阶段都不传，
-    # 只有整理出成稿后才上传。上传成功后，本地这份再保留
-    # qiniu_archive_days 天，之后由归档清理任务删除（删前会回查云端大小）。
+    # 备份兜底：主触发点已提前到媒体落盘时（见 _transcribe_body），
+    # 这里再触发一次保证早期漏备份的任务也能补上（备份模块自身幂等）。
     _schedule_backup(t)
 
     try:
@@ -649,49 +698,77 @@ def submit_polish(t: store.Task, style: str, force: bool = False) -> None:
 
     幂等：输入未变化且已有成稿时不提交任务，直接复用旧稿（force=True 可强制重跑）。
     """
-    # 加锁只保护「判定 + 置为 running」这一段，不阻塞后续执行
+    # 加锁只保护「判定 + 登记」这一段，不阻塞后续执行
     with _task_lock(t.id):
         need, reason = polish_needed(t, style, force)
         if not need:
             # 命中缓存：把该风格的稿切回展示位
-            _apply_variant(t, style)
-            _sync_variant_meta(t)
-            _mark_idempotent_hit(t, reason)
+            _apply_cached(t, style, reason)
             return
-        if t.status == "running":
+        if style in polishing_styles(t.id):
+            t.log("info", f"该风格正在生成中，忽略重复请求")
+            store.save(t)
+            return
+        if t.status == "running" and t.stage != "polishing":
+            # 还在下载/转写阶段：原文没定型，不能开整理。
+            # 已在 polishing 阶段则放行——不同风格可以同时生成。
             t.log("warn", "任务正在处理中，忽略本次整理请求")
             store.save(t)
             return
+        _polish_register(t.id, style)
         t.status = "running"
+        t.stage = "polishing"
         t.error = ""
         store.save(t)
     _executor.submit(lambda: _catch_polish(t, style, force))
 
 
 def _catch_polish(t: store.Task, style: str, force: bool = False) -> bool:
+    ok = False
     try:
         _polish_body(t, style, force=force)
-        return True
+        ok = True
     except InterruptedError as e:
-        t.status = "canceled"
-        t.error = str(e)
-        t.log("warn", str(e))
-        store.save(t)
-        return False
+        with _task_lock(t.id):
+            if _polish_unregister(t.id, style):
+                t.status = "canceled"
+                t.error = str(e)
+            t.log("warn", str(e))
+            store.save(t)
     except Exception as e:
-        # 失败回退到「已转写」，允许重试。★必须记 failed_stage="polishing"：
+        # 失败回退，允许重试。★必须记 failed_stage="polishing"：
         # retry() 靠它分流到「只重跑整理」；旧代码漏设，整理失败的任务
         # 既进不了 retry（状态是 transcribed 而非 failed），分流也无从谈起。
-        t.status = "transcribed"
-        t.stage = "transcribed"
-        t.failed_stage = "polishing"
-        t.spercent = 100
-        t.percent = RANGES["transcribing"][1]
-        t.error = str(e)
-        t.message = "AI 整理失败，可重试"
-        t.log("error", str(e))
-        store.save(t)
-        return False
+        # 还有其它风格在跑时不抢终态，只记日志；最后一个失败的按
+        # 「已有成稿→done / 没有→transcribed」收尾。
+        with _task_lock(t.id):
+            if _polish_unregister(t.id, style):
+                has = any((v or {}).get("note") for v in (t.variants or {}).values())
+                t.status = "done" if has else "transcribed"
+                t.stage = t.status
+                t.failed_stage = "polishing"
+                t.spercent = 100
+                t.percent = 100 if has else RANGES["transcribing"][1]
+                t.error = str(e)
+                t.message = "AI 整理失败，可重试"
+            t.log("error", str(e))
+            store.save(t)
+    finally:
+        # 成功路径在这里注销。若注销后已无在跑风格、而 _polish_body
+        # 写终态时还有别的风格在册（对方随后先失败退出），由这里补齐终态。
+        if ok:
+            with _task_lock(t.id):
+                if _polish_unregister(t.id, style) \
+                        and t.status == "running" and t.stage == "polishing":
+                    has = any((v or {}).get("note") for v in (t.variants or {}).values())
+                    t.status = "done" if has else "transcribed"
+                    t.stage = t.status
+                    if has:
+                        t.spercent = 100
+                        t.percent = 100
+                        t.message = "完成"
+                    store.save(t)
+    return ok
 
 
 def _ensure_cover(t: store.Task, meta: dict) -> None:

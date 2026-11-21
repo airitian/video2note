@@ -34,7 +34,8 @@ from .config import (ACCESS_TOKEN, ADMIN_TOKEN, HELP, MEDIA_DIR, ROOT, SECRET_KE
                      reset_pro_usage, save_settings, token_identity, token_role,
                      add_token as cfg_add_token, remove_token as cfg_remove_token)
 from .pipeline import (_apply_variant, _mark_idempotent_hit, _sync_variant_meta,
-                       polish_needed, retry as pipeline_retry,
+                       polish_needed, polishing_styles,
+                       retry as pipeline_retry,
                        submit, submit_polish)
 
 ensure_dirs()
@@ -383,6 +384,13 @@ async def _access_guard(request: Request, call_next):
 # owner 是创建时所持令牌的标识（config.token_identity）。可见性规则：
 #   admin 角色 -> 全部；普通令牌 -> 自己的 + 历史无归属（owner="")；
 #   未配置令牌（回环开发）-> 全部。不可见的任务一律按 404 处理，不泄露存在性。
+
+def _task_view(t, **kw) -> dict:
+    """任务序列化 + 透出正在生成的风格列表（前端据此显示各风格生成状态）"""
+    d = t.to_dict(**kw)
+    d["polishing_styles"] = polishing_styles(t.id)
+    return d
+
 
 def _can_view(request: Request, t) -> bool:
     tok = _extract_token(request)
@@ -824,7 +832,7 @@ def list_tasks(request: Request, q: str = ""):
             return q in title or q in (t.transcript or "").lower() \
                 or q in (t.url or "").lower()
         items = [t for t in items if _hit(t)]
-    return [t.to_dict(with_events=False, brief=True) for t in items]
+    return [_task_view(t, with_events=False, brief=True) for t in items]
 
 
 # 查重 + 创建必须原子：两个请求几乎同时贴同一条链接时，
@@ -991,7 +999,7 @@ async def patch_transcript(request: Request, tid: str, body: TranscriptBody):
     t.error = ""
     t.message = "转写已更新，可重新整理"
     store.save(t)
-    return t.to_dict()
+    return _task_view(t)
 
 
 @app.post("/api/tasks/upload")
@@ -1101,8 +1109,11 @@ def polish_task(tid: str, body: PolishIn, request: Request):
         _mark_idempotent_hit(t, reason)
         return {"ok": True, "idempotent": True, "message": reason,
                 "style": style, "note_info": t.note_info}
-    if t.status == "running":
+    if t.status == "running" and t.stage != "polishing":
         raise HTTPException(400, "任务正在处理中，请稍后再试")
+    if style in polishing_styles(t.id):
+        return {"ok": True, "idempotent": False, "message": "该风格正在生成中"}
+    # 已在 polishing 阶段时放行：不同风格可以同时生成
     t._cancel = False
     submit_polish(t, style, force=body.force)
     return {"ok": True, "idempotent": False, "message": reason}
@@ -1219,7 +1230,7 @@ def archive_run(days: int = 0, dry_run: int = 1, limit: int = 0):
 
 @app.get("/api/tasks/{tid}")
 def get_task(tid: str, request: Request):
-    return _get_visible_task(request, tid).to_dict()
+    return _task_view(_get_visible_task(request, tid))
 
 
 @app.delete("/api/tasks/{tid}")

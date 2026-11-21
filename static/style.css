@@ -258,6 +258,8 @@ textarea#url:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--p
 .style-pick { display: flex; gap: 8px; flex-wrap: wrap; }
 .style-chip { height: 38px; padding: 0 15px; border: 1px solid var(--border-strong); border-radius: 19px; background: #fff; color: var(--text-2); font-size: 13px; cursor: pointer; transition: border-color .15s, background .15s, color .15s; }
 .style-chip:hover { border-color: var(--primary); color: var(--primary); }
+.style-chip.generating { border-color: var(--primary); color: var(--primary); animation: chipPulse 1.2s ease-in-out infinite; }
+@keyframes chipPulse { 50% { opacity: .45; } }
 .style-chip.on { background: var(--primary); border-color: var(--primary); color: #fff; font-weight: 600; }
 .btn.ai:disabled { opacity: .5; cursor: not-allowed; }
 /* 字数统计：文字稿与成稿各一处，与标题同行右对齐 */
