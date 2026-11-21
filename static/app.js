@@ -462,19 +462,17 @@
       row.querySelector(".pbar i").style.width = pct + "%";
       row.querySelector(".ppct").textContent = Math.round(pct) + "%";
     });
-    const title = $("#ws-title"), st = $("#ws-status"), msg = $("#ws-msg");
+    const title = $("#ws-title"), st = $("#ws-status");
     if (!t) {
       title.textContent = "尚未开始任务";
       st.textContent = "";
       st.className = "status";
-      msg.textContent = "";
       $("#ws-error").classList.add("hidden");
       return;
     }
     title.textContent = (t.meta && t.meta.title) || t.url || "(无标题)";
     st.className = "status " + t.status;
     st.textContent = (STATUS_TEXT[t.status] || t.status) + (t.status === "running" ? " · " + (STAGE_TEXT[t.stage] || t.stage) : "");
-    msg.textContent = t.message || "";
     const err = $("#ws-error");
     if (t.error) { err.textContent = t.error; err.classList.remove("hidden"); } else err.classList.add("hidden");
     // 失败/取消后才给重试入口；整理阶段失败只补AI 整理，其余重跑全流程
