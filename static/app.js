@@ -875,9 +875,16 @@
             t.events = t.events || [];
             if (!t.events.some((x) => x.t === ev.t && x.text === ev.text)) t.events.push(ev);
           } else if (ev.type === "meta") {
-            // 下载一落盘就拿到了 video_path，预览区立刻可播，不用等全流程结束
+            // 下载一落盘就拿到了 video_path，预览区立刻可播，不用等全流程结束。
+            // 但只有文件名/封面真的变了才清 videoKey 让播放器重建：
+            // 新连接的首帧 meta、生成文稿后的归档回写都会推 meta，
+            // 无条件重建会把正在播放的视频打断重载，看起来像页面刷新。
+            const oldF = ((t.meta && t.meta.video_path) || "").split(/[\\/]/).pop();
+            const oldC = (t.meta && t.meta.cover) || "";
             t.meta = ev.meta || {};
-            ws.videoKey = null;
+            const newF = ((t.meta && t.meta.video_path) || "").split(/[\\/]/).pop();
+            const newC = (t.meta && t.meta.cover) || "";
+            if (oldF !== newF || oldC !== newC) ws.videoKey = null;
           } else if (ev.type === "eof") {
             clearPoller(tid);       // 任务结束，停掉轮询兜底
             // eof 携带最终结果，先就地采用，避免依赖 refreshOne 的网络往返
@@ -1131,6 +1138,16 @@
         body: JSON.stringify({ style: curStyle })
       });
       if (r && r.idempotent) toast(r.message || "已复用该风格的成稿");
+      // 按钮状态立刻更新，不等 SSE 的第一帧状态事件（网络慢时按钮会像没反应）；
+      // 只改本地展示态，播放器元素不碰，视频继续播
+      if (r && !r.idempotent) {
+        const t = tasks.get(currentId);
+        if (t) {
+          t.polishing_styles = Array.from(new Set([...(t.polishing_styles || []), curStyle]));
+          if (t.status === "done" || t.status === "transcribed") { t.status = "running"; t.stage = "polishing"; }
+        }
+        render();
+      }
       follow(currentId);
     } catch (e) {
       toast(e.message, true);
@@ -1987,7 +2004,9 @@ if (rest.length) {
     if (t.status === "done" || t.status === "failed" || t.status === "canceled"
         || t.status === "transcribed") return;
     retryAt.delete(currentId);
-    ws.linesTask = null; ws.linesSig = null; ws.videoKey = null;
+    // 只重绘文本稿，不清 videoKey：播放器是否重建由 ensureVideo 的键
+    // （任务+文件名+封面）决定，切回标签页不该打断正在播的视频
+    ws.linesTask = null; ws.linesSig = null;
     refreshOne(currentId).then(() => {
       ws.linesTask = null; ws.linesSig = null;
       render();
