@@ -430,6 +430,10 @@
       if (plat) parts.push('<i class="htag">' + plat + "</i>");
       if (t.meta && t.meta.duration) parts.push(fmtTime(Number(t.meta.duration) || 0));
       if (t.meta && t.meta.uploader) parts.push(esc(t.meta.uploader));
+      // 已生成文稿的标记：不用点开就知道哪条有稿、有几篇
+      const nStyles = (t.note_info && t.note_info.styles) || [];
+      if (nStyles.length) parts.push("📄 " + nStyles.length + " 篇文稿");
+      else if (t.note_info && t.note_info.style) parts.push("📄 已生成");
       const running = t.status === "running" || t.status === "pending";
       const pct = Math.max(0, Math.min(100, Math.round(t.percent || t.spercent || 0)));
       return head +
@@ -471,11 +475,20 @@
       st.textContent = "";
       st.className = "status";
       $("#ws-error").classList.add("hidden");
+      const cbtn0 = $("#btn-cancel");
+      if (cbtn0) cbtn0.classList.add("hidden");
       return;
     }
     title.textContent = (t.meta && t.meta.title) || t.url || "(无标题)";
     st.className = "status " + t.status;
-    st.textContent = (STATUS_TEXT[t.status] || t.status) + (t.status === "running" ? " · " + (STAGE_TEXT[t.stage] || t.stage) : "");
+    // 运行中把后端推的细粒度进度文案（清洗第 X-Y 段 / 共 N 段等）一并带上：
+    // 只显示阶段名时，几分钟的生成看起来像卡死
+    st.textContent = (STATUS_TEXT[t.status] || t.status) + (t.status === "running"
+      ? " · " + (STAGE_TEXT[t.stage] || t.stage) + (t.message && t.message !== STAGE_TEXT[t.stage] ? " · " + t.message : "")
+      : "");
+    // 取消入口：运行/排队中才显示（后端有 /cancel，之前前端没接）
+    const cbtn = $("#btn-cancel");
+    if (cbtn) cbtn.classList.toggle("hidden", !(t.status === "running" || t.status === "pending"));
     const err = $("#ws-error");
     if (t.error) { err.textContent = t.error; err.classList.remove("hidden"); } else err.classList.add("hidden");
     // 失败/取消后才给重试入口；整理阶段失败只补AI 整理，其余重跑全流程
@@ -541,13 +554,16 @@
       const info = (t && t.note_info) || {};
       const sameStyle = info.style === curStyle;
       const vinfo = (((t && t.variants) || {})[curStyle] || {}).info || (sameStyle ? info : {});
-      meta.textContent = (STYLE_TEXT[curStyle] || curStyle) + " · " +
-        fmtNum(charCount(text)) + " 字" +
-        (tc ? "（原文 " + fmtNum(tc) + " 字）" : "") +
-        (sameStyle && info.at ? " · " + info.at : "") +
-        (vinfo.model ? " · " + shortModel(vinfo.model) : "") +
+      // 主信息（风格/字数/时间）正常显示，次信息（模型/用时/保留率）
+      // 降一档透明度，避免一行小字全挤在一起分不清主次
+      const dim = (vinfo.model ? " · " + esc(shortModel(vinfo.model)) : "") +
         (vinfo.seconds ? " · 用时 " + vinfo.seconds + "s" : "") +
         (vinfo.ratio ? " · 保留率 " + Math.round(vinfo.ratio * 100) + "%" : "");
+      meta.innerHTML = esc(STYLE_TEXT[curStyle] || curStyle) + " · " +
+        fmtNum(charCount(text)) + " 字" +
+        (tc ? "（原文 " + fmtNum(tc) + " 字）" : "") +
+        (sameStyle && info.at ? " · " + esc(info.at) : "") +
+        (dim ? '<span class="meta-dim">' + dim + "</span>" : "");
     } else {
       meta.textContent = "";
     }
@@ -758,12 +774,15 @@
   function ensureNote(t) {
     const box = $("#note-body");
     const text = noteForStyle(t, curStyle);
-    const key = currentId + "|" + curStyle + "|" +
+    const generating = !!t && (t.polishing_styles || []).indexOf(curStyle) >= 0;
+    const key = currentId + "|" + curStyle + "|" + (generating ? "gen|" : "") +
       (text ? text.length + "|" + text.slice(0, 40) : "none");
     if (ws.noteKey !== key) {
       ws.noteKey = key;
       box.innerHTML = text ? renderMarkdown(text)
-        : '<div class="empty">转写完成后，在上方选一种风格点「生成文稿」</div>';
+        : generating
+          ? '<div class="empty">⏳ 正在生成「' + (STYLE_TEXT[curStyle] || curStyle) + '」…进度看上方状态栏，生成完会自动显示在这里</div>'
+          : '<div class="empty">转写完成后，在上方选一种风格点「生成文稿」</div>';
     }
   }
 
@@ -778,11 +797,24 @@
 
   // 只滚动文本稿容器本身把当前句带到中间：scrollIntoView 会连带滚动
   // 外层页面与吸顶面板，在不少浏览器上表现为页面乱跳或干脆不跟随。
+  let progScrollUntil = 0;
   function scrollLineCenter(line, smooth) {
     const box = $("#lines");
     if (!box || !line) return;
+    // 标记程序滚动窗口：这段时间内的 scroll 事件不是用户手动翻页，
+    // 不能据此关掉跟随（否则平滑滚动自己会把跟随关掉）
+    progScrollUntil = Date.now() + 800;
     const top = line.offsetTop - (box.clientHeight - line.clientHeight) / 2;
     box.scrollTo({ top: Math.max(0, top), behavior: smooth ? "smooth" : "auto" });
+  }
+
+  // 用户手动翻页（滚轮/触摸拖动）= 想自己看：暂停跟随并给出恢复入口，
+  // 否则下一句一切换就被拽回中间，没法回看前文
+  function pauseFollow() {
+    if (!ws.follow) return;
+    ws.follow = false;
+    const b = $("#btn-follow");
+    if (b) b.classList.remove("hidden");
   }
 
   function markActive(i, scroll) {
@@ -943,6 +975,9 @@
   function selectTask(id) {
     if (id !== currentId) stopFollow(currentId);   // 切任务先掐掉上一个 SSE，避免孤儿连接/重连（#1）
     currentId = id;
+    ws.follow = true;
+    const fb = $("#btn-follow");
+    if (fb) fb.classList.add("hidden");
     ws.videoTask = null; ws.videoKey = null; ws.linesTask = null; ws.linesSig = null;
     ws.noteKey = null; ws.logCount = -1;
     ws.videoEl = null; ws.segs = []; ws.lineEls = []; ws.active = -1; ws.scrollTop = 0;
@@ -1005,7 +1040,7 @@
       const files = pickedFiles.slice();
       pickedFiles = [];
       $("#file").value = "";
-      $("#drop-text").textContent = "将文件拖放到此处";
+      renderPickedFiles();
       let firstId = null, okCount = 0;
       try {
         for (const f of files) {
@@ -1133,9 +1168,12 @@
   async function polish() {
     if (!currentId) return;
     try {
+      // 按钮文案对已生成风格写的是「重新生成」，就必须真重跑（force）；
+      // 首次生成走普通路径（服务端幂等保护还在，不会重复扣额度）
+      const force = generatedStyles.has(curStyle);
       const r = await api("/api/tasks/" + currentId + "/polish", {
         method: "POST",
-        body: JSON.stringify({ style: curStyle })
+        body: JSON.stringify({ style: curStyle, force: force })
       });
       if (r && r.idempotent) toast(r.message || "已复用该风格的成稿");
       // 按钮状态立刻更新，不等 SSE 的第一帧状态事件（网络慢时按钮会像没反应）；
@@ -1149,6 +1187,17 @@
         render();
       }
       follow(currentId);
+    } catch (e) {
+      toast(e.message, true);
+    }
+  }
+
+  async function cancelTask() {
+    if (!currentId) return;
+    try {
+      await api("/api/tasks/" + currentId + "/cancel", { method: "POST" });
+      toast("已请求取消，当前步骤结束后停下");
+      refreshOne(currentId).then(() => render());
     } catch (e) {
       toast(e.message, true);
     }
@@ -1293,6 +1342,11 @@
   async function openQc() {
     const t = qcTargetTask();
     qcTaskId = t ? t.id : null;
+    // 回退到了别的任务（当前任务还没文稿）时先说清楚，免得用户对着
+    // 别人的报告纳闷——弹窗里只有一行小字标任务名，很容易看漏
+    if (t && currentId && t.id !== currentId) {
+      toast("当前任务还没有文稿，先显示最近一篇有文稿的任务报告");
+    }
     renderQc(t);
     $("#qc-modal").classList.remove("hidden");
     openQcPollOnly();
@@ -1301,8 +1355,9 @@
   async function regenQc() {
     if (!qcTaskId) { toast("没有可质检的任务", true); return; }
     try {
-      const r = await fetch("/api/tasks/" + qcTaskId + "/qc", { method: "POST" });
-      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || "触发失败");
+      // 走 api() 统一通道：带令牌头 + 401 引导（之前用裸 fetch，
+      // 纯令牌登录下会直接 401 失败）
+      await api("/api/tasks/" + qcTaskId + "/qc", { method: "POST", body: "{}" });
       toast("已开始质检，报告生成后自动刷新");
       const t = tasks.get(qcTaskId);
       if (t) { t.qc_running = true; renderQc(t); }
@@ -1316,7 +1371,7 @@
       if ($("#qc-modal").classList.contains("hidden")) { clearInterval(qcTimer); qcTimer = null; return; }
       if (!qcTaskId) return;
       try {
-        const d = await fetch("/api/tasks/" + qcTaskId).then((r) => r.json());
+        const d = await api("/api/tasks/" + qcTaskId);
         if (d && d.id) { tasks.set(d.id, d); renderQc(d); if (!d.qc_running) { clearInterval(qcTimer); qcTimer = null; } }
       } catch (e) {}
     }, 4000);
@@ -1405,7 +1460,12 @@ if (rest.length) {
     // 渲染后立刻核对 curl 框是否真的在 DOM 里，并把结论写在面板顶部。
     // 「看不到 curl 输入框」这个问题，靠猜是猜不出来的——可能是没更新、
     // 可能接口失败、可能被隐藏规则过滤。这里把判定摊开给用户看。
-    if (!settingsLoadErr) blocks.unshift(selfCheck(help, blocks.join("")));
+    // 自检条只在真有问题（bad）时才出现：正常时它是调试信息，
+    // 常驻顶部只会挤占设置面板、让每个打开设置的人先读一段无关文字
+    if (!settingsLoadErr) {
+      const sc = selfCheck(help, blocks.join(""));
+      if (sc.indexOf("scheck bad") >= 0) blocks.unshift(sc);
+    }
     $("#settings-form").innerHTML = blocks.join("");
     $("#settings-modal").classList.remove("hidden");
     // 管理员才渲染令牌管理区块（普通 token 看不到；后端也会拒绝）
@@ -1701,6 +1761,7 @@ if (rest.length) {
 
     if (e.target.id === "btn-start") start();
     else if (e.target.id === "btn-polish") polish();
+    else if (e.target.id === "btn-cancel") cancelTask();
     else if (e.target.id === "btn-retry") retryTask();
     else if (e.target.id === "btn-history") { $("#side-left").classList.toggle("folded"); syncSideBtns(); syncDrawerMask(); }
     else if (e.target.id === "btn-logs") { $("#side-right").classList.toggle("folded"); syncSideBtns(); syncDrawerMask(); }
@@ -1733,9 +1794,45 @@ if (rest.length) {
     else if (e.target.id === "pick") $("#file").click();
   });
 
+  // 已选文件的展示与管理：名字逐个列出可单独移除（选错不用整批重选），
+  // 并把「开始转写」按钮文案带上文件数、高亮一下，免得用户选完文件
+  // 还要跨到右栏去找那个对着空链接框的按钮才敢点
+  function renderPickedFiles() {
+    const dt = $("#drop-text");
+    const t2 = drop ? drop.querySelector(".up-t2") : null;
+    if (!pickedFiles.length) {
+      if (dt) dt.textContent = "将文件拖放到此处";
+      if (t2) t2.innerHTML = '或 <a href="javascript:void(0)" id="pick">点击上传</a>，支持视频 / 音频';
+    } else {
+      if (dt) dt.textContent = "已选择 " + pickedFiles.length + " 个文件";
+      if (t2) t2.innerHTML = pickedFiles.map((f, i) =>
+        '<span class="fname">' + esc(f.name) +
+        ' <a href="javascript:void(0)" class="unpick" data-unpick="' + i + '" title="移除这个文件">×</a></span>'
+      ).join(" ") + "<br>点右侧「开始转写」处理";
+    }
+    updateStartBtn();
+  }
+  function updateStartBtn() {
+    const b = $("#btn-start");
+    if (!b) return;
+    const urlEmpty = !(($("#url") || {}).value || "").trim();
+    const fileMode = !!(pickedFiles.length && urlEmpty);
+    b.textContent = fileMode ? "开始转写（" + pickedFiles.length + " 个文件）" : "开始转写";
+    b.classList.toggle("pulse", fileMode);
+  }
+
   const drop = $("#drop");
   if (drop) {
-    drop.addEventListener("click", () => $("#file").click());
+    drop.addEventListener("click", (e) => {
+      const un = e.target.closest("[data-unpick]");
+      if (un) {
+        e.stopPropagation();
+        pickedFiles.splice(parseInt(un.dataset.unpick, 10), 1);
+        renderPickedFiles();
+        return;
+      }
+      $("#file").click();
+    });
     drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
     drop.addEventListener("dragleave", () => drop.classList.remove("over"));
     drop.addEventListener("drop", (e) => {
@@ -1744,7 +1841,7 @@ if (rest.length) {
       const fs = e.dataTransfer.files;
       if (fs && fs.length) {
         pickedFiles = Array.from(fs);
-        $("#drop-text").textContent = fs.length > 1 ? "已选择 " + fs.length + " 个文件" : "已选择：" + fs[0].name;
+        renderPickedFiles();
       }
     });
   }
@@ -1753,9 +1850,11 @@ if (rest.length) {
     const fs = fileInput.files;
     if (fs && fs.length) {
       pickedFiles = Array.from(fs);
-      $("#drop-text").textContent = fs.length > 1 ? "已选择 " + fs.length + " 个文件" : "已选择：" + fs[0].name;
+      renderPickedFiles();
     }
   });
+  const urlInput = $("#url");
+  if (urlInput) urlInput.addEventListener("input", updateStartBtn);
   $("#url").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) start();
   });
@@ -1809,6 +1908,15 @@ if (rest.length) {
   // ---------- 启动 ----------
   // 记住文字区滚动位置：转写增量会重建 DOM，重建后要还原回去
   $("#lines").addEventListener("scroll", saveScroll, { passive: true });
+  // 手动翻页暂停跟随（滚轮与触摸是明确的用户意图；程序滚动走 progScrollUntil 守卫）
+  $("#lines").addEventListener("wheel", () => { if (Date.now() > progScrollUntil) pauseFollow(); }, { passive: true });
+  $("#lines").addEventListener("touchmove", () => { if (Date.now() > progScrollUntil) pauseFollow(); }, { passive: true });
+  const followBtn = $("#btn-follow");
+  if (followBtn) followBtn.addEventListener("click", () => {
+    ws.follow = true;
+    followBtn.classList.add("hidden");
+    if (ws.videoEl) syncActive(ws.videoEl.currentTime, true);
+  });
 
   // ---------- 手机端抽屉工具 ----------
   // ≤720px 时侧栏是浮层抽屉（见 style.css 对应断点）：
@@ -1908,7 +2016,15 @@ if (rest.length) {
       bits.push('<span class="bad">后端版本过旧，请 git pull 后重启</span>');
     }
     const el = $("#health");
-    el.innerHTML = bits.join(" · ");
+    // 顶栏是给使用者看的：依赖明细与版本戳是管理员排查信息。
+    // 非管理员只看结论（正常 / 哪项异常），管理员保持全量。
+    const hasBad = bits.some((b) => b.indexOf('class="bad"') >= 0);
+    el.classList.toggle("has-bad", hasBad);
+    if (typeof authState !== "undefined" && authState.role && authState.role !== "admin") {
+      el.innerHTML = hasBad ? bits.filter((b) => b.indexOf('class="bad"') >= 0).join(" · ") : '<span class="ok">服务正常</span>';
+    } else {
+      el.innerHTML = bits.join(" · ");
+    }
     el.classList.remove("checking");
     el.title = "点击重新检测依赖";
   }

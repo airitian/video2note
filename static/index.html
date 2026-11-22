@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#7c3aed">
 <title>抖音 / B站 视频转文字</title>
-<link rel="stylesheet" href="/static/style.css?v=20261121w">
+<link rel="stylesheet" href="/static/style.css?v=20261121x">
 </head>
 <body>
 <header class="topbar">
@@ -57,7 +57,7 @@
       </div>
       <div class="input-col">
         <div class="url-row">
-          <textarea id="url" rows="3" placeholder="支持抖音 / B站链接，可连同分享文案一起粘贴；也支持直接拖入本地音视频。一行一个链接、多个文件都会全部处理"></textarea>
+          <textarea id="url" rows="3" placeholder="支持抖音 / B站链接，可连同分享文案一起粘贴；也支持直接拖入本地音视频。一行一个链接、多个文件都会全部处理（Ctrl+Enter 快速开始）"></textarea>
           <button id="btn-start" class="btn primary big">开始转写</button>
         </div>
       </div>
@@ -78,6 +78,7 @@
     <div id="ws-error" class="wserr hidden"></div>
     <div class="pfoot">
       <span class="spacer"></span>
+      <button class="btn small hidden" id="btn-cancel">■ 取消任务</button>
       <button class="btn small retry hidden" id="btn-retry">↻ 重试</button>
     </div>
   </section>
@@ -85,12 +86,24 @@
   <section class="ws-grid">
     <div class="card pane sticky-pane video-pane">
       <div id="video-host" class="video-host"><div class="empty">暂无视频</div></div>
+      <div class="video-tools">
+        <select id="rate-pick" class="rate-pick" title="播放倍速">
+          <option value="0.5">0.5×</option>
+          <option value="0.75">0.75×</option>
+          <option value="1" selected>1×</option>
+          <option value="1.25">1.25×</option>
+          <option value="1.5">1.5×</option>
+          <option value="2">2×</option>
+        </select>
+        <button id="btn-pip" class="btn small" title="画中画小窗播放">画中画</button>
+      </div>
     </div>
     <div class="card pane lines-pane">
       <div class="pane-head">文本稿
         <span class="tools"><span id="lines-meta" class="count-meta"></span><button class="btn small" id="btn-edit-transcript">编辑</button></span>
       </div>
       <div id="lines" class="lines"><div class="empty">暂无转写结果</div></div>
+      <button id="btn-follow" class="btn small follow-chip hidden">↓ 回到当前句</button>
     </div>
   </section>
 
@@ -103,7 +116,7 @@
     </div>
     <button id="btn-polish" class="btn ai" disabled>✨ 生成文稿</button>
   </div>
-  <p class="ai-tip" id="ai-tip">选一种风格生成文稿；换风格点「生成文稿」即可重写同一份转写内容，已生成过的风格会直接复用，不重复消耗额度。</p>
+  <p class="ai-tip" id="ai-tip">选一种风格点「生成文稿」；切换风格只是查看已生成的文稿、不消耗额度；已生成过的风格点按钮会重新生成一篇。</p>
 
   <section class="card" id="note-card">
     <div class="pane-head">AI 文稿
@@ -207,6 +220,6 @@
 
 <div id="toast" class="toast hidden"></div>
 
-<script src="/static/app.js?v=20261121w"></script>
+<script src="/static/app.js?v=20261121x"></script>
 </body>
 </html>
