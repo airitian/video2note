@@ -409,7 +409,7 @@ def _get_visible_task(request: Request, tid: str):
         raise HTTPException(404, "任务不存在")
     return t
 
-STYLES = ("general", "digest", "article", "star")
+STYLES = ("cleaned", "general", "digest", "article", "star")
 
 # 按扩展名给媒体流定Content-Type。
 # 不用固定白名单的原因：上传的本地文件落盘名是 source<原后缀>，
@@ -981,7 +981,8 @@ async def patch_transcript(request: Request, tid: str, body: TranscriptBody):
 
     ASR 难免错字，旧流程只能整条重跑。现在可直接改原文：保存新转写，
     并清掉基于旧转写的成稿/变体/签名（note、variants、note_sig、
-    note_info），任务回到「已转写」态，前端可一键重新整理出新成稿。
+    note_info）与共享清洗缓存（clean_cache），任务回到「已转写」态，
+    前端可一键重新整理出新成稿。
     """
     t = _get_visible_task(request, tid)
     text = (body.transcript or "").strip()
@@ -994,6 +995,7 @@ async def patch_transcript(request: Request, tid: str, body: TranscriptBody):
     t.variants = {}
     t.note_sig = ""
     t.note_info = {}
+    t.clean_cache = {}
     if t.status == "done":
         t.status = "transcribed"
         t.stage = "transcribed"

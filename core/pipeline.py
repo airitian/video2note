@@ -381,7 +381,8 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
         t.note_sig = ""
         t.note_info = {}
         t.variants = {}
-        t.log("info", "转写原文已更新，原文稿（含各风格缓存）作废，请重新生成")
+        t.clean_cache = {}
+        t.log("info", "转写原文已更新，原文稿（含各风格缓存与共享清洗稿）作废，请重新生成")
 
     t.stage = "transcribed"
     t.status = "transcribed"
@@ -396,7 +397,8 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
         record_pro_use()
     except Exception:
         pass
-    # 转写完成默认自动生成全部四种风格，用户无需再手动点生成。
+    # 转写完成默认自动生成全部风格，用户无需再手动点生成：清洗文稿
+    # 最先（产出共享清洗产物），其余风格随后只做 compose。
     # 模型不在此处预分配：每次真正生成时由 _polish_body 按生成次数
     # 从轮换名单取下一个（见 pick_generation_model）。
     for _style in AUTO_STYLES:
@@ -454,7 +456,9 @@ _ROTATION_LOCK = threading.Lock()
 # 全局整理并发上限：多个视频同时下完时，整理任务最多同时跑 2 个，
 # 避免把模型端点打到限流（限流后重试反而更慢）
 _POLISH_SEM = threading.Semaphore(2)
-AUTO_STYLES = ("general", "digest", "article", "star")
+# 转写后自动生成顺序：清洗文稿最先（它就是共享清洗产物，跑完后其余
+# 风格只剩 compose），其后仍是原有四风格。
+AUTO_STYLES = ("cleaned", "general", "digest", "article", "star")
 
 
 def rotation_models() -> list[str]:
@@ -636,13 +640,81 @@ def src_hash(t: store.Task) -> str:
     return hashlib.sha1((t.transcript or "").encode("utf-8")).hexdigest()[:16]
 
 
+# ============================ 共享清洗产物 ============================
+# 一篇稿子的清洗（术语抽取 + 分块清洗）只跑一次，结果落在 t.clean_cache，
+# 五种风格共享：清洗文稿 = 产物本身，整理文稿 = 产物加标题，精简/公众号/
+# 面试只在产物之上做一次 compose。清洗签名由转写原文 + 清洗模板版本决定
+# （llm.clean_signature），原文被编辑/重转写即失效。
+_clean_locks: dict[str, threading.Lock] = {}
+
+
+def _clean_lock(tid: str) -> threading.Lock:
+    with _locks_guard:
+        lk = _clean_locks.get(tid)
+        if lk is None:
+            lk = threading.Lock()
+            _clean_locks[tid] = lk
+        return lk
+
+
+def clean_cache_valid(t: store.Task) -> dict | None:
+    """任务的共享清洗缓存是否可用（有文本且签名与当前原文匹配）。"""
+    cache = t.clean_cache or {}
+    if cache.get("text") and cache.get("sig") == llm.clean_signature(t.transcript or ""):
+        return cache
+    return None
+
+
+def ensure_clean(t: store.Task, model: str | None = None,
+                 prog=None, force: bool = False) -> dict:
+    """确保任务有与当前转写原文匹配的共享清洗产物，返回缓存 dict。
+
+    命中（签名一致）零 LLM 调用直接返回；未命中才真跑清洗
+    （llm.clean_transcript），产物连同实际所用模型/用时落盘到
+    t.clean_cache。同任务并发调用由 per-task 锁串行化：先到者清洗、
+    后到者复检命中，避免自动生成多风格并发时把同一份稿子洗两遍。
+    force=True 时绕过缓存强制重洗（清洗文稿/整理文稿的「重新生成」）。
+    """
+    if not force:
+        cache = clean_cache_valid(t)
+        if cache is not None:
+            return cache
+    with _clean_lock(t.id):
+        if not force:
+            cache = clean_cache_valid(t)
+            if cache is not None:
+                return cache
+        _t0 = time.time()
+        cleaned, terms = llm.clean_transcript(
+            t.transcript, t.meta or {}, prog, model=model)
+        cache = {"text": cleaned, "terms": terms,
+                 "sig": llm.clean_signature(t.transcript or ""),
+                 "model": llm.resolve_model(model),
+                 "seconds": round(time.time() - _t0, 1),
+                 "ts": time.time()}
+        t.clean_cache = cache
+        store.save(t)
+        t.log("info", f"共享清洗完成：清洗稿 {len(cleaned)} 字"
+                      f"（用时 {cache['seconds']}s），后续各风格共享")
+        return cache
+
+
 def polish_signature(t: store.Task, style: str) -> str:
     """当前输入对应的成稿幂等键。
 
     模型不计入签名：模型按生成次数轮换，若计入，每次生成都会被判为
-    「输入已变化」、10 分钟冷却形同虚设。其余要素（原文/模板/温度）
-    变化仍会使签名变化、照常触发重新整理。
+    「输入已变化」、10 分钟冷却形同虚设。
+    清洗文稿的签名就是清洗签名本身；其余风格改为基于共享清洗文本
+    签名——清洗变了（原文变/重洗），下游成稿签名跟着变，下次点击时
+    重新生成。尚无有效清洗缓存时退回基于原文的签名：它与任何
+    「基于清洗文本」落盘的签名必然不同，照常触发重新生成（生成时
+    会先补清洗再按清洗文本重算签名落盘）。
     """
+    if style == "cleaned":
+        return llm.clean_signature(t.transcript or "")
+    cache = clean_cache_valid(t)
+    if cache is not None:
+        return llm.signature(cache["text"], style, None)
     return llm.signature(t.transcript, style, None)
 
 
@@ -761,11 +833,59 @@ def _polish_body(t: store.Task, style: str, emit: EmitFn = None, force: bool = F
     def prog(msg: str) -> None:
         _set(t, "polishing", 0.3, msg, emit=emit)
 
-    # 走到这里说明 polish_needed 已判定要真跑 LLM，此刻才挑模型并
-    # 递增轮换计数（缓存命中在上方已返回，不会消耗轮换名额）。
-    model = pick_generation_model(t)
+    # 生成走共享清洗：清洗只跑一次（ensure_clean），各风格在此之上产出。
+    # 挑模型（pick_generation_model）只发生在确实要调 LLM 时——清洗已
+    # 命中缓存的整理/清洗文稿零调用完成，不消耗轮换名额；清洗未命中
+    # 时，清洗用本次挑的模型（它就是本风格内容实际的生产者）。
     _t0 = time.time()
-    text = llm.polish(t.transcript, t.meta or {}, style, prog, model=model)
+    if style == "cleaned":
+        # 清洗文稿 = 共享清洗产物本身；force 时绕过缓存重洗
+        hit = None if force else clean_cache_valid(t)
+        if hit is not None:
+            cache, used_model = hit, hit.get("model") or ""
+        else:
+            m = pick_generation_model(t)
+            cache = ensure_clean(t, model=m, prog=prog, force=force)
+            used_model = cache.get("model") or llm.resolve_model(m)
+        text = cache["text"]
+    elif style == "general":
+        # 整理文稿 = 清洗产物加标题：清洗已完成时零额外 LLM 调用
+        hit = None if force else clean_cache_valid(t)
+        if hit is not None:
+            text = llm.compose_from_cleaned(
+                hit["text"], t.meta or {}, "general", prog)
+            used_model = hit.get("model") or ""
+        else:
+            m = pick_generation_model(t)
+            try:
+                cache = ensure_clean(t, model=m, prog=prog, force=force)
+                text = llm.compose_from_cleaned(
+                    cache["text"], t.meta or {}, "general", prog, model=m)
+                used_model = cache.get("model") or llm.resolve_model(m)
+            except Exception:
+                # 共享清洗失败：回退老路径（自带术语+清洗+成稿），
+                # 不能因为共享化让原本能生成的风格生成不了
+                t.log("warn", "共享清洗失败，整理文稿回退原有独立整理路径")
+                text = llm.polish(t.transcript, t.meta or {}, style, prog,
+                                  model=m)
+                used_model = llm.resolve_model(m)
+    else:
+        # 精简/公众号/面试：跳过各自原有的术语+清洗，只剩 compose 一次调用。
+        # 只有清洗这一步失败才回退老路径；compose 本身失败与改版前一样
+        # 直接失败、可重试（老路径里 compose 失败也是整体失败）。
+        m = pick_generation_model(t)
+        cache = None
+        try:
+            cache = ensure_clean(t, model=m, prog=prog)
+        except Exception:
+            t.log("warn", f"共享清洗失败，「{style}」回退原有独立整理路径")
+        if cache is not None:
+            text = llm.compose_from_cleaned(
+                cache["text"], t.meta or {}, style, prog, model=m)
+        else:
+            text = llm.polish(t.transcript, t.meta or {}, style, prog,
+                              model=m)
+        used_model = llm.resolve_model(m)
     _seconds = round(time.time() - _t0, 1)
     t.log("info", f"整理完成，输出 {len(text)} 字（用时 {_seconds}s）")
 
@@ -774,7 +894,7 @@ def _polish_body(t: store.Task, style: str, emit: EmitFn = None, force: bool = F
     # variant 覆盖掉。终态只由「最后一个结束的风格」写，其余只报进度。
     info = {
         "style": style,
-        "model": llm.resolve_model(model),
+        "model": used_model,
         "chars": len(text),
         "seconds": _seconds,
         "ratio": round(len(text) / max(1, len(t.transcript or "")), 3),

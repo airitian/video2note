@@ -79,7 +79,7 @@
   const ORDER = ["upload", "downloading", "extracting", "slicing", "transcribing", "polishing"];
   const STATUS_TEXT = { pending: "排队中", running: "处理中", transcribed: "转写完成", done: "已完成", failed: "失败", canceled: "已取消" };
   const STAGE_TEXT = { queued: "等待开始", downloading: "下载视频", extracting: "提取音频", slicing: "语音切片", transcribing: "语音转写", transcribed: "等待生成文稿", polishing: "AI 生成文稿", done: "完成", failed: "失败" };
-  const STYLE_TEXT = { general: "整理文稿", digest: "精简文稿", article: "公众号文章", star: "面试话术", note: "结构化笔记", clean: "仅清洗润色" };
+  const STYLE_TEXT = { cleaned: "清洗文稿", general: "整理文稿", digest: "精简文稿", article: "公众号文章", star: "面试话术", note: "结构化笔记", clean: "仅清洗润色" };
   // 默认风格；页面把选择结果记在curStyle 里
   let curStyle = "general";
   // 已生成过文稿的风格集合（当前任务），用于提示与按钮文案
@@ -1309,13 +1309,13 @@
     if (Object.keys(items).length) {
       h += "<p class='qc-meta'>质检时间 " + esc(qc.at || "") + " · 裁判模型 " +
            esc(shortModel(qc.judge_model || "")) + "（与生成模型不同，避免自己评自己）</p>";
-      for (const style of ["general", "digest", "article", "star"]) {
+      for (const style of ["cleaned", "general", "digest", "article", "star"]) {
         const it = items[style];
         if (!it) continue;
         const fitCls = it.fit === "符合" ? "ok" : (it.fit === "不符合" ? "bad" : "mid");
         // 整理文稿现在要求删引流/广告/无关话术，广告多的视频保留率
       // 合理地低于 85%——标红线降到 70%，只拦灾难性塌缩（如曾经的 19%）
-      const lowRatio = style === "general" && typeof it.ratio === "number" && it.ratio < 0.7;
+      const lowRatio = (style === "general" || style === "cleaned") && typeof it.ratio === "number" && it.ratio < 0.7;
         h += "<div class='qc-item'>" +
           "<div class='qc-item-head'><b>" + esc(STYLE_TEXT[style] || style) + "</b>" +
           "<span class='qc-fit " + fitCls + "'>" + esc(it.fit || "未评") + "</span>" +

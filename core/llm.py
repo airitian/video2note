@@ -24,12 +24,14 @@ CHUNK_LIMIT = 3500      # map 阶段每块字符数
 
 # 管线版本：生成行为（合并方式/温度/质检）变化时递增，纳入缓存签名，
 # 避免旧逻辑生成的缓存成稿在新逻辑上线后继续被当作有效结果复用。
-PIPELINE_REV = "20261122-v1"
+# 20261123-v2：清洗产物跨风格共享（见 clean_transcript / clean_signature），
+# 下游风格签名改为基于清洗文本，旧成稿签名全部失效、首次点击重新生成。
+PIPELINE_REV = "20261123-v2"
 
 # 分风格温度：忠实类要稳、创作类要放。设置页显式填了温度时以设置页为准
 # （见 _style_temperature），这里只提供未显式设置时的默认值。
-STYLE_TEMPERATURES = {"general": 0.1, "digest": 0.3, "star": 0.35,
-                      "article": 0.65}
+STYLE_TEMPERATURES = {"general": 0.1, "cleaned": 0.1, "digest": 0.3,
+                      "star": 0.35, "article": 0.65}
 # 清洗/术语/质检这类确定性工序统一用低温
 WORK_TEMP = 0.1
 
@@ -571,6 +573,9 @@ STYLE_SYSTEMS = {
 # 它只对照风格要求评价成稿、列问题与修改建议，绝不改写成稿本身。
 
 STYLE_RUBRICS = {
+    "cleaned": "清洗文稿：转写稿的清洗产物——只删口语填充、重复啰嗦、引流/广告话术与无关闲聊跑题，"
+               "修正转写错字、补标点；实质内容与叙述顺序必须完整保留，不得概括、改写或新增内容；"
+               "字数应与原文接近（保留率一般不低于 70%，原文引流/广告占比高时可更低）",
     "general": "整理文稿：基于原文校对——只修错别字、补缺失字；删纯填充、引流、广告及与主题无关的话术，"
                "保留内容严格按原文顺序、一字不删、不改写、不概括；字数应与原文接近（保留率一般不低于 70%，"
                "原文引流/广告占比高时可更低，但正文内容不得缺失、顺序不得打乱）",
@@ -752,10 +757,86 @@ def _carry_block(done: list[str], limit: int = CARRY_CHARS) -> str:
             f"不要重复输出）：\n{tail}\n")
 
 
+def clean_transcript(raw: str, meta: dict, progress=None,
+                     model: str | None = None) -> tuple[str, str]:
+    """共享清洗：把转写原文洗成各风格共用的清洗稿，返回 (清洗文本, 术语表)。
+
+    短稿（≤ SHORT_LIMIT）整段作一块走 CLEAN_TMPL 单次清洗——CLEAN_TMPL 与
+    GENERAL_TMPL 口径一致（删填充/引流/广告、修错、保序），单块上下文完整，
+    不必再抽术语（术语表返回空串）；长稿走术语抽取 -> 分块清洗 -> 拼接，
+    与原 polish 长稿路径的清洗段完全相同。清洗产物由 pipeline.ensure_clean
+    按任务缓存（见 clean_signature），一篇稿子只洗一次、五种风格共享。
+    """
+    title = (meta.get("title") or "未命名视频").strip()
+    raw = (raw or "").strip()
+    if not raw:
+        raise LLMError("转写文本为空，无法清洗")
+    if progress is None:
+        progress = lambda _msg: None  # noqa: E731
+
+    if len(raw) <= SHORT_LIMIT:
+        progress("清洗文本")
+        out = chat(SYSTEM, CLEAN_TMPL.format(
+            title=title, idx=1, total=1, terms="无", prev="", chunk=raw),
+            model=model, temperature=WORK_TEMP)
+        return _strip_fence(out), ""
+
+    progress("抽取专有名词，用于纠错")
+    terms = _extract_terms(raw, title, model)
+
+    chunks = _split_chunks(raw)
+    total = len(chunks)
+    maxw = get_int_clamped(load_settings(), "max_concurrency", 4, 1, 8)
+    progress(f"分 {total} 块清洗文本")
+
+    # 分批推进：批内并行（互不依赖，可并发），批与批之间把上文摘要带进下一批。
+    # 为什么不全串行——串行上下文最完整，但耗时会翻数倍；
+    # 分批在并发度和连贯性之间取平衡，断点只落在相邻两批之间。
+    cleaned_parts: list[str] = []
+    for start in range(0, total, maxw):
+        batch = list(range(start, min(start + maxw, total)))
+        prev = _carry_block(cleaned_parts)
+
+        def work(i: int, _prev: str = prev) -> str:
+            return chat(SYSTEM, CLEAN_TMPL.format(
+                title=title, idx=i + 1, total=total, terms=terms,
+                prev=_prev, chunk=chunks[i]), model=model, temperature=WORK_TEMP)
+
+        progress(f"清洗第 {batch[0] + 1}-{batch[-1] + 1} 段 / 共 {total} 段")
+        with ThreadPoolExecutor(max_workers=maxw) as ex:
+            cleaned_parts.extend(ex.map(work, batch))
+    cleaned = "\n\n".join(p for p in cleaned_parts if p.strip())
+    return cleaned, terms
+
+
+def compose_from_cleaned(cleaned: str, meta: dict, style: str,
+                         progress=None, model: str | None = None) -> str:
+    """在共享清洗稿之上产出某风格成稿（清洗已完成时调用）。
+
+    general：清洗产物本身就是校对稿，只加一行标题、零 LLM 调用；
+    其余风格：各自模板在清洗文本上做一次 compose 调用（模板不变）。
+    """
+    title = (meta.get("title") or "未命名视频").strip()
+    if progress is None:
+        progress = lambda _msg: None  # noqa: E731
+    if style == "general":
+        progress("拼接清洗稿")
+        return f"# {title}\n\n{cleaned}" if title else cleaned
+    progress("合并并结构化排版")
+    tmpl = STYLES.get(style, STYLES[DEFAULT_STYLE])
+    sys_p = STYLE_SYSTEMS.get(style, SYSTEM)
+    return _strip_fence(chat(sys_p, tmpl.format(
+        title=title, uploader=meta.get("uploader", ""),
+        description=meta.get("description", "")[:300], cleaned=cleaned),
+        model=model, temperature=_style_temperature(style)))
+
+
 def polish(raw: str, meta: dict, style: str = "general", progress=None,
            model: str | None = None) -> str:
-    """短文本一次完成；长文本 map-reduce：术语抽取 -> 分块清洗 -> 合并成稿
+    """老路径（自带清洗的完整整理）：短文本一次完成；长文本 map-reduce。
 
+    保留用途：共享清洗失败时各风格回退到这里，保证共享化不会让原本
+    能生成的风格生成不了；短稿路径行为与改版前完全一致。
     model：按任务覆盖的配置化模型名（对应页面「LLM 模型」输入框）
     """
     title = (meta.get("title") or "未命名视频").strip()
@@ -777,50 +858,8 @@ def polish(raw: str, meta: dict, style: str = "general", progress=None,
         # 只评不改——避免「按意见整篇重写」把好稿改没（曾把 4785 字改成 1080 字）
         return note
 
-    progress("抽取专有名词，用于纠错")
-    terms = _extract_terms(raw, title, model)
-
-    chunks = _split_chunks(raw)
-    total = len(chunks)
-    maxw = get_int_clamped(load_settings(), "max_concurrency", 4, 1, 8)
-
-    if progress:
-        progress(f"分 {total} 块清洗文本")
-
-    # 分批推进：批内并行（互不依赖，可并发），批与批之间把上文摘要带进下一批。
-    # 为什么不全串行——串行上下文最完整，但耗时会翻数倍；
-    # 分批在并发度和连贯性之间取平衡，断点只落在相邻两批之间。
-    cleaned_parts: list[str] = []
-    for start in range(0, total, maxw):
-        batch = list(range(start, min(start + maxw, total)))
-        prev = _carry_block(cleaned_parts)
-
-        def work(i: int, _prev: str = prev) -> str:
-            return chat(SYSTEM, CLEAN_TMPL.format(
-                title=title, idx=i + 1, total=total, terms=terms,
-                prev=_prev, chunk=chunks[i]), model=model, temperature=WORK_TEMP)
-
-        if progress:
-            progress(f"清洗第 {batch[0] + 1}-{batch[-1] + 1} 段 / 共 {total} 段")
-        with ThreadPoolExecutor(max_workers=maxw) as ex:
-            cleaned_parts.extend(ex.map(work, batch))
-    cleaned = "\n\n".join(p for p in cleaned_parts if p.strip())
-
-    if style == "general":
-        # 整理文稿：分块清洗的产物本身就是校对稿，拼接后只加一行标题，
-        # 不再整篇再生成——避免同一风格下成稿长度大幅漂移、内容被重写
-        progress("拼接清洗稿")
-        note = f"# {title}\n\n{cleaned}" if title else cleaned
-    else:
-        progress("合并并结构化排版")
-        tmpl = STYLES.get(style, STYLES[DEFAULT_STYLE])
-        sys_p = STYLE_SYSTEMS.get(style, SYSTEM)
-        note = _strip_fence(chat(sys_p, tmpl.format(
-            title=title, uploader=meta.get("uploader", ""),
-            description=meta.get("description", "")[:300], cleaned=cleaned),
-            model=model, temperature=_style_temperature(style)))
-    # 同短稿路径：生成后不再做质检修订，成稿直接交付；质检走独立报告
-    return note
+    cleaned, _terms = clean_transcript(raw, meta, progress, model=model)
+    return compose_from_cleaned(cleaned, meta, style, progress, model=model)
 
 
 # ========== 幂等键 ==========
@@ -841,5 +880,20 @@ def signature(transcript: str, style: str, model: str | None = None) -> str:
     digest = hashlib.sha1(tmpl.encode("utf-8")).hexdigest()[:8]
     temp = str(_style_temperature(style))
     raw = "\n".join((digest, style, resolve_model(model), temp,
+                     PIPELINE_REV, transcript or ""))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def clean_signature(transcript: str) -> str:
+    """共享清洗产物的幂等键：原文 + 清洗/术语模板 + 管线版本 + 清洗温度。
+
+    任一要素变化（编辑/重转写使原文变、改清洗口径、升管线版本）签名
+    都变，pipeline.ensure_clean 据此判定缓存失效、重新清洗；下游风格
+    的成稿签名改为基于清洗文本（见 pipeline.polish_signature），
+    清洗一变，下游成稿下次点击时跟着重新生成。
+    """
+    digest = hashlib.sha1(
+        (CLEAN_TMPL + "\n" + TERMS_TMPL).encode("utf-8")).hexdigest()[:8]
+    raw = "\n".join((digest, "cleaned", str(WORK_TEMP),
                      PIPELINE_REV, transcript or ""))
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]

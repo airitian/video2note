@@ -50,6 +50,10 @@ class Task:
     variants: dict = field(default_factory=dict)
     # 生成后质检报告：{"at","at_ts","judge_model","items":{style:{model,chars,ratio,seconds,fit,problems,suggestions}}}
     qc: dict = field(default_factory=dict)
+    # 共享清洗产物（跨风格共享，一篇稿子只洗一次）：
+    # {"text","terms","sig","model","seconds","ts"}，sig 见 llm.clean_signature；
+    # 转写原文变化即失效（编辑/重转写时与 variants 一并清掉）
+    clean_cache: dict = field(default_factory=dict)
     options: dict = field(default_factory=dict)
     # 任务归属：创建时所持令牌的标识（config.token_identity），"" = 无归属
     # （无令牌创建 / 历史数据）。列表与详情按它做可见性隔离，admin 看全部。
@@ -70,7 +74,8 @@ class Task:
     # 列表接口专用的重字段：segments/transcript/note/variants 动辄几十 KB，
     # 全量塞进 /api/tasks 列表曾把响应撑到 2.17MB，公网传输要 45 秒。
     # 前端设计本就是「列表给摘要，点开再拉 /api/tasks/<id> 详情」，此处对齐。
-    _HEAVY_FIELDS = ("segments", "transcript", "note", "note_sig", "variants")
+    _HEAVY_FIELDS = ("segments", "transcript", "note", "note_sig", "variants",
+                     "clean_cache")
 
     def to_dict(self, with_events: bool = True, brief: bool = False) -> dict:
         d = {
@@ -96,6 +101,7 @@ class Task:
             "note_info": self.note_info,
             "variants": self.variants,
             "qc": self.qc,
+            "clean_cache": self.clean_cache,
         }
         if brief:
             for k in self._HEAVY_FIELDS:
