@@ -699,6 +699,55 @@ def ensure_clean(t: store.Task, model: str | None = None,
         return cache
 
 
+def apply_cleaned_edit(t: store.Task, text: str) -> dict:
+    """保存用户人工编辑后的清洗文本，返回更新后的 cleaned 成稿 info。
+
+    编辑只换 clean_cache 的文本：缓存签名按转写原文计算（不变），
+    clean_cache_valid 照常命中，ensure_clean 不会把编辑冲掉；
+    cleaned 变体同步为编辑稿并打 edited 标记；下游风格变体一个都不
+    动——它们的成稿签名基于清洗文本，编辑后自动不匹配，下次点击
+    时按新底稿重新生成。强制重洗 cleaned/general 仍会覆盖编辑
+    （与「重新生成」的既有语义一致）。
+    调用方（接口层）负责前置校验：文本非空、任务不在运行中、
+    已有有效清洗缓存。
+    """
+    with _task_lock(t.id):
+        cache = dict(t.clean_cache or {})
+        cache["text"] = text
+        cache["edited"] = True
+        cache["edited_at"] = _now_str()
+        t.clean_cache = cache
+        old = (t.variants or {}).get("cleaned") or {}
+        info = dict(old.get("info") or {})
+        if not info:
+            # 清洗缓存有、cleaned 变体还没生成过：按清洗信息新建
+            info = {"style": "cleaned",
+                    "model": cache.get("model") or "",
+                    "seconds": cache.get("seconds") or 0,
+                    "at": _now_str(),
+                    "ts": cache.get("ts") or time.time(),
+                    "src_hash": src_hash(t)}
+        info["chars"] = len(text)
+        info["ratio"] = round(len(text) / max(1, len(t.transcript or "")), 3)
+        info["edited"] = True
+        info["edited_at"] = _now_str()
+        t.variants = t.variants or {}
+        t.variants["cleaned"] = {
+            "note": text,
+            "sig": llm.clean_signature(t.transcript or ""),
+            "info": info}
+        if (t.note_info or {}).get("style") == "cleaned":
+            # 当前展示的正是清洗文稿：展示位同步为编辑稿
+            t.note = text
+            t.note_sig = t.variants["cleaned"]["sig"]
+            t.note_info = dict(info)
+            _sync_variant_meta(t)
+        t.log("info", f"清洗文稿已人工编辑（{len(text)} 字），"
+                      "下游风格下次生成将按新底稿")
+        store.save(t)
+        return info
+
+
 def polish_signature(t: store.Task, style: str) -> str:
     """当前输入对应的成稿幂等键。
 

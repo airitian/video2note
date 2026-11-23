@@ -34,6 +34,7 @@ from .config import (ACCESS_TOKEN, ADMIN_TOKEN, HELP, MEDIA_DIR, ROOT, SECRET_KE
                      reset_pro_usage, save_settings, token_identity, token_role,
                      add_token as cfg_add_token, remove_token as cfg_remove_token)
 from .pipeline import (_apply_variant, _mark_idempotent_hit, _sync_variant_meta,
+                       apply_cleaned_edit, clean_cache_valid,
                        polish_needed, polishing_styles, qc_running, submit_qc,
                        retry as pipeline_retry,
                        submit, submit_polish)
@@ -319,6 +320,10 @@ def _is_token_required_endpoint(request: Request) -> bool:
     if m == "GET" and re.fullmatch(r"/api/tasks/[^/]+(/export|/events)?", p):
         return True
     if m == "GET" and p.startswith("/api/media/"):
+        return True
+    # PATCH 编辑（转写纠错 / 清洗文稿编辑）直接改数据，与 DELETE 同级：
+    # 配置了令牌时同样必须持有效令牌（此前只有可见性校验，属覆盖缺口）
+    if m == "PATCH" and re.fullmatch(r"/api/tasks/[^/]+/(transcript|cleaned)", p):
         return True
     return False
 
@@ -1002,6 +1007,32 @@ async def patch_transcript(request: Request, tid: str, body: TranscriptBody):
     t.error = ""
     t.message = "转写已更新，可重新整理"
     store.save(t)
+    return _task_view(t)
+
+
+class CleanedBody(BaseModel):
+    text: str
+
+
+@app.patch("/api/tasks/{tid}/cleaned")
+async def patch_cleaned(request: Request, tid: str, body: CleanedBody):
+    """清洗文稿编辑：保存人工修订后的清洗文本。
+
+    清洗稿是五种风格共享的底稿（见 pipeline.ensure_clean）。保存只
+    更新共享清洗缓存与 cleaned 变体（见 pipeline.apply_cleaned_edit）：
+    缓存签名按转写原文计算、不随编辑变化，编辑不会被 ensure_clean
+    冲掉；下游风格的成稿签名基于清洗文本，编辑后下次点击自动按新
+    底稿重新生成。强制重洗会覆盖编辑（与「重新生成」的既有语义一致）。
+    """
+    t = _get_visible_task(request, tid)
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(400, "清洗文稿不能为空")
+    if t.status == "running":
+        raise HTTPException(409, "任务运行中，不能编辑清洗文稿")
+    if clean_cache_valid(t) is None:
+        raise HTTPException(409, "尚无清洗文稿可编辑，请先生成清洗文稿")
+    apply_cleaned_edit(t, text)
     return _task_view(t)
 
 

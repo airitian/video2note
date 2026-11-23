@@ -567,6 +567,15 @@
     } else {
       meta.textContent = "";
     }
+
+    // 「编辑」只给清洗文稿：它是各风格共用的底稿，可人工修订；
+    // 其余风格是底稿的再创作，不提供直接编辑
+    const editCleanBtn = $("#btn-edit-cleaned");
+    if (editCleanBtn) {
+      const canEdit = !!t && curStyle === "cleaned" && !!noteForStyle(t, "cleaned") &&
+        t.status !== "running" && t.status !== "pending";
+      editCleanBtn.classList.toggle("hidden", !canEdit);
+    }
   }
 
   // 文字稿高度跟随视频框：有视频时把稿件区高度设为视频框的实际高度，
@@ -1143,6 +1152,49 @@
       $("#edit-modal").classList.add("hidden");
       render();
       toast("转写已保存，可点「重新整理」生成新成稿");
+    } catch (e) {
+      toast(e.message, true);
+    }
+  }
+
+  // 清洗文稿编辑：把当前清洗稿装进编辑框（底稿编辑，保存走 PATCH /cleaned）。
+  function openCleanedEdit() {
+    const t = tasks.get(currentId);
+    if (!t) return;
+    if (t.status === "running" || t.status === "pending") {
+      toast("任务运行中，结束后再编辑清洗文稿", true);
+      return;
+    }
+    const text = noteForStyle(t, "cleaned");
+    if (!text) { toast("尚无清洗文稿可编辑", true); return; }
+    $("#edit-cleaned-text").value = text;
+    $("#edit-cleaned-modal").classList.remove("hidden");
+  }
+
+  async function saveCleanedEdit() {
+    const text = $("#edit-cleaned-text").value.trim();
+    if (!text) { toast("清洗文稿不能为空", true); return; }
+    try {
+      const r = await api("/api/tasks/" + currentId + "/cleaned", {
+        method: "PATCH",
+        body: JSON.stringify({ text: text })
+      });
+      const t = tasks.get(currentId);
+      if (t) {
+        // 与后端保持一致：只换清洗缓存与 cleaned 变体，下游成稿不动
+        //（其签名基于清洗文本，下次点击自动按新底稿重新生成）
+        t.clean_cache = r.clean_cache;
+        t.variants = r.variants;
+        if (r.note_info && r.note_info.style === "cleaned") {
+          t.note = r.note;
+          t.note_sig = r.note_sig;
+          t.note_info = r.note_info;
+        }
+      }
+      ws.noteKey = "";   // 强制文稿区按新文本重渲染（字数随之刷新）
+      $("#edit-cleaned-modal").classList.add("hidden");
+      render();
+      toast("清洗文稿已保存");
     } catch (e) {
       toast(e.message, true);
     }
@@ -1893,12 +1945,23 @@ if (rest.length) {
     const b = $(sel);
     if (b) b.addEventListener("click", () => $("#edit-modal").classList.add("hidden"));
   });
+  // 清洗文稿编辑弹窗
+  const editCleanBtn = $("#btn-edit-cleaned");
+  if (editCleanBtn) editCleanBtn.addEventListener("click", openCleanedEdit);
+  const saveCleanBtn = $("#btn-save-cleaned");
+  if (saveCleanBtn) saveCleanBtn.addEventListener("click", saveCleanedEdit);
+  ["#btn-close-cleaned", "#btn-cancel-cleaned"].forEach((sel) => {
+    const b = $(sel);
+    if (b) b.addEventListener("click", () => $("#edit-cleaned-modal").classList.add("hidden"));
+  });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       $("#settings-modal").classList.add("hidden");
       $("#confirm-modal").classList.add("hidden");
       const em = $("#edit-modal");
       if (em) em.classList.add("hidden");
+      const cm = $("#edit-cleaned-modal");
+      if (cm) cm.classList.add("hidden");
       closeDrawers();
       pendingDeleteId = null;
       if (!$("#auth-modal").classList.contains("hidden")) settleAuth(false);
