@@ -1313,7 +1313,9 @@
         const it = items[style];
         if (!it) continue;
         const fitCls = it.fit === "符合" ? "ok" : (it.fit === "不符合" ? "bad" : "mid");
-        const lowRatio = style === "general" && typeof it.ratio === "number" && it.ratio < 0.85;
+        // 整理文稿现在要求删引流/广告/无关话术，广告多的视频保留率
+      // 合理地低于 85%——标红线降到 70%，只拦灾难性塌缩（如曾经的 19%）
+      const lowRatio = style === "general" && typeof it.ratio === "number" && it.ratio < 0.7;
         h += "<div class='qc-item'>" +
           "<div class='qc-item-head'><b>" + esc(STYLE_TEXT[style] || style) + "</b>" +
           "<span class='qc-fit " + fitCls + "'>" + esc(it.fit || "未评") + "</span>" +

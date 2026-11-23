@@ -14,8 +14,16 @@ import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# 文稿/质检的展示时间固定按北京时间（容器运行在 UTC，直接 datetime.now 会差 8 小时）
+_CST = timezone(timedelta(hours=8))
+
+
+def _now_str() -> str:
+    return datetime.now(_CST).strftime("%m-%d %H:%M")
+
 from typing import Callable
 
 from . import asr, audio, downloader, llm, store
@@ -592,7 +600,7 @@ def generate_qc(t: store.Task) -> dict:
             "problems": review["problems"],
             "suggestions": review["suggestions"],
         }
-    qc = {"at": datetime.now().strftime("%m-%d %H:%M"),
+    qc = {"at": _now_str(),
           "at_ts": time.time(),
           "judge_model": judge,
           "items": items}
@@ -751,7 +759,7 @@ def _polish_body(t: store.Task, style: str, emit: EmitFn = None, force: bool = F
         "chars": len(text),
         "seconds": _seconds,
         "ratio": round(len(text) / max(1, len(t.transcript or "")), 3),
-        "at": datetime.now().strftime("%m-%d %H:%M"),
+        "at": _now_str(),
         "ts": time.time(),
         "src_hash": src_hash(t),
     }

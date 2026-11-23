@@ -1409,7 +1409,7 @@ def _cloud_playback(tid: str, name: str, request: Request):
       1 → 服务端代拉再转发：部署机出网受限、或空间设为私有时只能这样
     """
     from . import store
-    from .qiniu_archive import remote_info, open_remote, s3_presign_url
+    from .qiniu_archive import remote_info, open_remote
 
     t = store.get(tid)
     if t is None:
@@ -1419,11 +1419,10 @@ def _cloud_playback(tid: str, name: str, request: Request):
         # 没记过归档信息不代表云端一定没有——下载完就备份那一步还没跑时
         # 本地就被删了才会走到这里，只能如实告诉调用方没有。
         return None
-    # 旧 CDN 测试域名（*.clouddn.com）会被七牛 30 天回收，回收后解析到
-    # 127.0.0.1，302 跳过去必然失败。优先改用 S3 兼容协议的预签名地址：
-    # 独立的 s3.<region>.qiniucs.com 域名 + AK/SK 签名，不受回收影响，
-    # 且原生支持 Range。生成失败（如没配密钥）才回退到旧的 url。
-    url = s3_presign_url(info) or info["url"]
+    # 播放地址由 remote_info 统一决议：优先空间域名私有链接（不走 S3）。
+    # 测试域名会被七牛回收的问题改由「空间每 25 天轮换」根治——新空间
+    # 自带新测试域名，配置里的域名始终新鲜（见服务器 /root/qiniu-rotate）。
+    url = info["url"]
 
     if not _proxy_mode():
         return RedirectResponse(url, status_code=302)

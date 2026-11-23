@@ -432,11 +432,34 @@ def cleanup(days: int | None = None, *, dry_run: bool = False,
     return summary
 
 
+def domain_private_url(info: dict, c: dict | None = None,
+                         expires: int | None = None) -> str | None:
+    """按 key + 当前配置域名现生成七牛原生私有下载 URL（不走 S3）。
+
+    空间每 25 天轮换一次、测试域名随空间走：域名始终新鲜可用，
+    这条通道是播放首选；S3 预签名只作域名未配置时的兜底。
+    """
+    c = c or cfg()
+    if not c["domain"]:
+        return None
+    key = s3_key_from(info)
+    if not key:
+        return None
+    if expires is None:
+        expires = _url_expires()
+    try:
+        return _auth(c).private_download_url(
+            public_url(key, c["domain"]), expires=expires)
+    except Exception:
+        return None
+
+
 def remote_info(t, name: str) -> dict | None:
     """该文件在云端的归档信息（key / size + 按需现生成的 url），没有则 None。
 
-    meta 里只存 key：播放用的 URL 在这里现算——优先 S3 预签名（短时效），
-    失败则回退公开域名直链或旧数据里存过的 url（仅作兼容，新数据不再写）。
+    meta 里只存 key：播放用的 URL 在这里现算——优先空间域名私有链接
+    （七牛原生签名，不走 S3），域名未配置时回退 S3 预签名，再回退旧数据
+    里存过的 url（仅作兼容，新数据不再写）。
     """
     m = ((t.meta or {}).get("archived") or {}).get(name)
     if not isinstance(m, dict):
@@ -444,7 +467,7 @@ def remote_info(t, name: str) -> dict | None:
     key = s3_key_from(m)
     if not key:
         return None
-    url = s3_presign_url(m) or (m.get("url") or "") \
+    url = domain_private_url(m) or s3_presign_url(m) or (m.get("url") or "") \
         or public_url(key, cfg()["domain"])
     if not url.startswith("http"):
         return None
@@ -635,7 +658,11 @@ def resolve_missing(t, name: str) -> str | None:
     """
     m = ((t.meta or {}).get("archived") or {}).get(name)
     if isinstance(m, dict):
-        # 优先 S3 预签名（测试域名被回收后旧 url 已不可用）
+        # 优先空间域名私有链接（不走 S3）：空间每 25 天轮换，域名始终新鲜；
+        # 域名未配置时才回退 S3 预签名
+        du = domain_private_url(m)
+        if du:
+            return du
         s3 = s3_presign_url(m)
         if s3:
             return s3
