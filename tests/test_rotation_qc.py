@@ -41,52 +41,81 @@ def test_rotation_index_cycles(tmp_path, monkeypatch):
     assert [pipeline._rotation_next_index(3) for _ in range(5)] == [0, 1, 2, 0, 1]
 
 
-# ---------- 分配：探活跳过 ----------
+# ---------- 按生成次数轮换：逐次取下一个、探活跳过 ----------
 
-def test_assign_skips_dead_model(monkeypatch):
+def test_pick_rotates_each_generation(tmp_path, monkeypatch):
+    _set_rotation("m/A,m/B,m/C")
+    monkeypatch.setattr(pipeline, "TASK_DIR", tmp_path / "tasks")
+    monkeypatch.setattr(pipeline, "_probe_model", lambda m: True)
+    t = store.Task(id="rot0")
+    try:
+        got = [pipeline.pick_generation_model(t) for _ in range(4)]
+        assert got == ["m/A", "m/B", "m/C", "m/A"]   # 环回
+        assert "llm_model" not in t.options          # 轮换结果不写回任务
+    finally:
+        _cleanup_settings()
+
+
+def test_pick_skips_dead_model(monkeypatch):
     _set_rotation("m/A,m/B,m/C")
     monkeypatch.setattr(pipeline, "_rotation_next_index", lambda n: 0)
     monkeypatch.setattr(pipeline, "_probe_model", lambda m: m != "m/A")
     t = store.Task(id="rot1")
     try:
-        got = pipeline.assign_rotation_model(t)
-        assert got == "m/B"
-        assert t.options["llm_model"] == "m/B"
-    finally:
-        _cleanup_settings()
-
-
-def test_assign_all_dead_falls_back(monkeypatch):
-    _set_rotation("m/A,m/B")
-    monkeypatch.setattr(pipeline, "_rotation_next_index", lambda n: 0)
-    monkeypatch.setattr(pipeline, "_probe_model", lambda m: False)
-    t = store.Task(id="rot2")
-    try:
-        assert pipeline.assign_rotation_model(t) is None
+        assert pipeline.pick_generation_model(t) == "m/B"
         assert "llm_model" not in t.options
     finally:
         _cleanup_settings()
 
 
-def test_assign_respects_explicit_model(monkeypatch):
+def test_pick_all_dead_falls_back(monkeypatch):
+    _set_rotation("m/A,m/B")
+    monkeypatch.setattr(pipeline, "_rotation_next_index", lambda n: 0)
+    monkeypatch.setattr(pipeline, "_probe_model", lambda m: False)
+    t = store.Task(id="rot2")
+    try:
+        assert pipeline.pick_generation_model(t) is None
+        assert "llm_model" not in t.options
+    finally:
+        _cleanup_settings()
+
+
+def test_pick_respects_explicit_model(monkeypatch):
     _set_rotation("m/A,m/B")
     monkeypatch.setattr(pipeline, "_probe_model",
                         lambda m: (_ for _ in ()).throw(AssertionError("不应探活")))
+    monkeypatch.setattr(pipeline, "_rotation_next_index",
+                        lambda n: (_ for _ in ()).throw(AssertionError("不应计数")))
     t = store.Task(id="rot3", options={"llm_model": "user/chosen"})
     try:
-        assert pipeline.assign_rotation_model(t) == "user/chosen"
+        assert pipeline.pick_generation_model(t) == "user/chosen"
     finally:
         _cleanup_settings()
+
+
+# ---------- 签名不含模型（轮换不得绕过冷却） ----------
+
+def test_signature_ignores_task_model():
+    a = store.Task(id="sig1", transcript="原文")
+    b = store.Task(id="sig2", transcript="原文",
+                   options={"llm_model": "some/model"})
+    assert pipeline.polish_signature(a, "general") == \
+        pipeline.polish_signature(b, "general")
 
 
 # ---------- 裁判选择：不能是生成模型自己 ----------
 
 def test_judge_is_next_in_rotation(monkeypatch):
     _set_rotation("m/A,m/B,m/C")
-    t = store.Task(id="qc0", options={"llm_model": "m/C"})
+    t = store.Task(id="qc0")
+    # 最新一稿（ts 最大）由 m/C 生成 → 裁判取环回第一个 m/A
+    t.variants = {
+        "general": {"note": "稿", "info": {"model": "m/C", "ts": 2.0}},
+        "digest": {"note": "稿", "info": {"model": "m/A", "ts": 1.0}},
+    }
     try:
-        assert pipeline._judge_model_for(t) == "m/A"   # 环回第一个
-        t.options["llm_model"] = "m/A"
+        assert pipeline._judge_model_for(t) == "m/A"
+        t.variants["general"]["info"] = {"model": "m/A", "ts": 3.0}
         assert pipeline._judge_model_for(t) == "m/B"
     finally:
         _cleanup_settings()

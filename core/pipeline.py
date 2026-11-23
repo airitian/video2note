@@ -397,13 +397,8 @@ def _transcribe_body(t: store.Task, emit: EmitFn = None) -> None:
     except Exception:
         pass
     # 转写完成默认自动生成全部四种风格，用户无需再手动点生成。
-    # 先按轮换名单给本视频分配一个模型（四种风格共用同一模型），
-    # 再逐个提交（不同风格可并行，submit_polish 自带幂等与防重复）。
-    try:
-        assign_rotation_model(t)
-        store.save(t)
-    except Exception:
-        t.log("warn", "模型轮换分配失败，改用默认模型生成")
+    # 模型不在此处预分配：每次真正生成时由 _polish_body 按生成次数
+    # 从轮换名单取下一个（见 pick_generation_model）。
     for _style in AUTO_STYLES:
         try:
             submit_polish(t, _style)
@@ -450,10 +445,11 @@ def _polish_unregister(tid: str, style: str) -> bool:
         return True
 
 
-# ========== 模型轮换（按视频轮流用不同厂商的旗舰模型） ==========
-# 名单在设置项 llm_rotation_models（逗号/换行分隔）。每条新视频分配一个
-# 模型、四种风格都用它；下一条视频换下一个。计数落盘，重启不乱序；
-# 分配前逐个探活，不可用的跳过，全灭则回退设置里的默认模型。
+# ========== 模型轮换（按生成次数轮流用不同厂商的旗舰模型） ==========
+# 名单在设置项 llm_rotation_models（逗号/换行分隔）。每一次真正执行的
+# 文稿生成（任何风格，手动或转写后自动，一视同仁）都取名单中的下一个
+# 模型；缓存命中/冷却复用不算生成、不递增。全局计数落盘，重启不乱序；
+# 挑模型时逐个探活，不可用的跳过，全灭则回退设置里的默认模型。
 _ROTATION_LOCK = threading.Lock()
 # 全局整理并发上限：多个视频同时下完时，整理任务最多同时跑 2 个，
 # 避免把模型端点打到限流（限流后重试反而更慢）
@@ -492,14 +488,17 @@ def _probe_model(model: str) -> bool:
         return False
 
 
-def assign_rotation_model(t: store.Task) -> str | None:
-    """给任务分配本轮模型，写进 options['llm_model']（后续所有风格共用）。
+def pick_generation_model(t: store.Task) -> str | None:
+    """为一次「真正执行的生成」挑模型（按生成次数轮换）。
 
-    任务已有显式模型（页面手填）时不覆盖。返回实际分配的模型名，
-    未分配（无名单/全不可用）返回 None，此时沿用设置里的默认模型。
+    - 任务显式指定了模型（options['llm_model']）→ 用它，不递增轮换计数；
+    - 否则取轮换名单中的下一个（全局计数落盘 +1），探活跳过不可用的，
+      全不可用返回 None（调用方回退设置里的默认模型）。
+    只应在确认要真跑 LLM 后调用：缓存命中/冷却复用不经此处、不计数。
     """
-    if (t.options or {}).get("llm_model"):
-        return t.options["llm_model"]
+    explicit = (t.options or {}).get("llm_model") or ""
+    if explicit:
+        return explicit
     pool = rotation_models()
     if not pool:
         return None
@@ -510,8 +509,7 @@ def assign_rotation_model(t: store.Task) -> str | None:
             if _probe_model(m):
                 if k:
                     t.log("warn", f"轮换模型 {pool[start]} 不可用，改用 {m}")
-                t.options["llm_model"] = m
-                t.log("info", f"本视频文稿由 {m} 生成（模型轮换）")
+                t.log("info", f"本次生成使用轮换模型 {m}（名单第 {start + 1} 位）")
                 return m
             t.log("warn", f"轮换模型 {m} 探活失败，尝试下一个")
     t.log("warn", "轮换模型全部不可用，回退到设置中的默认模型")
@@ -567,8 +565,21 @@ def _catch_qc(t: store.Task) -> None:
 
 
 def _judge_model_for(t: store.Task) -> str:
-    """质检裁判：优先用轮换名单里生成模型的下一个，避免自己评自己。"""
-    gen = (t.options or {}).get("llm_model") or ""
+    """质检裁判：优先用轮换名单里「最近一次生成所用模型」的下一个，
+    避免自己评自己。生成模型按生成次数轮换、各风格可能不同，
+    以最新一稿（info.ts 最大）的实际模型为准；无成稿记录时回退
+    任务显式模型。"""
+    gen = ""
+    latest = -1.0
+    for v in (t.variants or {}).values():
+        info = (v or {}).get("info") or {}
+        try:
+            ts = float(info.get("ts") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if info.get("model") and ts >= latest:
+            latest, gen = ts, info["model"]
+    gen = gen or (t.options or {}).get("llm_model") or ""
     pool = rotation_models()
     if gen in pool and len(pool) > 1:
         return pool[(pool.index(gen) + 1) % len(pool)]
@@ -626,8 +637,13 @@ def src_hash(t: store.Task) -> str:
 
 
 def polish_signature(t: store.Task, style: str) -> str:
-    """当前输入对应的成稿幂等键"""
-    return llm.signature(t.transcript, style, t.options.get("llm_model") or None)
+    """当前输入对应的成稿幂等键。
+
+    模型不计入签名：模型按生成次数轮换，若计入，每次生成都会被判为
+    「输入已变化」、10 分钟冷却形同虚设。其余要素（原文/模板/温度）
+    变化仍会使签名变化、照常触发重新整理。
+    """
+    return llm.signature(t.transcript, style, None)
 
 
 # 同一风格两次 LLM 整理之间的最短间隔（秒）。输入没变化时，
@@ -641,7 +657,8 @@ def polish_needed(t: store.Task, style: str, force: bool = False) -> tuple[bool,
     命中幂等（该风格已有成稿 + 输入签名一致）时的策略：
     - 距上次生成不足 10 分钟 → 复用旧稿（省额度、防连点）；
     - 距上次生成超过 10 分钟 → 允许重新生成一份（同风格、同输入也可重出稿）。
-    换风格 / 换模型 / 换模板 / 重转写（签名变化）则无论间隔都直接重新生成。
+    换风格 / 换模板 / 重转写（签名变化）则无论间隔都直接重新生成。
+    （模型按生成次数轮换、不计入签名，见 polish_signature。）
     """
     if force:
         return True, "已强制重新整理"
@@ -744,7 +761,9 @@ def _polish_body(t: store.Task, style: str, emit: EmitFn = None, force: bool = F
     def prog(msg: str) -> None:
         _set(t, "polishing", 0.3, msg, emit=emit)
 
-    model = t.options.get("llm_model") or None
+    # 走到这里说明 polish_needed 已判定要真跑 LLM，此刻才挑模型并
+    # 递增轮换计数（缓存命中在上方已返回，不会消耗轮换名额）。
+    model = pick_generation_model(t)
     _t0 = time.time()
     text = llm.polish(t.transcript, t.meta or {}, style, prog, model=model)
     _seconds = round(time.time() - _t0, 1)
