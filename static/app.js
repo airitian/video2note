@@ -562,7 +562,7 @@
       meta.innerHTML = esc(STYLE_TEXT[curStyle] || curStyle) + " · " +
         fmtNum(charCount(text)) + " 字" +
         (tc ? "（原文 " + fmtNum(tc) + " 字）" : "") +
-        (sameStyle && info.at ? " · " + esc(info.at) : "") +
+        (vinfo.at ? " · " + esc(vinfo.at) : "") +
         (dim ? '<span class="meta-dim">' + dim + "</span>" : "");
     } else {
       meta.textContent = "";
